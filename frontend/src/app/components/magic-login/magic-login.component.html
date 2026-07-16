@@ -1,0 +1,13 @@
+<div class="magic-login-container">
+  <div class="magic-login-box">
+    <h2>Signing you in&hellip;</h2>
+    <p *ngIf="!finished">Redeeming your admin magic link.</p>
+    <div *ngIf="finished && success" class="success-msg">
+      Authenticated. Redirecting to admin&hellip;
+    </div>
+    <div *ngIf="finished && !success" class="error-msg">{{ error }}</div>
+    <p *ngIf="finished && !success" class="footer-link">
+      <a routerLink="/login">Back to sign in</a>
+    </p>
+  </div>
+</div>

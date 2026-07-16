@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  db:
+    image: ankane/pgvector:v0.5.1
+    environment:
+      POSTGRES_USER: nomos_admin
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_prod_password}
+      POSTGRES_DB: nomos_db
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=nomos_admin
+      - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
+      - DB_NAME=nomos_db
+      - OLLAMA_URL=http://ollama:11434
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+      - ollama
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "80:4200" # Mapping to port 80 for production access
+    depends_on:
+      - backend
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  # Production Ollama with GPU Pass-through enabled via NVIDIA Container Toolkit
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models_prod:/root/.ollama
+    networks:
+      - nomos-prod-network
+    restart: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  pgdata_prod:
+  ollama_models_prod:
+
+networks:
+  nomos-prod-network:
+    driver: bridge

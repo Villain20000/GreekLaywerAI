@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="el">
+<head>
+  <meta charset="utf-8">
+  <title>NomosAI — Greek AI Lawyer</title>
+  <base href="/">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An elite Greek AI lawyer powered by Gemma, grounded in real Greek legislation via pgvector RAG.">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <!--
+    Phase 27: typography + theme bootstrap, both applied BEFORE the Angular
+    bundle even evaluates — so no flash-of-wrong-font and no flash-of-wrong-
+    theme on cold start.
+
+    - Inter (display + body) via Google Fonts. Weights 400 / 500 / 600 / 700
+      cover the entire UI: body copy uses 400/500, headings 600/700.
+    - Inline <script> reads `localStorage.nomos_theme` synchronously and
+      sets the `data-theme` attribute on <html> before <app-root> mounts.
+      That attribute drives the CSS custom-property cascade in styles.scss.
+      A `prefers-color-scheme: light` OS preference is the fallback for
+      first-time visitors with no stored choice. Dark remains the default
+      for everyone else so the brand's "elite attorney" dark identity
+      holds for new users regardless of OS setting.
+  -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    // Phase 27: no-FOUC theme bootstrap. Runs synchronously BEFORE <app-root>
+    // mounts. Reads stored choice; falls back to the OS preference; defaults
+    // to dark. The matching Angular ThemeService constructor re-reads the
+    // attribute and subscribes to it — so user-triggered toggles propagate
+    // through the same pipe without a flash on subsequent navigations.
+    (function () {
+      try {
+        var stored = localStorage.getItem('nomos_theme');
+        var theme;
+        if (stored === 'dark' || stored === 'light') {
+          theme = stored;
+        } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+          theme = 'light';
+        } else {
+          theme = 'dark';
+        }
+        document.documentElement.setAttribute('data-theme', theme);
+      } catch (_e) {
+        // localStorage or matchMedia unavailable (SSR / private mode) —
+        // <html data-theme> stays unset so :root defaults to dark.
+      }
+    })();
+  </script>
+</head>
+<body>
+  <app-root></app-root>
+</body>
+</html>

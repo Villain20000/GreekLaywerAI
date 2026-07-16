@@ -1,0 +1,879 @@
+/*
+ * ════════════════════════════════════════════════════════════════════════
+ *  Phase 27 — NomosAI global design system
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ *  This file is the single source of truth for every colour, font, spacing
+ *  step, radius, shadow, and reusable component-internal class name used
+ *  across the SPA. Per-component inline `styles: [...]` arrays are kept
+ *  minimal — most components just declare `styles: []` and let this sheet
+ *  do the heavy lifting through class aliases that map to the legacy
+ *  selectors used by existing component templates (login-box, register-box,
+ *  password-row, peek-btn, primary, auth-links, etc.). That alias layer
+ *  is what fixes the `anyComponentStyle: 4 kB` budget breach in
+ *  `angular.json` — those per-component stylesheets no longer duplicate the
+ *  shared chrome.
+ *
+ *  Dark is the default (kept for the "elite attorney" brand identity).
+ *  Switching to light is a single `[data-theme="light"]` attribute on
+ *  <html>. The ThemeService + the inline <script> in index.html keep that
+ *  attribute in sync with localStorage + the system's prefers-color-scheme.
+ *
+ *  Token convention: `--nl-…` (nomós-layer / nomos layer). Tokens are
+ *  documented inline so a future theme (corporate / seasonal / per-tenant)
+ *  can override just the variables — every selector below references a
+ *  token via `var()`, never a literal colour.
+ */
+
+/* ── 1. Tokens (dark defaults; light overrides on [data-theme="light"]) ──
+   Downstream selectors MUST read from these tokens, not literal hex. */
+:root {
+  /* Surfaces */
+  --nl-bg:           #0a0a0a;          /* page           */
+  --nl-bg-card:      #151517;          /* auth-card      */
+  --nl-bg-elevated:  #1d1d20;          /* menu / rows    */
+  --nl-bg-input:     #161618;          /* input          */
+  --nl-bg-hover:     rgba(255,255,255,0.04);
+
+  /* Borders */
+  --nl-border:        #26262b;
+  --nl-border-strong: #3a3a40;
+
+  /* Text */
+  --nl-fg:           #ffffff;
+  --nl-fg-muted:     #aaaaaf;
+  --nl-fg-subtle:    #7a7a82;
+  --nl-fg-inverse:   #0a0a0a;          /* On light surfaces in dark mode */
+
+  /* Accent */
+  --nl-accent:        #ffffff;          /* Dark CTAs invert to white */
+  --nl-accent-hover:  #ececec;
+  --nl-accent-text:   #000000;
+  --nl-focus:         #6cb6ff;          /* Bright enough on both surfaces */
+
+  /* Semantic */
+  --nl-danger:    #f44336;
+  --nl-danger-bg: rgba(244, 67, 54, 0.10);
+  --nl-success:   #4caf50;
+  --nl-success-bg:rgba(76, 175, 80, 0.10);
+  --nl-warning:   #ff9800;
+  --nl-warning-bg:rgba(255, 152, 0, 0.10);
+
+  /* Typography — Inter loaded in <head>; sensible fallback if CDN fails */
+  --nl-font-display:  'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --nl-font-body:     'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --nl-font-mono:     ui-monospace, SFMono-Regular, Menlo, 'Consolas', monospace;
+
+  /* Spacing (4-px scale, doubling each step) */
+  --nl-space-1:  0.25rem;
+  --nl-space-2:  0.5rem;
+  --nl-space-3:  0.75rem;
+  --nl-space-4:  1rem;
+  --nl-space-5:  1.25rem;
+  --nl-space-6:  1.5rem;
+  --nl-space-8:  2rem;
+  --nl-space-10: 2.5rem;
+  --nl-space-12: 3rem;
+
+  /* Radius */
+  --nl-radius-sm: 4px;
+  --nl-radius-md: 8px;
+  --nl-radius-lg: 12px;
+  --nl-radius-pill: 999px;
+
+  /* Shadows */
+  --nl-shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
+  --nl-shadow-md: 0 10px 30px rgba(0,0,0,0.5);
+  --nl-shadow-lg: 0 20px 50px rgba(0,0,0,0.55);
+
+  /* Motion */
+  --nl-t-fast:    90ms ease;
+  --nl-t-base:    160ms ease;
+  --nl-t-slow:    240ms ease;
+}
+
+:root[data-theme='light'] {
+  --nl-bg:           #f6f7fb;
+  --nl-bg-card:      #ffffff;
+  --nl-bg-elevated:  #ffffff;
+  --nl-bg-input:     #ffffff;
+  --nl-bg-hover:     rgba(0,0,0,0.04);
+
+  --nl-border:        #d8dae3;
+  --nl-border-strong: #b6bac8;
+
+  --nl-fg:           #0a0a0a;
+  --nl-fg-muted:     #555560;
+  --nl-fg-subtle:    #76767e;
+  --nl-fg-inverse:   #ffffff;
+
+  --nl-accent:        #0a0a0a;
+  --nl-accent-hover:  #1f1f23;
+  --nl-accent-text:   #ffffff;
+  --nl-focus:         #0066ff;
+
+  --nl-danger-bg:  rgba(244, 67, 54, 0.06);
+  --nl-success-bg: rgba(76, 175, 80, 0.06);
+  --nl-warning-bg: rgba(255, 152, 0, 0.06);
+
+  --nl-shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+  --nl-shadow-md: 0 10px 30px rgba(0,0,0,0.10);
+  --nl-shadow-lg: 0 20px 50px rgba(0,0,0,0.18);
+}
+
+/* ── 2. Base resets ───────────────────────────────────────────────────── */
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--nl-bg);
+  color: var(--nl-fg);
+  font-family: var(--nl-font-body);
+  font-feature-settings: 'cv11', 'ss01';   /* keep Inter's opt-in alternates */
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color var(--nl-t-slow), color var(--nl-t-slow);
+}
+
+app-root { display: block; min-height: 100vh; }
+
+h1, h2, h3, h4 {
+  font-family: var(--nl-font-display);
+  letter-spacing: -0.01em;
+  font-weight: 500;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font: inherit;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+}
+
+input, textarea, select {
+  font: inherit;
+  color: inherit;
+}
+
+/* Universal a11y focus ring */
+:focus-visible {
+  outline: 2px solid var(--nl-focus);
+  outline-offset: 2px;
+  border-radius: var(--nl-radius-sm);
+}
+
+/* ── 3. Auth-card shell + page container (shared by login/register/change-password/
+        magic-login/forgot-password/reset-password/verify-email) ───── */
+.nl-page-container,
+.login-container,
+.register-container,
+.change-password-container,
+.magic-login-container,
+.forgot-container,
+.reset-container,
+.verify-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  background: var(--nl-bg);
+  color: var(--nl-fg);
+  padding: var(--nl-space-4);
+}
+.nl-page-container { min-height: 100vh; }
+
+/* The 420-px card that holds every auth flow */
+.nl-auth-card,
+.login-box,
+.register-box,
+.change-password-box,
+.magic-login-box,
+.forgot-box,
+.reset-box,
+.verify-box {
+  background: var(--nl-bg-card);
+  padding: var(--nl-space-10) var(--nl-space-8);
+  border-radius: var(--nl-radius-lg);
+  border: 1px solid var(--nl-border);
+  width: 100%;
+  max-width: 420px;
+  box-shadow: var(--nl-shadow-lg);
+  animation: nlFadeIn var(--nl-t-slow) both;
+}
+
+/* Slight variant for magic-login (text-centered, less chrome) */
+.magic-login-box { text-align: center; padding: var(--nl-space-10); border-radius: var(--nl-radius-md); }
+
+.nl-auth-card h2,
+.box-heading,
+h2 {
+  margin: var(--nl-space-2) 0 var(--nl-space-1);
+  font-weight: 500;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
+}
+
+.nl-auth-card p,
+.box-subtext,
+p {
+  color: var(--nl-fg-muted);
+  margin: 0 0 var(--nl-space-7) 0;
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.nl-prompt-text { color: var(--nl-fg-muted); margin: var(--nl-space-2) 0; font-size: 0.92rem; }
+
+/* ── 4. Brand row (NomosAI logo + name) ─────────────────────────────── */
+.nl-brand-row,
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nl-space-3);
+  margin-bottom: var(--nl-space-6);
+  color: var(--nl-fg);
+}
+
+.nl-brand-mark,
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--nl-radius-sm);
+  background: var(--nl-accent);
+  color: var(--nl-accent-text);
+  font-weight: 700;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.nl-brand-text,
+.brand-text {
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  font-size: 1.05rem;
+}
+
+/* ── 5. Form rows, labels, inputs ───────────────────────────────────── */
+.nl-form-group,
+.form-group {
+  margin-bottom: var(--nl-space-5);
+}
+
+.nl-label,
+label {
+  display: block;
+  margin-bottom: var(--nl-space-2);
+  color: var(--nl-fg-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+.nl-input,
+input[type='email'],
+input[type='password'],
+input[type='text'] {
+  width: 100%;
+  padding: 0.85rem var(--nl-space-3);
+  background: var(--nl-bg-input);
+  border: 1px solid var(--nl-border);
+  color: var(--nl-fg);
+  border-radius: var(--nl-radius-md);
+  font-size: 0.95rem;
+  transition: border-color var(--nl-t-base), background var(--nl-t-base);
+}
+
+.nl-input:focus,
+input:focus {
+  outline: none;
+  border-color: var(--nl-accent);
+  background: var(--nl-bg-elevated);
+}
+
+/* Password peek row (label + input + tiny toggle button right inside) */
+.nl-password-row,
+.password-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+.nl-password-row .nl-input,
+.password-row input { padding-right: 2.8rem; }
+
+.nl-peek-btn,
+.peek-btn {
+  position: absolute;
+  right: 0.4rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  color: var(--nl-fg-subtle);
+  padding: var(--nl-space-2);
+  border-radius: var(--nl-radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--nl-t-fast), background var(--nl-t-fast);
+}
+
+.nl-peek-btn:hover, .peek-btn:hover {
+  color: var(--nl-fg);
+  background: var(--nl-bg-hover);
+}
+
+.nl-peek-btn svg, .peek-btn svg { width: 18px; height: 18px; fill: currentColor; }
+
+/* ── 6. Buttons (primary CTA + secondary + nested-in-card spacing) ─── */
+.nl-btn-primary,
+button.primary {
+  width: 100%;
+  padding: var(--nl-space-3) var(--nl-space-4);
+  background: var(--nl-accent);
+  color: var(--nl-accent-text);
+  border: 0;
+  border-radius: var(--nl-radius-md);
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: var(--nl-space-2);
+  letter-spacing: 0.02em;
+  transition: transform var(--nl-t-fast), opacity var(--nl-t-fast), background var(--nl-t-fast);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.nl-btn-primary:hover:not(:disabled),
+button.primary:hover:not(:disabled) { background: var(--nl-accent-hover); }
+.nl-btn-primary:active:not(:disabled),
+button.primary:active:not(:disabled) { transform: translateY(1px); }
+.nl-btn-primary:disabled,
+button.primary:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.nl-btn-secondary,
+button.secondary {
+  width: 100%;
+  padding: 0.85rem var(--nl-space-4);
+  background: transparent;
+  color: var(--nl-fg);
+  border: 1px solid var(--nl-border-strong);
+  border-radius: var(--nl-radius-md);
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  transition: background var(--nl-t-fast), border-color var(--nl-t-fast), transform var(--nl-t-fast);
+}
+.nl-btn-secondary:hover:not(:disabled),
+button.secondary:hover:not(:disabled) { background: var(--nl-bg-hover); border-color: var(--nl-fg-muted); }
+.nl-btn-secondary:active:not(:disabled),
+button.secondary:active:not(:disabled) { transform: translateY(1px); }
+.nl-btn-secondary:disabled,
+button.secondary:disabled { opacity: 0.7; cursor: not-allowed; }
+
+/* "inverted" button (red logout etc) */
+button.logout-btn {
+  background: transparent;
+  color: var(--nl-fg);
+  border: 1px solid var(--nl-border-strong);
+  padding: var(--nl-space-2) var(--nl-space-3);
+  border-radius: var(--nl-radius-md);
+  font-size: 0.85rem;
+  font-weight: 500;
+  transition: background var(--nl-t-fast), border-color var(--nl-t-fast);
+}
+button.logout-btn:hover { background: var(--nl-bg-hover); border-color: var(--nl-fg-muted); }
+
+button.refresh-btn {
+  background: var(--nl-accent);
+  color: var(--nl-accent-text);
+  border: 0;
+  border-radius: var(--nl-radius-md);
+  padding: var(--nl-space-2) var(--nl-space-4);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+button.refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── 7. Error / success banner (shared by all auth flows) ──────────── */
+.nl-error-msg, .error-msg,
+.nl-success-msg, .success-msg {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.9rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: var(--nl-radius-md);
+  margin-bottom: var(--nl-space-4);
+  line-height: 1.45;
+}
+.nl-error-msg, .error-msg {
+  color: var(--nl-danger);
+  background: var(--nl-danger-bg);
+  border: 1px solid rgba(244, 67, 54, 0.40);
+}
+.nl-success-msg, .success-msg {
+  color: var(--nl-success);
+  background: var(--nl-success-bg);
+  border: 1px solid rgba(76, 175, 80, 0.40);
+}
+
+.nl-msg-icon, .msg-icon {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+
+.inline-link {
+  color: var(--nl-danger);
+  text-decoration: underline;
+  font-weight: 600;
+  margin-left: auto;
+}
+.inline-link:hover { color: #ff6b6b; }
+
+/* Resend panel (Phase 24 unverified-state on login) */
+.resend-panel {
+  margin: var(--nl-space-1) 0;
+  padding-top: var(--nl-space-4);
+  border-top: 1px dashed var(--nl-border);
+}
+
+/* ── 8. Auth-links footer (forgot + register on login) ────────────── */
+.nl-auth-links, .auth-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nl-space-4);
+  margin-top: var(--nl-space-6);
+  padding-top: var(--nl-space-5);
+  border-top: 1px solid var(--nl-border);
+}
+.nl-auth-link, .auth-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nl-space-2);
+  color: var(--nl-fg-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  padding: var(--nl-space-2) var(--nl-space-3);
+  border-radius: var(--nl-radius-md);
+  transition: color var(--nl-t-base), background var(--nl-t-base), transform var(--nl-t-base);
+}
+.nl-auth-link:hover, .auth-link:hover {
+  color: var(--nl-fg);
+  background: var(--nl-bg-hover);
+  transform: translateY(-1px);
+}
+.nl-auth-link-icon, .auth-link-icon {
+  width: 16px; height: 16px; fill: currentColor;
+  transition: transform var(--nl-t-base);
+}
+.nl-auth-link:hover .nl-auth-link-icon,
+.auth-link:hover .auth-link-icon { transform: scale(1.1); }
+.nl-auth-links-divider, .auth-links-divider {
+  width: 1px; height: 18px; background: var(--nl-border);
+}
+
+.nl-footer-link, .footer-link {
+  text-align: center;
+  margin: var(--nl-space-5) 0 0 0;
+  font-size: 0.9rem;
+  color: var(--nl-fg-subtle);
+}
+.nl-footer-link a, .footer-link a {
+  color: var(--nl-fg);
+  text-decoration: none;
+  font-weight: 500;
+}
+.nl-footer-link a:hover, .footer-link a:hover { text-decoration: underline; }
+
+@media (max-width: 380px) {
+  .nl-auth-links, .auth-links { flex-direction: column; gap: var(--nl-space-1); padding-top: var(--nl-space-4); }
+  .nl-auth-links-divider, .auth-links-divider { width: 28px; height: 1px; }
+}
+
+/* ── 9. Loading spinner + entry animations ────────────────────────── */
+.nl-spinner, .spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid rgba(0,0,0,0.25);
+  border-top-color: #000;
+  border-radius: 50%;
+  animation: nlSpin 720ms linear infinite;
+}
+.nl-btn-secondary .nl-spinner,
+button.secondary .spinner,
+.nl-spinner.on-light {
+  border-color: rgba(255,255,255,0.25);
+  border-top-color: var(--nl-fg);
+}
+@keyframes nlSpin { to { transform: rotate(360deg); } }
+
+@keyframes nlFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ── 10. Top menu (sticky glass nav rendered in AppComponent) ─────── */
+.nl-menu {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: var(--nl-space-6);
+  padding: 0 var(--nl-space-6);
+  height: 64px;
+  background: color-mix(in oklab, var(--nl-bg-elevated) 78%, transparent);
+  backdrop-filter: saturate(160%) blur(14px);
+  -webkit-backdrop-filter: saturate(160%) blur(14px);
+  border-bottom: 1px solid var(--nl-border);
+  font-family: var(--nl-font-display);
+}
+.nl-menu-brand {
+  display: inline-flex; align-items: center; gap: var(--nl-space-2);
+  font-weight: 600;
+  font-size: 1.05rem;
+  letter-spacing: 0.01em;
+  color: var(--nl-fg);
+}
+.nl-menu-brand .nl-menu-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: var(--nl-radius-sm);
+  background: var(--nl-accent); color: var(--nl-accent-text);
+  font-weight: 700; font-size: 0.95rem;
+}
+.nl-menu-links { display: flex; align-items: center; gap: var(--nl-space-1); }
+.nl-menu-link {
+  display: inline-flex; align-items: center; gap: var(--nl-space-2);
+  padding: var(--nl-space-2) var(--nl-space-3);
+  color: var(--nl-fg-muted);
+  border-radius: var(--nl-radius-md);
+  font-weight: 500;
+  font-size: 0.92rem;
+  transition: color var(--nl-t-fast), background var(--nl-t-fast);
+}
+.nl-menu-link:hover { color: var(--nl-fg); background: var(--nl-bg-hover); }
+.nl-menu-link.active {
+  color: var(--nl-fg);
+  background: var(--nl-bg-hover);
+  box-shadow: inset 0 -2px 0 var(--nl-accent);
+}
+.nl-menu-link svg { width: 16px; height: 16px; fill: currentColor; }
+
+.nl-menu-tail { margin-left: auto; display: flex; align-items: center; gap: var(--nl-space-3); }
+.nl-menu-icon-btn {
+  width: 36px; height: 36px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--nl-fg-muted);
+  border-radius: var(--nl-radius-md);
+  transition: color var(--nl-t-fast), background var(--nl-t-fast);
+}
+.nl-menu-icon-btn:hover { color: var(--nl-fg); background: var(--nl-bg-hover); }
+.nl-menu-icon-btn svg { width: 18px; height: 18px; fill: currentColor; }
+
+/* User-menu dropdown */
+.nl-menu-user {
+  position: relative;
+  display: inline-flex; align-items: center; gap: var(--nl-space-2);
+  padding: var(--nl-space-1) var(--nl-space-2);
+  border-radius: var(--nl-radius-md);
+  cursor: pointer;
+  transition: background var(--nl-t-fast);
+}
+.nl-menu-user:hover { background: var(--nl-bg-hover); }
+.nl-menu-avatar {
+  width: 32px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: var(--nl-accent);
+  color: var(--nl-accent-text);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.nl-menu-email {
+  color: var(--nl-fg-muted);
+  font-size: 0.85rem;
+  max-width: 180px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nl-menu-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--nl-bg-elevated);
+  border: 1px solid var(--nl-border);
+  border-radius: var(--nl-radius-md);
+  padding: var(--nl-space-3);
+  min-width: 240px;
+  box-shadow: var(--nl-shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nl-space-2);
+  font-family: var(--nl-font-body);
+}
+.nl-menu-dropdown-email { color: var(--nl-fg); font-weight: 600; font-size: 0.92rem; }
+.nl-menu-dropdown-role {
+  display: inline-block;
+  font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 2px 6px; border-radius: var(--nl-radius-pill);
+  background: var(--nl-bg-card); color: var(--nl-fg-muted);
+  align-self: flex-start;
+  margin-bottom: var(--nl-space-2);
+}
+.nl-menu-dropdown-role.admin { background: var(--nl-danger); color: #fff; }
+.nl-menu-dropdown a, .nl-menu-dropdown button {
+  text-align: left;
+  padding: var(--nl-space-2);
+  color: var(--nl-fg-muted);
+  border-radius: var(--nl-radius-sm);
+  font-size: 0.9rem;
+  transition: color var(--nl-t-fast), background var(--nl-t-fast);
+}
+.nl-menu-dropdown a:hover, .nl-menu-dropdown button:hover { color: var(--nl-fg); background: var(--nl-bg-hover); }
+.nl-menu-dropdown-divider { height: 1px; background: var(--nl-border); margin: var(--nl-space-1) 0; }
+
+/* Main content offset for the fixed menu */
+.nl-app-main.has-menu { padding-top: 64px; }
+
+/* ── 11. Chat layout (after stripping the inline header) ──────────── */
+.nl-chat-layout {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 64px);
+  background: var(--nl-bg);
+  color: var(--nl-fg);
+  max-width: 980px;
+  margin: 0 auto;
+  border-left: 1px solid var(--nl-border);
+  border-right: 1px solid var(--nl-border);
+}
+.nl-chat-messages {
+  flex: 1;
+  padding: var(--nl-space-6);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nl-space-5);
+}
+.nl-chat-message { display: flex; }
+.nl-chat-message.user { justify-content: flex-end; }
+.nl-chat-bubble {
+  max-width: 75%;
+  padding: var(--nl-space-4) var(--nl-space-6);
+  border-radius: var(--nl-radius-md);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  animation: nlFadeIn var(--nl-t-slow) both;
+}
+.nl-chat-message.user .nl-chat-bubble {
+  background: var(--nl-bg-elevated);
+  color: var(--nl-fg);
+}
+.nl-chat-message.assistant .nl-chat-bubble {
+  background: var(--nl-bg-card);
+  border: 1px solid var(--nl-border);
+  color: var(--nl-fg);
+}
+.nl-typing-indicator { color: var(--nl-fg-subtle); font-style: italic; align-self: flex-start; }
+.nl-chat-input-area {
+  padding: var(--nl-space-5) var(--nl-space-6);
+  border-top: 1px solid var(--nl-border);
+  display: flex; gap: var(--nl-space-3); align-items: center;
+  background: var(--nl-bg-elevated);
+}
+.nl-chat-input-area textarea { flex: 1; background: var(--nl-bg-input); border: 1px solid var(--nl-border); color: var(--nl-fg); padding: var(--nl-space-3); border-radius: var(--nl-radius-md); resize: none; font-family: inherit; }
+.nl-chat-input-area button { padding: var(--nl-space-3) var(--nl-space-5); background: var(--nl-accent); color: var(--nl-accent-text); border-radius: var(--nl-radius-md); font-weight: 600; }
+.nl-chat-input-area button:disabled { opacity: 0.5; cursor: not-allowed; }
+.nl-chat-voice-btn { padding: var(--nl-space-3); background: var(--nl-bg-input); color: var(--nl-fg); border-radius: var(--nl-radius-md); }
+.nl-chat-voice-btn.recording { background: var(--nl-danger); color: #fff; animation: nlPulse 1.5s infinite; }
+@keyframes nlPulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+/* ── 12. Admin layout (after stripping the inline header) ─────────── */
+.nl-admin-layout {
+  min-height: calc(100vh - 64px);
+  background: var(--nl-bg);
+  padding: 0 0 var(--nl-space-12) 0;
+  position: relative;
+}
+.nl-admin-who {
+  padding: var(--nl-space-4) var(--nl-space-6);
+  color: var(--nl-fg-muted);
+  margin: 0;
+  font-size: 0.9rem;
+}
+.nl-role-pill {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--nl-radius-pill);
+  font-size: 0.65rem;
+  margin-left: var(--nl-space-2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  background: var(--nl-bg-card);
+  color: var(--nl-fg-muted);
+}
+.nl-role-pill.admin { background: var(--nl-danger); color: #fff; }
+
+.nl-admin-card {
+  margin: 0 var(--nl-space-6);
+  background: var(--nl-bg-card);
+  border: 1px solid var(--nl-border);
+  border-radius: var(--nl-radius-md);
+  padding: var(--nl-space-5);
+}
+.nl-admin-card h3 { margin: 0 0 var(--nl-space-4) 0; font-weight: 500; }
+
+.nl-admin-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.nl-admin-table th, .nl-admin-table td { text-align: left; padding: var(--nl-space-3); border-bottom: 1px solid var(--nl-border); vertical-align: middle; }
+.nl-admin-table th { font-weight: 500; color: var(--nl-fg-subtle); text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.08em; }
+.nl-admin-table tbody tr { transition: background var(--nl-t-fast); }
+.nl-admin-table tbody tr:hover { background: var(--nl-bg-hover); }
+.nl-admin-table tbody tr.is-self { background: var(--nl-danger-bg); }
+
+.nl-admin-actions { display: flex; gap: var(--nl-space-3); align-items: center; padding: var(--nl-space-4) var(--nl-space-6); }
+.nl-admin-actions select { background: var(--nl-bg-input); color: var(--nl-fg); border: 1px solid var(--nl-border); padding: var(--nl-space-2) var(--nl-space-3); border-radius: var(--nl-radius-sm); font-size: 0.85rem; cursor: pointer; }
+.nl-admin-actions select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.nl-mono { font-family: var(--nl-font-mono); color: var(--nl-fg-subtle); }
+.nl-you-badge {
+  margin-left: var(--nl-space-2);
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--nl-radius-pill);
+  background: var(--nl-danger);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.nl-empty-row { text-align: center; padding: var(--nl-space-6); color: var(--nl-fg-subtle); font-style: italic; }
+
+/* Magic-link banner (Phase 25 reused) */
+.nl-magic-banner {
+  display: flex; align-items: center; gap: var(--nl-space-4);
+  margin: 0 var(--nl-space-6) var(--nl-space-4) var(--nl-space-6);
+  padding: var(--nl-space-3) var(--nl-space-5);
+  background: var(--nl-warning-bg);
+  border: 1px solid rgba(255, 152, 0, 0.55);
+  border-radius: var(--nl-radius-md);
+  color: #ffd180;
+  animation: nlFadeIn var(--nl-t-slow) ease-out;
+}
+.nl-magic-banner strong { color: var(--nl-fg); font-weight: 500; }
+.nl-magic-banner-sub { color: #ffd180; font-size: 0.85rem; line-height: 1.4; display: block; margin-top: 2px; }
+.nl-magic-banner-icon { font-size: 1.4rem; line-height: 1; }
+.nl-magic-banner-dismiss {
+  background: transparent; color: #ffd180;
+  border: 1px solid rgba(255, 152, 0, 0.45);
+  border-radius: var(--nl-radius-sm);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.nl-magic-banner-dismiss:hover { background: rgba(255, 152, 0, 0.20); color: var(--nl-fg); }
+
+/* Toast error (Admin) */
+.nl-toast-error {
+  position: fixed; right: 1.5rem; bottom: 1.5rem;
+  display: flex; gap: var(--nl-space-2); align-items: center;
+  background: #b71c1c; color: #fff;
+  padding: 0.75rem 1rem;
+  border-radius: var(--nl-radius-md);
+  box-shadow: var(--nl-shadow-md);
+  animation: nlSlideIn var(--nl-t-slow) ease-out;
+}
+@keyframes nlSlideIn {
+  from { transform: translateY(20px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.nl-toast-error button {
+  background: transparent;
+  color: #fff;
+  padding: 0 var(--nl-space-1);
+  font-size: 1rem;
+}
+
+/* ── 13. Landing page (Three.js canvas overlay + hero) ──────────────
+   The legacy selectors used by landing.component.ts are aliased next
+   to the .nl-landing-* names so the existing template keeps working
+   unchanged. Tokens drive every color so the page reacts to theme
+   toggles like the rest of the SPA. */
+.nl-landing-container, .landing-container {
+  position: relative;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background: var(--nl-bg);
+  color: var(--nl-fg);
+}
+.nl-landing-canvas, .canvas-container {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+.nl-landing-content, .content {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  pointer-events: none;
+}
+.nl-landing-hero-title, .hero-title {
+  font-family: var(--nl-font-display);
+  font-size: clamp(2.5rem, 7vw, 5rem);
+  margin: 0;
+  font-weight: 300;
+  letter-spacing: 0.2rem;
+  opacity: 0;
+}
+.nl-landing-hero-subtitle, .hero-subtitle {
+  font-size: 1.25rem;
+  margin-top: var(--nl-space-4);
+  color: var(--nl-fg-muted);
+  opacity: 0;
+}
+.nl-landing-cta, .cta-button {
+  margin-top: var(--nl-space-8);
+  padding: var(--nl-space-4) var(--nl-space-8);
+  font-size: 1.1rem;
+  background: transparent;
+  border: 1px solid var(--nl-fg);
+  color: var(--nl-fg);
+  cursor: pointer;
+  pointer-events: auto;
+  border-radius: var(--nl-radius-sm);
+  transition: background var(--nl-t-base), color var(--nl-t-base), transform var(--nl-t-base);
+  opacity: 0;
+  letter-spacing: 0.02em;
+}
+.nl-landing-cta:hover, .cta-button:hover {
+  background: var(--nl-fg);
+  color: var(--nl-bg);
+  transform: translateY(-1px);
+}

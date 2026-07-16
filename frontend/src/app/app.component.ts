@@ -1,0 +1,94 @@
+import { Component, DestroyRef, inject, OnInit } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { CommonModule } from '@angular/common';
+import {
+  Router,
+  RouterOutlet,
+  NavigationEnd,
+  ActivatedRoute
+} from '@angular/router';
+import { filter, map, startWith } from 'rxjs/operators';
+import { MenuComponent } from './components/menu/menu.component';
+
+/**
+ * Phase 27 — AppComponent shell.
+ *
+ * Renders a sticky top-level <app-menu> for all routes EXCEPT those whose
+ * route data declares `hideMenu: true`. The /, /login, /register,
+ * /forgot-password, /reset-password, /verify-email, and /admin-login
+ * routes all carry that flag (see app.routes.ts), so the menu is correctly
+ * hidden on every public surface while still adapting to new auth-only
+ * routes automatically.
+ *
+ * Why a `data`-flag check instead of a hard-coded URL allowlist: the
+ * route config is the single source of truth for "is this an auth route?";
+ * any future auth-protected page (e.g. /settings, /billing) gets a menu
+ * automatically with no AppComponent edit.
+ */
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, RouterOutlet, MenuComponent],
+  template: `
+    <app-menu *ngIf="(showMenu$ | async)"></app-menu>
+    <main
+      class="nl-app-main"
+      [class.has-menu]="(showMenu$ | async)"
+    >
+      <router-outlet></router-outlet>
+    </main>
+  `,  // Phase 27 — zero per-component CSS. All visual surface lives in
+  // src/styles.scss under .nl-app-main / .has-menu utility classes
+  // (and the menu's own .nl-menu-* palette). The comment above
+  // REPLACES the round-1 inline-docstring because that docstring
+  // contained literal backticks (`anyComponentStyle: 4 kB`) inside a
+  // backtick-delimited template literal, which caused the JS parser
+  // to close the literal early and trigger TS2304 on `anyComponentStyle`
+  // and `kB`. Keeping the visual intent — "we ship zero per-component
+  // CSS so the anyComponentStyle budget is trivially honored" — but in
+  // a form that is unambiguously NOT inside a template-literal region.
+  styles: [] 
+})
+export class AppComponent implements OnInit {
+  private readonly router = inject(Router);
+  private readonly activatedRoute = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
+
+  /**
+   * Live boolean stream: `true` iff the currently active deep child of the
+   * route tree carries `hideMenu: true` in its data. Dataset to `false`
+   * triggers the <app-menu> render + the .has-menu class on <main>.
+   */
+  public readonly showMenu$ = this.router.events.pipe(
+    filter((event): event is NavigationEnd => event instanceof NavigationEnd),
+    // Emit the current value immediately so the very first render isn't
+    // delayed by one NavigationEnd (i.e., users see the menu on cold load
+    // without a one-frame flash of "no menu").
+    startWith(null),
+    map(() => this.computeShowMenu())
+  );
+
+  ngOnInit(): void {
+    // Take-until-destroyed via DestroyRef keeps the listener cleanup tight
+    // to the component lifetime; Angular handles the unsubscribe on
+    // app teardown via the destroyRef binding, no manual ngOnDestroy hook
+    // needed. (Subscribe is a no-op here because showMenu$ already wires
+    // itself up to Router events at field-init time, so we just kick the
+    // pipeline into evaluating on first render.)
+    this.showMenu$.pipe(takeUntilDestroyed(this.destroyRef)).subscribe();
+  }
+
+  /**
+   * Walk the activated-route tree to the deepest child and inspect its
+   * `data` map for `hideMenu`. Default: false (menu shows). Routes whose
+   * data has `hideMenu: true` opt out.
+   */
+  private computeShowMenu(): boolean {
+    let r = this.activatedRoute.snapshot;
+    while (r.firstChild) {
+      r = r.firstChild;
+    }
+    const hide = r.data && r.data['hideMenu'];
+    return hide !== true;
+  }
+}

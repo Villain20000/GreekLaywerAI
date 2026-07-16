@@ -1,0 +1,13 @@
+<div class="verify-container">
+  <div class="verify-box">
+    <h2>Verifying…</h2>
+    <p *ngIf="!finished">Hang on while we activate your account.</p>
+    <div *ngIf="finished && success" class="success-msg">
+      Email verified. Signing you in&hellip;
+    </div>
+    <div *ngIf="finished && !success" class="error-msg">{{ error }}</div>
+    <p *ngIf="finished && !success" class="footer-link">
+      <a routerLink="/login">Back to sign in</a>
+    </p>
+  </div>
+</div>

@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # Database with pgvector
+  db:
+    image: ankane/pgvector:v0.5.1
+    environment:
+      POSTGRES_USER: nomos_admin
+      POSTGRES_PASSWORD: nomos_password
+      POSTGRES_DB: nomos_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - nomos-network
+
+  # Node.js Backend
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "3000:3000"
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=nomos_admin
+      - DB_PASSWORD=nomos_password
+      - DB_NAME=nomos_db
+      - OLLAMA_URL=http://ollama:11434
+      # Phase 31: dedicated embed model used by RAG (must be `ollama pull`ed
+      # once). Default `bge-m3` emits 1024-dim vectors which match the
+      # `legislation_embeddings.embedding vector(1024)` column. Swap from
+      # `nomic-embed-text` (768-dim, weak cross-lingual) to `bge-m3` for
+      # properly multilingual alignment — Greek-language queries now retrieve
+      # Greek-titled legislation correctly.
+      - OLLAMA_EMBED_MODEL=bge-m3
+      - OLLAMA_EMBED_DIM=1024
+      - STRIPE_SECRET_KEY=sk_test_mock
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    networks:
+      - nomos-network
+
+  # Redis for BullMQ
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - nomos-network
+
+  # Angular Frontend
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "4200:4200"
+    depends_on:
+      - backend
+    networks:
+      - nomos-network
+
+  # Ollama for Gemma 4 Runtime (with GPU pass-through if available)
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - nomos-network
+    # To enable GPU acceleration, uncomment the deploy section below:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  pgdata:
+  ollama_data:
+
+networks:
+  nomos-network:
+    driver: bridge
