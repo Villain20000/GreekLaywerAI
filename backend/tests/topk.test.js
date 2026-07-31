@@ -113,7 +113,7 @@ describe('ragService top-K default (Phase 34 regression lock)', () => {
       const res = await request(app)
         .post('/api/ai/audio-query')
         .set('Authorization', `Bearer ${entToken}`)
-        .attach('audio', Buffer.from('fake-audio-data'), 'test.webm');
+        .attach('audio', Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('fake')]), 'test.webm');
 
       expect(res.statusCode).toEqual(200);
       expect(ragService.retrieveContext).toHaveBeenCalledTimes(1);

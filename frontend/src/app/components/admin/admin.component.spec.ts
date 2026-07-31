@@ -9,7 +9,7 @@ describe('AdminComponent', () => {
   let fixture: ComponentFixture<AdminComponent>;
   let component: AdminComponent;
   let adminStub: jasmine.SpyObj<AdminService>;
-  let authStub: { userValue: AdminUser | null; logout: jasmine.Spy };
+  let authStub: { userValue: AdminUser | null; logout: jasmine.Spy; consumeMagicLinkBannerFlag: jasmine.Spy };
   let routerStub: { navigate: jasmine.Spy };
 
   beforeEach(async () => {

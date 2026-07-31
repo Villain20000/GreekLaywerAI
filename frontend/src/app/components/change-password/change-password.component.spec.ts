@@ -15,7 +15,7 @@ describe('ChangePasswordComponent', () => {
     mockAuthService = {
       changePassword: jasmine
         .createSpy('changePassword')
-        .mockResolvedValue({ ok: true })
+        .and.resolveTo({ ok: true })
     };
     mockRouter = { navigate: jasmine.createSpy('navigate') };
 
@@ -94,7 +94,7 @@ describe('ChangePasswordComponent', () => {
   }));
 
   it('should surface server error and stop loading on failure', fakeAsync(() => {
-    mockAuthService.changePassword.mockResolvedValue({
+    mockAuthService.changePassword.and.resolveTo({
       ok: false,
       error: 'Password change failed',
       status: 400

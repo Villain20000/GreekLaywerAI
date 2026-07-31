@@ -9,6 +9,12 @@ import { ForgotPasswordComponent } from './components/forgot-password/forgot-pas
 import { ResetPasswordComponent } from './components/reset-password/reset-password.component';
 import { VerifyEmailComponent } from './components/verify-email/verify-email.component';
 import { MagicLoginComponent } from './components/magic-login/magic-login.component';
+import { DocumentsComponent } from './components/documents/documents.component';
+import { ConversationsComponent } from './components/conversations/conversations.component';
+import { BillingComponent } from './components/billing/billing.component';
+import { SubscriptionsComponent } from './components/subscriptions/subscriptions.component';
+import { ProfileComponent } from './components/profile/profile.component';
+import { AdminDocumentsComponent } from './components/admin-documents/admin-documents.component';
 import { authGuard } from './guards/auth.guard';
 import { adminGuard } from './guards/admin.guard';
 
@@ -40,6 +46,12 @@ export const routes: Routes = [
     component: ChangePasswordComponent,
     canActivate: [authGuard]
   },
+  { path: 'documents', component: DocumentsComponent, canActivate: [authGuard] },
+  { path: 'conversations', component: ConversationsComponent, canActivate: [authGuard] },
+  { path: 'billing', component: BillingComponent, canActivate: [authGuard] },
+  { path: 'subscriptions', component: SubscriptionsComponent, canActivate: [authGuard] },
+  { path: 'profile', component: ProfileComponent, canActivate: [authGuard] },
   { path: 'admin', component: AdminComponent, canActivate: [adminGuard] },
+  { path: 'admin/documents', component: AdminDocumentsComponent, canActivate: [adminGuard] },
   { path: '**', redirectTo: '' }
 ];

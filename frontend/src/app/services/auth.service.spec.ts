@@ -1,5 +1,5 @@
 import { TestBed } from '@angular/core/testing';
-import { AuthService } from './auth.service';
+import { AuthService, AuthUser } from './auth.service';
 import { Router } from '@angular/router';
 
 describe('AuthService', () => {
@@ -51,38 +51,52 @@ describe('AuthService', () => {
   });
 
   describe('register()', () => {
-    const originalFetch = global.fetch;
+    const originalFetch = globalThis.fetch;
 
     afterEach(() => {
-      global.fetch = originalFetch;
+      globalThis.fetch = originalFetch;
     });
 
-    it('should store token and user on a 200 response', async () => {
-      const fakeUser = {
+    // Phase 24: register no longer mints a JWT. Success returns
+    // `{ ok: true, requires_verification: true, user }` and nothing is
+    // stored in localStorage — the JWT comes later from /verify-email.
+    it('should return requires_verification on a 200 response and store NO token', async () => {
+      const fakeUser: AuthUser = {
         id: 1,
         email: 'new@nomos.ai',
         role: 'user',
-        subscription_tier: 'basic'
+        subscription_tier: 'basic',
+        token_version: 1,
+        verified_at: null
       };
-      global.fetch = jasmine
+      globalThis.fetch = jasmine
         .createSpy('fetch')
         .and.returnValue(
           Promise.resolve({
             ok: true,
-            json: () => Promise.resolve({ token: 'jwt-x', user: fakeUser })
+            json: () =>
+              Promise.resolve({
+                ok: true,
+                requires_verification: true,
+                user: fakeUser
+              })
           } as Response)
         );
 
       const result = await service.register('new@nomos.ai', 'password123');
-      expect(result).toEqual({ ok: true });
-      expect(localStorage.getItem('nomos_token')).toBe('jwt-x');
-      expect(JSON.parse(localStorage.getItem('nomos_user')!)).toEqual(fakeUser);
-      expect(service.tokenValue).toBe('jwt-x');
-      expect(service.userValue).toEqual(fakeUser);
+      expect(result).toEqual({
+        ok: true,
+        requires_verification: true,
+        user: fakeUser
+      });
+      // No token is issued at registration time.
+      expect(localStorage.getItem('nomos_token')).toBeNull();
+      expect(service.tokenValue).toBeNull();
+      expect(service.userValue).toBeNull();
     });
 
     it('should return ok:false with the server error message on a 4xx', async () => {
-      global.fetch = jasmine
+      globalThis.fetch = jasmine
         .createSpy('fetch')
         .and.returnValue(
           Promise.resolve({
@@ -103,7 +117,7 @@ describe('AuthService', () => {
     });
 
     it('should return ok:false with a network error message when fetch throws', async () => {
-      global.fetch = jasmine.createSpy('fetch').and.rejectWith(new Error('boom'));
+      globalThis.fetch = jasmine.createSpy('fetch').and.rejectWith(new Error('boom'));
 
       const result = await service.register('a@b.com', 'password123');
       expect(result.ok).toBeFalse();
@@ -117,7 +131,7 @@ describe('AuthService', () => {
   });
 
   describe('changePassword()', () => {
-    const originalFetch = global.fetch;
+    const originalFetch = globalThis.fetch;
 
     beforeEach(() => {
       // Seed a token so the service picks it up at construction time.
@@ -125,15 +139,15 @@ describe('AuthService', () => {
     });
 
     afterEach(() => {
-      global.fetch = originalFetch;
+      globalThis.fetch = originalFetch;
     });
 
     it('should POST to /change-password and return ok:true on 200', async () => {
       // After construction the service fires refreshFromServer() in the
       // background. We only want to assert on the explicit changePassword()
-      // call, so override global.fetch first with a fallback that answers
+      // call, so override globalThis.fetch first with a fallback that answers
       // every call identically, then assert on URL+method to disambiguate.
-      const fetchSpy = spyOn(global, 'fetch').and.callFake(
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(
         () =>
           Promise.resolve({
             ok: true,
@@ -160,7 +174,7 @@ describe('AuthService', () => {
     });
 
     it('should surface server error message on a 4xx', async () => {
-      spyOn(global, 'fetch').and.callFake(
+      spyOn(globalThis, 'fetch').and.callFake(
         () =>
           Promise.resolve({
             ok: false,
@@ -183,7 +197,7 @@ describe('AuthService', () => {
     });
 
     it('should return ok:false on a network error', async () => {
-      spyOn(global, 'fetch').and.rejectWith(new Error('offline'));
+      spyOn(globalThis, 'fetch').and.rejectWith(new Error('offline'));
 
       service = new AuthService(mockRouter);
 

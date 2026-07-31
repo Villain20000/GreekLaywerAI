@@ -1,12 +1,24 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const aiRoutes = require('./routes/ai');
 const billingRoutes = require('./routes/billing');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
+const conversationsRoutes = require('./routes/conversations');
+const documentsRoutes = require('./routes/documents');
+const subscriptionsRoutes = require('./routes/subscriptions');
+const gdprRoutes = require('./routes/gdpr');
+const webhookRoutes = require('./routes/webhook');
 const privacyShield = require('./middlewares/privacyShield');
+const { securityHeaders, csrfProtection } = require('./middlewares/security');
+const { requestLogger } = require('./middlewares/requestLogger');
+const { metricsMiddleware, metricsHandler } = require('./middlewares/metrics');
 const { authMiddleware } = require('./middlewares/authMiddleware');
 const ollamaService = require('./services/ollamaService');
+const inferenceQueue = require('./services/inferenceQueue');
+const stripeService = require('./services/stripeService');
+const db = require('./config/db');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -21,20 +33,111 @@ const port = process.env.PORT || 3000;
 // to rate-limit the wrong value and DoS the whole site.
 app.set('trust proxy', process.env.TRUST_PROXY || 'uniquelocal,loopback');
 
-app.use(cors());
-app.use(express.json());
+// ===========================================================================
+// Phase 29: Security hardening.
+// ===========================================================================
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:', 'blob:'],
+        connectSrc: ["'self'"],
+        frameAncestors: ["'none'"]
+      }
+    },
+    crossOriginEmbedderPolicy: false // keep blob: media streaming working
+  })
+);
+
+// CORS origin whitelist from env (comma-separated). No origins configured
+// → mirror the old permissive dev behavior; production MUST set it.
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+app.use(
+  cors({
+    origin: allowedOrigins.length
+      ? (origin, cb) => {
+          if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+          return cb(new Error('Not allowed by CORS'));
+        }
+      : true,
+    credentials: false
+  })
+);
+
+// Stripe webhook needs the RAW body for signature verification, so it is
+// mounted BEFORE the JSON parsers (body-parser skips already-parsed paths).
+app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+app.use(requestLogger);
+app.use(metricsMiddleware);
+app.use(securityHeaders);
+app.use(csrfProtection);
 app.use(privacyShield); // Apply globally for NomosAI
 
 // Phase 28 (pre-warm): anonymous health endpoints. Registered BEFORE the
 // protected `/api/ai` mount so they short-circuit before authMiddleware
 // and never require a Bearer token. Useful for orchestrator liveness
 // probes and operator post-deploy verification.
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
+//
+// Phase 29: enhanced health check — DB, Redis, Ollama warmup, Stripe
+// config, and inference-queue status. 200 when everything is up,
+// 503 when any critical check is down.
+async function dbHealth() {
+  const start = Date.now();
+  try {
+    await db.query('SELECT 1');
+    return { status: 'up', latency_ms: Date.now() - start };
+  } catch (err) {
+    return { status: 'down', latency_ms: Date.now() - start, error: err.message };
+  }
+}
+
+app.get('/health', async (req, res) => {
+  const [database, redis, queue, ollama] = await Promise.all([
+    dbHealth(),
+    inferenceQueue.pingRedis().then((latency) => ({
+      status: latency !== null ? 'up' : 'down',
+      latency_ms: latency
+    })),
+    inferenceQueue.getQueueStatus(),
+    Promise.resolve(ollamaService.getWarmupStatus())
+  ]);
+
+  const checks = {
+    database,
+    redis,
+    queue,
+    ollama: {
+      status: ollama.status,
+      embedModel: ollama.embedModel,
+      chatModel: ollama.chatModel,
+      embedDim: ollama.embedDim,
+      embedWarmed: ollama.embedWarmed,
+      chatWarmed: ollama.chatWarmed
+    },
+    stripe: {
+      status: stripeService.isConfigured() ? 'configured' : 'missing'
+    }
+  };
+
+  const anyDown = database.status === 'down' || redis.status === 'down';
+  const status = anyDown ? 'unhealthy' : 'ok';
+
+  res.status(anyDown ? 503 : 200).json({
+    status,
     service: 'NomosAI Backend',
+    timestamp: new Date().toISOString(),
     localPrivacyEnabled: req.isLocallyProcessed,
-    ollama: ollamaService.getWarmupStatus()
+    checks
   });
 });
 
@@ -52,19 +155,54 @@ app.get('/api/ai/health', (req, res) => {
 app.use('/api/auth', authRoutes); // buildAuthRouter(factory) already wired in require
 app.use('/api/ai', authMiddleware, aiRoutes); // Per-route RBAC inside ai.js
 app.use('/api/billing', authMiddleware, billingRoutes); // Per-route RBAC inside billing.js
+app.use('/api/conversations', authMiddleware, conversationsRoutes);
+app.use('/api/documents', authMiddleware, documentsRoutes);
+app.use('/api/subscriptions', authMiddleware, subscriptionsRoutes);
+app.use('/api/gdpr', authMiddleware, gdprRoutes);
 app.use('/api/admin', adminRoutes); // admin-only (gated inside admin.js)
+app.post('/api/billing/webhook', webhookRoutes); // raw-body, signature-verified
 
-app.listen(port, () => {
+// Phase 29: Prometheus metrics endpoint (no auth — scraped by Prometheus).
+app.get('/metrics', metricsHandler);
+
+// Phase 29: graceful shutdown — stop accepting connections, drain, exit.
+const server = app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
-  // Phase 28: pre-warm gemma:2b (chat) and nomic-embed-text (embed) so
-  // the first /api/ai/query doesn't pay the ~180 s cold-load penalty.
-  // Fire-and-forget: app.listen has already returned, so requests are
-  // accepted immediately; /api/ai/health surfaces the warming state so
-  // callers (or K8s readinessProbe) can defer real traffic until ready.
+  // Phase 28: pre-warm gemma:2b (chat) and bge-m3 (embed) so the first
+  // /api/ai/query doesn't pay the ~180 s cold-load penalty. Fire-and-forget.
   ollamaService.warmup().catch((err) => {
-    // warmup() is internally try/caught per leg, so an error reaching
-    // this catch is unexpected (e.g. warmupPromise rejection somehow
-    // escaped). Log loudly but never crash the boot path.
     console.error(`[warmup] unhandled error: ${err && err.message}`);
   });
+  // Phase 29: start the inference queue worker (idempotent; no-op when
+  // Redis is not configured).
+  inferenceQueue.startWorker();
 });
+
+async function shutdown(signal) {
+  console.log(`[SHUTDOWN] ${signal} received — draining connections`);
+  const forceExit = setTimeout(() => {
+    console.error('[SHUTDOWN] Timed out after 30s — forcing exit');
+    process.exit(1);
+  }, 30000);
+  forceExit.unref();
+
+  try {
+    if (typeof server.closeIdleConnections === 'function') {
+      server.closeIdleConnections();
+    }
+    await new Promise((resolve) => server.close(resolve));
+    console.log('[SHUTDOWN] HTTP server closed');
+  } catch (err) {
+    console.error('[SHUTDOWN] Error closing server:', err.message);
+  }
+
+  try { await db.end(); console.log('[SHUTDOWN] DB pool closed'); } catch (err) { console.error('[SHUTDOWN] DB close error:', err.message); }
+  try { await inferenceQueue.closeQueue(); console.log('[SHUTDOWN] Queue closed'); } catch (err) { console.error('[SHUTDOWN] Queue close error:', err.message); }
+
+  clearTimeout(forceExit);
+  console.log('[SHUTDOWN] Clean exit');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

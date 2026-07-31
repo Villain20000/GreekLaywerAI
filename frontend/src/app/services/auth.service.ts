@@ -597,6 +597,43 @@ export class AuthService {
     }
   }
 
+  /**
+   * Phase 26: GDPR data export. Returns the raw server payload
+   * (profile + conversations + messages + documents) for the caller to
+   * serialize into a downloadable file.
+   */
+  async exportData(): Promise<unknown> {
+    const response = await fetch(`${this.apiUrl}/export`, {
+      method: 'GET',
+      headers: this.tokenValue
+        ? { Authorization: `Bearer ${this.tokenValue}` }
+        : {}
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data?.error || `Export failed (HTTP ${response.status})`);
+    }
+    return data;
+  }
+
+  /**
+   * Phase 26: GDPR account deletion. Irreversibly wipes the account and
+   * all associated data. Clears local auth state on success.
+   */
+  async deleteAccount(): Promise<void> {
+    const response = await fetch(`${this.apiUrl}/delete-account`, {
+      method: 'DELETE',
+      headers: this.tokenValue
+        ? { Authorization: `Bearer ${this.tokenValue}` }
+        : {}
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data?.error || `Delete account failed (HTTP ${response.status})`);
+    }
+    this.logout();
+  }
+
   // ========================================================================
   // Phase 25 (admin bypass): magic-link banner flag helpers.
   //

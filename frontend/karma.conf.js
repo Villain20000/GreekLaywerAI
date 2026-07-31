@@ -1,9 +1,13 @@
 // Karma configuration file, see link for more information
 // https://karma-runner.github.io/1.0/config/configuration-file.html
 
-process.env.CHROME_BIN = require('puppeteer').executablePath();
+const puppeteer = require('puppeteer');
 
-module.exports = function (config) {
+module.exports = async function (config) {
+  // Puppeteer >= v22 exposes an async executablePath(); karma's custom
+  // launcher reads CHROME_BIN synchronously, so resolve it before config.
+  process.env.CHROME_BIN = await puppeteer.executablePath();
+
   config.set({
     basePath: '',
     frameworks: ['jasmine', '@angular-devkit/build-angular'],

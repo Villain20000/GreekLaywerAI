@@ -1,39 +1,28 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { BehaviorSubject } from 'rxjs';
+import { BehaviorSubject, of } from 'rxjs';
 import { ChatComponent } from './chat.component';
 import { AuthService, AuthUser } from '../../services/auth.service';
 import { AiService } from '../../services/ai.service';
 import { provideRouter, Router } from '@angular/router';
 
 /**
- * Stub AiService that hands out observables no-ops for streamQuery/uploadAudio.
- * ChatComponent.onSubmit and sendAudioQuery both subscribe to those streams;
- * if the stubs were missing or threw synchronously, sendMessage would crash
- * before the spec could observe the header.
+ * Phase 29: the header (admin link / email chip) moved to the menu
+ * component in Phase 27; these specs verify what the chat component
+ * actually owns: the message list, input handling, the typing indicator,
+ * and logout delegation.
  */
 function buildAiStub(): Partial<AiService> {
-  const emptyStream = {
-    subscribe: () => ({ unsubscribe: () => undefined })
-  };
   return {
-    streamQuery: jasmine.createSpy('streamQuery').and.returnValue(emptyStream),
-    uploadAudio: jasmine.createSpy('uploadAudio').and.returnValue(emptyStream)
+    streamQuery: jasmine.createSpy('streamQuery').and.returnValue(of('απάντηση')),
+    uploadAudio: jasmine.createSpy('uploadAudio').and.returnValue(of('ήχος'))
   };
 }
 
-describe('ChatComponent (reactive user$ wiring)', () => {
+describe('ChatComponent (message rendering + input handling)', () => {
   let fixture: ComponentFixture<ChatComponent>;
   let userSub: BehaviorSubject<AuthUser | null>;
   let mockAuth: Pick<AuthService, 'tokenValue' | 'ready$' | 'user$' | 'logout'>;
   let mockAi: Partial<AiService>;
-
-  function findAdminLink(): HTMLAnchorElement | null {
-    return fixture.nativeElement.querySelector('a.admin-link');
-  }
-
-  function findEmailChip(): HTMLElement | null {
-    return fixture.nativeElement.querySelector('.user-email');
-  }
 
   beforeEach(async () => {
     userSub = new BehaviorSubject<AuthUser | null>(null);
@@ -58,82 +47,49 @@ describe('ChatComponent (reactive user$ wiring)', () => {
     fixture = TestBed.createComponent(ChatComponent);
   });
 
-  it('hides the admin link and email chip when user$ is null', () => {
-    userSub.next(null);
+  it('starts with an empty message list and disabled send state', () => {
     fixture.detectChanges();
-    expect(findAdminLink()).toBeNull();
-    expect(findEmailChip()).toBeNull();
+    const bubbles = fixture.nativeElement.querySelectorAll('.nl-chat-bubble');
+    expect(bubbles.length).toBe(0);
+    const sendBtn = fixture.nativeElement.querySelector('.nl-chat-input-area button[type="button"]');
+    expect(sendBtn.disabled).toBeTrue();
   });
 
-  it('renders email chip but hides admin link for non-admin users', () => {
-    userSub.next({
-      id: 2,
-      email: 'user@nomos.ai',
-      role: 'user',
-      subscription_tier: 'basic'
-    });
+  it('renders the user and assistant messages after sendMessage()', async () => {
+    const component = fixture.componentInstance;
+    component.currentInput = 'Τι προβλέπει ο Αστικός Κώδικας;';
+    component.sendMessage();
     fixture.detectChanges();
-    expect(findAdminLink()).toBeNull();
-    expect(findEmailChip()?.textContent?.trim()).toBe('user@nomos.ai');
+    await fixture.whenStable();
+
+    const bubbles = fixture.nativeElement.querySelectorAll('.nl-chat-bubble');
+    expect(bubbles.length).toBe(2);
+    expect(bubbles[0].textContent.trim()).toBe('Τι προβλέπει ο Αστικός Κώδικας;');
+    expect(bubbles[1].textContent.trim()).toBe('απάντηση');
+    // Input is cleared after send.
+    expect(component.currentInput).toBe('');
+    // Assistant message arrives with role marker on the host row.
+    const rows = fixture.nativeElement.querySelectorAll('.nl-chat-message');
+    expect(rows[0].classList).toContain('user');
+    expect(rows[1].classList).toContain('assistant');
   });
 
-  it('renders both admin link and email chip for admin users', () => {
-    userSub.next({
-      id: 1,
-      email: 'admin@nomos.ai',
-      role: 'admin',
-      subscription_tier: 'enterprise'
-    });
+  it('does nothing on sendMessage with empty/whitespace input', () => {
+    const component = fixture.componentInstance;
+    component.currentInput = '   ';
+    component.sendMessage();
     fixture.detectChanges();
-    const link = findAdminLink();
-    expect(link).not.toBeNull();
-    expect(link?.textContent?.trim()).toBe('⚙ Admin');
-    expect(link?.getAttribute('href')).toBe('/admin');
-    expect(findEmailChip()?.textContent?.trim()).toBe('admin@nomos.ai');
+    expect(component.messages.length).toBe(0);
+    expect(mockAi.streamQuery).not.toHaveBeenCalled();
   });
 
-  it('reacts to a role promotion pushed via user$ without a page refresh', () => {
-    // Initial state: regular user.
-    userSub.next({
-      id: 1,
-      email: 'u@nomos.ai',
-      role: 'user',
-      subscription_tier: 'basic'
-    });
+  it('shows the typing indicator while an answer is pending', () => {
+    const component = fixture.componentInstance;
+    component.currentInput = 'ερώτηση';
+    component.sendMessage();
     fixture.detectChanges();
-    expect(findAdminLink()).toBeNull();
-
-    // /me refresh populates user$ with an admin role — e.g. another tab
-    // promoted this user. The header must light up automatically.
-    userSub.next({
-      id: 1,
-      email: 'u@nomos.ai',
-      role: 'admin',
-      subscription_tier: 'enterprise'
-    });
-    fixture.detectChanges();
-    expect(findAdminLink()).not.toBeNull();
-    expect(findEmailChip()?.textContent?.trim()).toBe('u@nomos.ai');
-  });
-
-  it('reacts to a role demotion pushed via user$', () => {
-    userSub.next({
-      id: 1,
-      email: 'u@nomos.ai',
-      role: 'admin',
-      subscription_tier: 'enterprise'
-    });
-    fixture.detectChanges();
-    expect(findAdminLink()).not.toBeNull();
-
-    userSub.next({
-      id: 1,
-      email: 'u@nomos.ai',
-      role: 'user',
-      subscription_tier: 'basic'
-    });
-    fixture.detectChanges();
-    expect(findAdminLink()).toBeNull();
+    const indicator = fixture.nativeElement.querySelector('.nl-typing-indicator');
+    expect(indicator).not.toBeNull();
   });
 
   it('logout() delegates to AuthService.logout', () => {

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const { authMiddleware, rbacMiddleware, ALLOWED_ROLES, ALLOWED_TIERS } = require('../middlewares/authMiddleware');
+const { logAudit, getAuditLogs } = require('../services/auditLog');
 
 // All admin endpoints require auth AND admin role.
 router.use(authMiddleware);
@@ -49,15 +50,30 @@ router.patch('/users/:id/role', async (req, res) => {
       });
     }
 
+    // Capture the previous role for the audit trail BEFORE the UPDATE.
+    const before = await db.query(
+      `SELECT role FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (before.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     const result = await db.query(
       `UPDATE users SET role = $1 WHERE id = $2
        RETURNING id, email, role, subscription_tier`,
       [role, userId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    await logAudit({
+      userId,
+      action: 'admin.role_changed',
+      resourceType: 'user',
+      resourceId: userId,
+      oldValue: { role: before.rows[0].role },
+      newValue: { role },
+      ipAddress: req.ip
+    });
 
     res.json({ user: result.rows[0] });
   } catch (error) {
@@ -80,17 +96,97 @@ router.patch('/users/:id/tier', async (req, res) => {
       });
     }
 
+    const before = await db.query(
+      `SELECT subscription_tier FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (before.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     const result = await db.query(
       `UPDATE users SET subscription_tier = $1 WHERE id = $2
        RETURNING id, email, role, subscription_tier`,
       [tier, userId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    await logAudit({
+      userId,
+      action: 'admin.tier_changed',
+      resourceType: 'user',
+      resourceId: userId,
+      oldValue: { tier: before.rows[0].subscription_tier },
+      newValue: { tier },
+      ipAddress: req.ip
+    });
 
     res.json({ user: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/admin/audit-log — paginated audit trail (admin only)
+router.get('/audit-log', async (req, res) => {
+  try {
+    const limit = Math.min(Number.parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
+    const rows = await getAuditLogs({
+      userId: req.query.userId ? Number.parseInt(req.query.userId, 10) : undefined,
+      action: req.query.action || undefined,
+      limit,
+      offset
+    });
+    res.json({ auditLog: rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/admin/documents — list every user's documents (admin only)
+router.get('/documents', async (req, res) => {
+  try {
+    const limit = Math.min(Number.parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
+    const result = await db.query(
+      `SELECT d.id, d.user_id, u.email AS user_email, d.filename, d.content_type,
+              d.metadata, d.created_at,
+              (SELECT COUNT(*) FROM legal_document_chunks c WHERE c.document_id = d.id) AS chunk_count
+       FROM legal_documents d
+       JOIN users u ON u.id = d.user_id
+       ORDER BY d.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json({ documents: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/admin/documents/:id — delete any user's document (admin only)
+router.delete('/documents/:id', async (req, res) => {
+  try {
+    const userId = parseUserId(req.params.id);
+    if (userId === null) {
+      return res.status(400).json({ error: 'Invalid document id' });
+    }
+    const result = await db.query(
+      `DELETE FROM legal_documents WHERE id = $1 RETURNING id, user_id, filename`,
+      [userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    await logAudit({
+      userId: result.rows[0].user_id,
+      action: 'document.deleted_by_admin',
+      resourceType: 'document',
+      resourceId: userId,
+      newValue: { filename: result.rows[0].filename },
+      ipAddress: req.ip
+    });
+    res.json({ ok: true, deletedId: userId });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

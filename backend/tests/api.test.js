@@ -543,14 +543,28 @@ describe('NomosAI API Endpoints', () => {
       expect(res.body).toHaveProperty('error', 'Access denied. Insufficient permissions.');
     });
 
+    // Phase 29: audio-query now enqueues an inference job and returns its
+    // jobId (frontend polls GET /api/ai/query/stream/:jobId). The upload
+    // must also pass magic-byte validation (WebM EBML header).
     it('should allow enterprise-role to use audio-query', async () => {
+      queueAuth({ id: 1, role: 'enterprise', subscription_tier: 'enterprise' });
+      const webm = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('fake-audio')]);
+      const res = await request(app)
+        .post('/api/ai/audio-query')
+        .set('Authorization', `Bearer ${enterpriseToken}`)
+        .attach('audio', webm, 'test.webm');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body).toHaveProperty('jobId');
+    });
+
+    it('should reject audio uploads whose magic bytes do not match an allowed audio type', async () => {
       queueAuth({ id: 1, role: 'enterprise', subscription_tier: 'enterprise' });
       const res = await request(app)
         .post('/api/ai/audio-query')
         .set('Authorization', `Bearer ${enterpriseToken}`)
-        .attach('audio', Buffer.from('fake-audio-data'), 'test.webm');
-      expect(res.statusCode).toEqual(200);
-      expect(res.text).toContain('Mock stream');
+        .attach('audio', Buffer.from('definitely-not-audio'), 'test.mp3');
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.error).toMatch(/Unsupported file type/);
     });
 
     it('should block user-role from multimodal upload with 403', async () => {
@@ -562,14 +576,28 @@ describe('NomosAI API Endpoints', () => {
       expect(res.statusCode).toEqual(403);
     });
 
+    // Phase 29: multimodal requires the enterprise tier AND valid PDF magic
+    // bytes (%PDF header).
     it('should allow enterprise-role to use multimodal upload', async () => {
       queueAuth({ id: 1, role: 'enterprise', subscription_tier: 'enterprise' });
+      const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.from('fake-pdf-data')]);
       const res = await request(app)
         .post('/api/ai/multimodal')
         .set('Authorization', `Bearer ${enterpriseToken}`)
-        .attach('file', Buffer.from('fake-pdf-data'), 'document.pdf');
+        .attach('file', pdf, 'document.pdf');
       expect(res.statusCode).toEqual(200);
       expect(res.body).toHaveProperty('response');
+    });
+
+    it('should reject multimodal uploads whose magic bytes do not match a document type', async () => {
+      queueAuth({ id: 1, role: 'enterprise', subscription_tier: 'enterprise' });
+      const binaryGarbage = Buffer.from([0x00, 0x01, 0x02, 0x03, 0xff, 0xfe, 0xfd, 0x00, 0x01]);
+      const res = await request(app)
+        .post('/api/ai/multimodal')
+        .set('Authorization', `Bearer ${enterpriseToken}`)
+        .attach('file', binaryGarbage, 'fake.gif');
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.error).toMatch(/Unsupported file type/);
     });
   });
 
@@ -625,6 +653,9 @@ describe('NomosAI API Endpoints', () => {
 
     it('should allow admin to patch a user role (no extra tv bump; authMiddleware reads fresh role)', async () => {
       queueAuth({ id: 99, role: 'admin' });
+      // Phase 29: admin.js captures the previous role for the audit trail
+      // BEFORE the UPDATE, so the mock needs a SELECT row first.
+      db.query.mockResolvedValueOnce({ rows: [{ role: 'user' }] });
       db.query.mockResolvedValueOnce({
         rows: [
           { id: 2, email: 'u2@nomos.ai', role: 'enterprise', subscription_tier: 'enterprise', token_version: 1 }

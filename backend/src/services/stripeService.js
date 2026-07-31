@@ -1,0 +1,194 @@
+// Phase 29: Real Stripe integration.
+//
+// Two modes:
+//   - Mock mode (no STRIPE_SECRET_KEY or value === 'sk_test_mock'): returns a
+//     local mock checkout URL so dev / tests keep working without Stripe.
+//     This preserves the pre-Phase-29 behavior and the api.test.js contract.
+//   - Live mode (real sk_test_/sk_live_ key): creates a real Stripe Checkout
+//     Session (mode: 'subscription') with price IDs read from env vars, and
+//     handles webhook events to populate `subscriptions` + `users`.
+
+const Stripe = require('stripe');
+const db = require('../config/db');
+const { logAudit } = require('./auditLog');
+
+const MOCK_KEY = 'sk_test_mock';
+const stripeKey = process.env.STRIPE_SECRET_KEY || MOCK_KEY;
+const stripe = Stripe(stripeKey);
+
+const isMockMode = stripeKey === MOCK_KEY;
+
+const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:4200';
+
+// Price IDs per tier, from the Stripe Dashboard. Configure via env vars.
+const TIER_PRICE_IDS = {
+  basic: process.env.STRIPE_PRICE_ID_BASIC,
+  pro: process.env.STRIPE_PRICE_ID_PRO,
+  enterprise: process.env.STRIPE_PRICE_ID_ENTERPRISE
+};
+
+function isConfigured() {
+  return !isMockMode;
+}
+
+/**
+ * Create a Stripe Checkout Session for the given tier.
+ * @param {object} opts { tier, user }
+ * @returns {Promise<{id: string, url: string}>}
+ */
+async function createCheckoutSession({ tier, user }) {
+  if (isMockMode) {
+    const mockUrl = `${APP_BASE_URL}/chat?mock_payment=success&tier=${encodeURIComponent(tier)}`;
+    return { id: `mock_cs_${Date.now()}`, url: mockUrl };
+  }
+
+  const priceId = TIER_PRICE_IDS[tier];
+  if (!priceId) {
+    throw new Error(
+      `No STRIPE_PRICE_ID_${tier.toUpperCase()} env var configured for tier '${tier}'.`
+    );
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [{ price: priceId, quantity: 1 }],
+    success_url: `${APP_BASE_URL}/chat?checkout=success`,
+    cancel_url: `${APP_BASE_URL}/billing?checkout=cancelled`,
+    client_reference_id: String(user.id),
+    customer_email: user.email,
+    metadata: { user_id: String(user.id), tier }
+  });
+
+  return { id: session.id, url: session.url };
+}
+
+/**
+ * Upsert a subscription row for a user and sync users.subscription_tier.
+ * Shared by the webhook handler and the subscriptions route.
+ */
+async function upsertSubscription({ userId, stripeCustomerId, stripeSubscriptionId, status, currentPeriodEnd, tier }) {
+  const result = await db.query(
+    `INSERT INTO subscriptions
+       (user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING
+     RETURNING id`,
+    [userId, stripeCustomerId, stripeSubscriptionId, status, currentPeriodEnd]
+  );
+
+  // If a row already exists (same stripe_subscription_id), update it instead.
+  if (!result.rows.length && stripeSubscriptionId) {
+    await db.query(
+      `UPDATE subscriptions
+       SET status = $2, current_period_end = $3
+       WHERE stripe_subscription_id = $1`,
+      [stripeSubscriptionId, status, currentPeriodEnd]
+    );
+  }
+
+  if (tier) {
+    await db.query(
+      `UPDATE users SET subscription_tier = $1 WHERE id = $2`,
+      [tier, userId]
+    );
+    await logAudit({
+      userId,
+      action: 'subscription.tier_changed',
+      resourceType: 'subscription',
+      resourceId: stripeSubscriptionId,
+      newValue: { tier, status }
+    });
+  }
+
+  return result.rows[0] || { updated: true };
+}
+
+/**
+ * Handle a verified Stripe webhook event.
+ * @param {object} event Stripe event object (constructEvent output)
+ */
+async function handleWebhookEvent(event) {
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      const userId = Number(session.client_reference_id || (session.metadata && session.metadata.user_id));
+      const tier = session.metadata && session.metadata.tier;
+      if (!userId) return { handled: false, reason: 'no user_id' };
+
+      let status = 'active';
+      let currentPeriodEnd = null;
+      if (session.subscription) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(session.subscription);
+          status = sub.status;
+          currentPeriodEnd = sub.current_period_end
+            ? new Date(sub.current_period_end * 1000).toISOString()
+            : null;
+        } catch (err) {
+          console.error('[STRIPE] Failed to retrieve subscription:', err.message);
+        }
+      }
+
+      await upsertSubscription({
+        userId,
+        stripeCustomerId: typeof session.customer === 'string' ? session.customer : null,
+        stripeSubscriptionId: typeof session.subscription === 'string' ? session.subscription : null,
+        status,
+        currentPeriodEnd,
+        tier
+      });
+      return { handled: true };
+    }
+
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object;
+      const status = sub.status;
+      const currentPeriodEnd = sub.current_period_end
+        ? new Date(sub.current_period_end * 1000).toISOString()
+        : null;
+
+      await db.query(
+        `UPDATE subscriptions
+         SET status = $2, current_period_end = $3
+         WHERE stripe_subscription_id = $1`,
+        [sub.id, status, currentPeriodEnd]
+      );
+
+      // Find the owning user and mirror the tier for active subs.
+      const owner = await db.query(
+        `SELECT user_id FROM subscriptions WHERE stripe_subscription_id = $1`,
+        [sub.id]
+      );
+      if (owner.rows.length && status === 'active') {
+        const priceId =
+          sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price &&
+          sub.items.data[0].price.id;
+        const tier = Object.keys(TIER_PRICE_IDS).find((t) => TIER_PRICE_IDS[t] === priceId) || 'pro';
+        await db.query(
+          `UPDATE users SET subscription_tier = $1 WHERE id = $2`,
+          [tier, owner.rows[0].user_id]
+        );
+        await logAudit({
+          userId: owner.rows[0].user_id,
+          action: 'subscription.tier_changed',
+          resourceType: 'subscription',
+          resourceId: sub.id,
+          newValue: { tier, status }
+        });
+      }
+      return { handled: true };
+    }
+
+    default:
+      return { handled: false, reason: `unhandled event type ${event.type}` };
+  }
+}
+
+module.exports = {
+  isConfigured,
+  isMockMode,
+  createCheckoutSession,
+  handleWebhookEvent,
+  upsertSubscription
+};

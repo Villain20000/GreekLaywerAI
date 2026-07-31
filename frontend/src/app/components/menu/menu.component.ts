@@ -32,6 +32,33 @@ import { ThemeService } from '../../services/theme.service';
           </svg>
           <span>Chat</span>
         </a>
+        <a routerLink="/documents"
+           routerLinkActive="active"
+           class="nl-menu-link"
+           title="Upload and search your legal documents">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/>
+          </svg>
+          <span>Documents</span>
+        </a>
+        <a routerLink="/conversations"
+           routerLinkActive="active"
+           class="nl-menu-link"
+           title="Browse your past conversations">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M21 6h-2v9H6v2c0 .55.45 1 1 1h11l4 4V7c0-.55-.45-1-1-1zm-4 6V3c0-.55-.45-1-1-1H3c-.55 0-1 .45-1 1v14l4-4h10c.55 0 1-.45 1-1z"/>
+          </svg>
+          <span>Conversations</span>
+        </a>
+        <a routerLink="/billing"
+           routerLinkActive="active"
+           class="nl-menu-link"
+           title="Plans and upgrade">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M11.8 10.9c-2.27-.59-3-1.2-3-2.15 0-1.09 1.01-1.85 2.7-1.85 1.78 0 2.44.85 2.5 2.1h2.21c-.07-1.72-1.12-3.3-3.21-3.81V3h-3v2.16c-1.94.42-3.5 1.68-3.5 3.61 0 2.31 1.91 3.46 4.7 4.13 2.5.6 3 1.48 3 2.41 0 .69-.49 1.79-2.7 1.79-2.06 0-2.87-.92-2.98-2.1h-2.2c.12 2.19 1.76 3.42 3.68 3.83V21h3v-2.15c1.95-.37 3.5-1.5 3.5-3.55 0-2.84-2.43-3.81-4.7-4.4z"/>
+          </svg>
+          <span>Plans</span>
+        </a>
         <a *ngIf="auth.isAdmin"
            routerLink="/admin"
            routerLinkActive="active"
@@ -77,6 +104,8 @@ import { ThemeService } from '../../services/theme.service';
             <div class="nl-menu-dropdown-email">{{ u.email }}</div>
             <div class="nl-menu-dropdown-role" [class.admin]="u.role === 'admin'">{{ u.role }}</div>
             <div class="nl-menu-dropdown-divider"></div>
+            <a routerLink="/profile" (click)="closeUserMenu()">Profile & data</a>
+            <a routerLink="/subscriptions" (click)="closeUserMenu()">Subscription</a>
             <a routerLink="/change-password" (click)="closeUserMenu()">Change password</a>
             <button type="button" (click)="logout()">Sign out</button>
           </div>

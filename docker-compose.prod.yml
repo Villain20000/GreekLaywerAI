@@ -9,12 +9,17 @@ services:
       POSTGRES_DB: nomos_db
     volumes:
       - pgdata_prod:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
     networks:
       - nomos-prod-network
     restart: always
 
+  # Phase 29: Redis with AOF persistence.
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata_prod:/data
     networks:
       - nomos-prod-network
     restart: always
@@ -32,8 +37,22 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
       - DB_NAME=nomos_db
       - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_EMBED_MODEL=bge-m3
+      - OLLAMA_EMBED_DIM=1024
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}
+      - STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}
+      - STRIPE_PRICE_ID_ENTERPRISE=${STRIPE_PRICE_ID_ENTERPRISE:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
       - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set for production}
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://your-domain.gr}
+      - APP_BASE_URL=${APP_BASE_URL:-https://your-domain.gr}
+      - TRUST_PROXY=uniquelocal,loopback
+      - RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}
+      - RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}
+      - RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}
+      - ADMIN_MAGIC_LINK_ENABLED=${ADMIN_MAGIC_LINK_ENABLED:-false}
     depends_on:
       - db
       - redis
@@ -71,9 +90,65 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Phase 29: daily DB backup (pg_dump, custom format). Wire the cron
+  # inside the container to run backupDb.js at 02:00.
+  backup:
+    image: node:20-alpine
+    volumes:
+      - ./backend:/app/backend
+      - ./database:/app/database
+      - backups_prod:/backups
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=nomos_admin
+      - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
+      - DB_NAME=nomos_db
+      - BACKUP_DIR=/backups
+    entrypoint: >
+      /bin/sh -c "apk add --no-cache postgresql-client > /dev/null 2>&1
+      && echo '0 2 * * * cd /app/backend && node src/scripts/backupDb.js' > /etc/crontabs/root
+      && crond -f"
+    depends_on:
+      - db
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  # Phase 29: monitoring stack (Prometheus scrapes /metrics, Grafana charts).
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - nomos-prod-network
+    restart: always
+
 volumes:
   pgdata_prod:
+  redisdata_prod:
   ollama_models_prod:
+  backups_prod:
+  prometheus_data:
+  grafana_data:
 
 networks:
   nomos-prod-network:

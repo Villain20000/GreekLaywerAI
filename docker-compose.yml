@@ -39,17 +39,32 @@ services:
       - OLLAMA_EMBED_DIM=1024
       - STRIPE_SECRET_KEY=sk_test_mock
       - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-nomos-super-secret-key-development}
+      - CORS_ORIGINS=http://localhost:4200
+      - APP_BASE_URL=http://localhost:4200
+      - STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}
+      - STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}
+      - STRIPE_PRICE_ID_ENTERPRISE=${STRIPE_PRICE_ID_ENTERPRISE:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+      ollama:
+        condition: service_healthy
     networks:
       - nomos-network
 
-  # Redis for BullMQ
+  # Redis for BullMQ — Phase 29: AOF persistence so queued inference jobs
+  # survive container restarts.
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
     networks:
       - nomos-network
 
@@ -73,6 +88,19 @@ services:
       - ollama_data:/root/.ollama
     networks:
       - nomos-network
+    # Phase 31: pull the models at first boot so RAG + chat work out of the
+    # box. `bge-m3` emits 1024-dim vectors matching the pgvector schema;
+    # `gemma:2b` is the chat model the backend pre-warms.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "ollama serve & sleep 5 && ollama pull bge-m3 && ollama pull gemma:2b && wait"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q bge-m3 && ollama list | grep -q 'gemma:2b'"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
     # To enable GPU acceleration, uncomment the deploy section below:
     # deploy:
     #   resources:
@@ -84,6 +112,7 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
   ollama_data:
 
 networks:

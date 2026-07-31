@@ -13,10 +13,10 @@ describe('RegisterComponent', () => {
 
   beforeEach(async () => {
     mockAuthService = {
-      register: jasmine.createSpy('register').mockResolvedValue({ ok: true }),
+      register: jasmine.createSpy('register').and.resolveTo({ ok: true }),
       resendVerification: jasmine
         .createSpy('resendVerification')
-        .mockResolvedValue({ ok: true })
+        .and.resolveTo({ ok: true })
     };
     mockRouter = { navigate: jasmine.createSpy('navigate') };
 
@@ -75,7 +75,7 @@ describe('RegisterComponent', () => {
   });
 
   it('should reveal the verify-panel after a successful register', fakeAsync(() => {
-    mockAuthService.register.mockResolvedValue({
+    mockAuthService.register.and.resolveTo({
       ok: true,
       requires_verification: true,
       user: { email: 'test@nomos.ai' }
@@ -99,7 +99,7 @@ describe('RegisterComponent', () => {
   }));
 
   it('should surface server error and stop loading on failure', fakeAsync(() => {
-    mockAuthService.register.mockResolvedValue({
+    mockAuthService.register.and.resolveTo({
       ok: false,
       error: 'User already exists',
       status: 400
@@ -208,7 +208,7 @@ describe('RegisterComponent', () => {
   }));
 
   it('verify-panel renders the resend CTA calling authService.resendVerification', fakeAsync(() => {
-    mockAuthService.register.mockResolvedValue({
+    mockAuthService.register.and.resolveTo({
       ok: true,
       requires_verification: true,
       user: { email: 'test@nomos.ai' }

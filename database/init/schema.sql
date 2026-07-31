@@ -38,6 +38,17 @@ CREATE TABLE conversations (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS conversations_user_id_idx ON conversations(user_id);
+
+-- Conversation Messages Table
+CREATE TABLE messages (
+    id SERIAL PRIMARY KEY,
+    conversation_id INT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS messages_conversation_id_idx ON messages(conversation_id);
 
 -- Legal Documents Table (Uploaded Evidence / Contracts)
 CREATE TABLE legal_documents (
@@ -47,8 +58,39 @@ CREATE TABLE legal_documents (
     file_url VARCHAR(1024),
     content_type VARCHAR(100),
     parsed_text TEXT,
+    metadata JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS legal_documents_user_id_idx ON legal_documents(user_id);
+
+-- Legal Document Chunks (chunk-level storage + embeddings for user-doc vector search)
+CREATE TABLE legal_document_chunks (
+    id SERIAL PRIMARY KEY,
+    document_id INT NOT NULL REFERENCES legal_documents(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    embedding vector(1024),
+    chunk_index INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS legal_document_chunks_document_id_idx ON legal_document_chunks(document_id);
+CREATE INDEX IF NOT EXISTS legal_document_chunks_hnsw_idx
+    ON legal_document_chunks USING hnsw (embedding vector_l2_ops);
+
+-- Audit Log Table (admin actions, tier changes, account deletions, failed logins)
+CREATE TABLE audit_log (
+    id SERIAL PRIMARY KEY,
+    user_id INT,
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(50),
+    resource_id VARCHAR(100),
+    old_value JSONB,
+    new_value JSONB,
+    ip_address VARCHAR(64),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS audit_log_user_id_idx ON audit_log(user_id);
+CREATE INDEX IF NOT EXISTS audit_log_action_idx ON audit_log(action);
+CREATE INDEX IF NOT EXISTS audit_log_created_at_idx ON audit_log(created_at);
 
 -- Phase 23: password-reset tokens for /forgot-password + /reset-password.
 -- Stores ONLY SHA-256 of the plaintext token (the plaintext is sent via the

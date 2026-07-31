@@ -1,7 +1,25 @@
 const jwt = require('jsonwebtoken');
 const db = require('../config/db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'nomos-super-secret-key-development';
+const DEFAULT_DEV_SECRET = 'nomos-super-secret-key-development';
+const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_DEV_SECRET;
+
+// Phase 29: fail fast in production if JWT_SECRET is unset or still the
+// development default. A production deploy running on the well-known
+// default secret is fully compromised (anyone can forge JWTs).
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET === DEFAULT_DEV_SECRET) {
+    throw new Error(
+      '[authMiddleware] NODE_ENV=production requires JWT_SECRET to be set to a strong, non-default value. Refusing to boot.'
+    );
+  }
+} else if (!process.env.JWT_SECRET || process.env.JWT_SECRET === DEFAULT_DEV_SECRET) {
+  console.warn(
+    '[authMiddleware] WARNING: JWT_SECRET is unset or using the development default. ' +
+    'Set JWT_SECRET in your environment before deploying to production.'
+  );
+}
+
 const ALLOWED_ROLES = ['user', 'admin', 'enterprise'];
 const ALLOWED_TIERS = ['basic', 'pro', 'enterprise'];
 

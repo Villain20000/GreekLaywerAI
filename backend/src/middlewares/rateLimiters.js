@@ -238,4 +238,78 @@ function createRateLimiters(options = {}) {
   };
 }
 
-module.exports = { createRateLimiters };
+module.exports = { createRateLimiters, createAiRateLimiters };
+
+/**
+ * Phase 29: AI-route rate limiters, tier-aware.
+ *
+ *   - query + stream: 20/min (basic), 60/min (pro), 120/min (enterprise)
+ *   - audio-query:     5/min per user (premium)
+ *   - multimodal:      10/min per user (premium)
+ *   - job polling:     120/min per user (defends against polling spam)
+ *
+ * The `max` is a function of req.user.subscription_tier, resolved per
+ * request. All limiters emit RateLimit-* headers and 429 on excess.
+ */
+function createAiRateLimiters(options = {}) {
+  const isTest = options.isTest ?? (NODE_ENV === 'test');
+  const TEST_CEILING = 1000;
+
+  function resolveCap(overrideOption, productionDefault) {
+    if (overrideOption !== undefined && overrideOption !== null) return overrideOption;
+    if (isTest) return TEST_CEILING;
+    return productionDefault;
+  }
+
+  const TIER_QUERY_LIMITS = {
+    basic: resolveCap(options.aiQueryBasicMax, 20),
+    pro: resolveCap(options.aiQueryProMax, 60),
+    enterprise: resolveCap(options.aiQueryEnterpriseMax, 120)
+  };
+
+  const userKey = (req, prefix) =>
+    `${prefix}:${req.user && req.user.id !== undefined ? req.user.id : 'anon'}`;
+
+  const tierMax = (req) => {
+    const tier = req.user && req.user.subscription_tier;
+    return TIER_QUERY_LIMITS[tier] || TIER_QUERY_LIMITS.basic;
+  };
+
+  return {
+    query: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: tierMax,
+      keyGenerator: (req) => userKey(req, 'ai_query'),
+      store: createStore('ai_query')
+    }),
+    stream: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: tierMax,
+      keyGenerator: (req) => userKey(req, 'ai_stream'),
+      store: createStore('ai_stream')
+    }),
+    audioQuery: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.aiAudioMax, 5),
+      keyGenerator: (req) => userKey(req, 'ai_audio'),
+      store: createStore('ai_audio')
+    }),
+    multimodal: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.aiMultimodalMax, 10),
+      keyGenerator: (req) => userKey(req, 'ai_mm'),
+      store: createStore('ai_mm')
+    }),
+    poll: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.aiPollMax, 120),
+      keyGenerator: (req) => userKey(req, 'ai_poll'),
+      store: createStore('ai_poll')
+    })
+  };
+}
