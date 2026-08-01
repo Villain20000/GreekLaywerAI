@@ -73,11 +73,14 @@ router.get('/:id', async (req, res) => {
     }
 
     const msgs = await db.query(
-      `SELECT id, role, content, created_at
-       FROM messages
-       WHERE conversation_id = $1
-       ORDER BY created_at ASC, id ASC`,
-      [id]
+      `SELECT m.id, m.role, m.content, m.citation_metadata, m.created_at,
+              mf.helpful AS feedback_helpful
+       FROM messages m
+       LEFT JOIN message_feedback mf
+         ON mf.message_id = m.id AND mf.user_id = $2
+       WHERE m.conversation_id = $1
+       ORDER BY m.created_at ASC, m.id ASC`,
+      [id, req.user.id]
     );
     res.json({ conversation: conv.rows[0], messages: msgs.rows });
   } catch (error) {

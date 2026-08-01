@@ -14,6 +14,12 @@ import { DocumentService, LegalDocument, SearchResult } from '../../services/doc
       <section class="nl-admin-card">
         <h2>Ανέβασμα εγγράφου</h2>
         <input
+          class="nl-input"
+          [(ngModel)]="uploadTitle"
+          placeholder="Τίτλος (προαιρετικό)"
+          aria-label="Document title"
+        />
+        <input
           type="file"
           accept=".pdf,.docx,.txt,application/pdf,text/plain"
           (change)="onFileSelected($event)"
@@ -54,7 +60,7 @@ import { DocumentService, LegalDocument, SearchResult } from '../../services/doc
             <tr *ngFor="let doc of documents">
               <td>{{ doc.filename }}</td>
               <td>{{ doc.content_type }}</td>
-              <td>{{ formatSize(doc.metadata?.['size_bytes']) }}</td>
+              <td>{{ formatSize(doc.metadata['size_bytes']) }}</td>
               <td>{{ doc.created_at | date: 'short' }}</td>
               <td>
                 <button class="nl-btn-secondary" (click)="deleteDoc(doc)">Διαγραφή</button>
@@ -77,6 +83,7 @@ export class DocumentsComponent implements OnInit {
   uploading = false;
   uploadError = '';
   uploadOk = '';
+  uploadTitle = '';
 
   constructor(private documentService: DocumentService) {}
 
@@ -100,7 +107,7 @@ export class DocumentsComponent implements OnInit {
     this.uploadError = '';
     this.uploadOk = '';
     this.documentService
-      .upload(file)
+      .upload(file, this.uploadTitle.trim() || undefined)
       .then(({ document }) => {
         this.uploadOk = `Το έγγραφο "${document.filename}" ανέβηκε με επιτυχία.`;
         this.load();
@@ -111,6 +118,7 @@ export class DocumentsComponent implements OnInit {
       .finally(() => {
         this.uploading = false;
         input.value = '';
+        this.uploadTitle = '';
       });
   }
 

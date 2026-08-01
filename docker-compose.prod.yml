@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   db:
@@ -39,6 +38,7 @@ services:
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_EMBED_MODEL=bge-m3
       - OLLAMA_EMBED_DIM=1024
+      - OLLAMA_CHAT_MODEL=gemma2b-mmap
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
       - STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}
       - STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}
@@ -73,6 +73,8 @@ services:
     restart: always
 
   # Production Ollama with GPU Pass-through enabled via NVIDIA Container Toolkit
+  # Note: on CPU-only hosts, `gemma2b-mmap` (gemma:2b with use_mmap true)
+  # avoids the --no-mmap CPU_REPACK crash on low-RAM machines.
   ollama:
     image: ollama/ollama
     ports:
@@ -82,6 +84,16 @@ services:
     networks:
       - nomos-prod-network
     restart: always
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "ollama serve & sleep 5 && ollama pull bge-m3 && ollama pull gemma:2b && printf 'FROM gemma:2b\nPARAMETER use_mmap true\n' > /tmp/gemma-mmap.Modelfile && ollama create gemma2b-mmap -f /tmp/gemma-mmap.Modelfile && wait"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q bge-m3 && ollama list | grep -q gemma2b-mmap"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
     deploy:
       resources:
         reservations:

@@ -3,6 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const db = require('../config/db');
 const ragService = require('../services/ragService');
+const documentService = require('../services/documentService');
 const ollamaService = require('../services/ollamaService');
 const inferenceQueue = require('../services/inferenceQueue');
 const { rbacMiddleware } = require('../middlewares/authMiddleware');
@@ -39,10 +40,24 @@ const validatePrompt = validate([
     .withMessage('prompt must be at most 10000 characters')
 ]);
 
-// RAG retrieval stays synchronous — only inference goes through the queue.
-async function retrieveRagContext(prompt) {
-  const docs = await ragService.retrieveContext(prompt);
-  return ragService.formatContextForGemma(docs);
+// Retrieval stays synchronous — only inference goes through the queue. Uploaded
+// documents are always scoped again in documentService by owner, so a forged
+// document id can never expose another user's chunks.
+async function retrieveRagContext(prompt, userId, documentIds = []) {
+  const legislation = await ragService.retrieveContext(prompt);
+  const selectedIds = Array.isArray(documentIds)
+    ? documentIds.filter((id) => Number.isInteger(id) && id > 0).slice(0, 10)
+    : [];
+  const uploaded = selectedIds.length
+    ? await documentService.searchUserDocuments(prompt, userId, 5, selectedIds)
+    : [];
+  const documents = [...legislation, ...uploaded];
+  const sources = ragService.toSources(documents);
+  return {
+    contextStr: ragService.formatContextForGemma(documents),
+    sources,
+    confidence: ragService.calculateConfidence(sources)
+  };
 }
 
 /**
@@ -50,21 +65,72 @@ async function retrieveRagContext(prompt) {
  * Silently skips if conversationId is missing or does not belong to the
  * user (defensive — the AI answer is not blocked by history storage).
  */
-async function storeExchange(conversationId, userId, prompt, response) {
+async function storeExchange(conversationId, userId, prompt, response, jobId = null, answerMetadata = {}) {
   if (!conversationId) return;
   const conv = await db.query(
     `SELECT id FROM conversations WHERE id = $1 AND user_id = $2`,
     [conversationId, userId]
   );
   if (conv.rows.length === 0) return;
-  await db.query(
-    `INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2), ($1, 'assistant', $3)`,
-    [conversationId, prompt, String(response)]
+
+  if (jobId) {
+    // The assistant row owns the unique job key. Inserting both rows in one
+    // CTE makes retries atomic: a second poll inserts neither row, while a
+    // first poll cannot leave a user message behind without its answer.
+    // The user timestamp is slightly earlier so normal chronological reads
+    // still show user → assistant even though the CTE reserves the key first.
+    const result = await db.query(
+      `WITH inserted_assistant AS (
+         INSERT INTO messages (conversation_id, role, content, source_job_id, citation_metadata, created_at)
+         VALUES ($1, 'assistant', $3, $4, $5::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT (source_job_id) WHERE source_job_id IS NOT NULL DO NOTHING
+         RETURNING id
+       ), inserted_user AS (
+         INSERT INTO messages (conversation_id, role, content, source_job_id, citation_metadata, created_at)
+         SELECT $1, 'user', $2, NULL, NULL, CURRENT_TIMESTAMP - INTERVAL '1 millisecond'
+         WHERE EXISTS (SELECT 1 FROM inserted_assistant)
+         RETURNING id
+       )
+       existing_assistant AS (
+         SELECT id
+         FROM messages
+         WHERE source_job_id = $4
+           AND conversation_id = $1
+           AND role = 'assistant'
+       ), touched_conversation AS (
+         UPDATE conversations
+         SET updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND EXISTS (SELECT 1 FROM inserted_assistant)
+         RETURNING id
+       )
+       SELECT inserted_assistant.id AS assistant_message_id
+       FROM inserted_assistant
+       JOIN touched_conversation ON TRUE
+       UNION ALL
+       SELECT existing_assistant.id AS assistant_message_id
+       FROM existing_assistant
+       WHERE NOT EXISTS (SELECT 1 FROM inserted_assistant)`,
+      [conversationId, prompt, String(response), String(jobId), JSON.stringify(answerMetadata || {})]
+    );
+    return result.rows?.[0]?.assistant_message_id ?? null;
+  }
+
+  const inserted = await db.query(
+    `INSERT INTO messages (conversation_id, role, content, source_job_id, citation_metadata)
+     VALUES ($1, 'user', $2, NULL, NULL), ($1, 'assistant', $3, NULL, $4::jsonb)
+     RETURNING id, role`,
+    [conversationId, prompt, String(response), JSON.stringify(answerMetadata || {})]
   );
   await db.query(
     `UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
     [conversationId]
   );
+  return inserted.rows?.find((row) => row.role === 'assistant')?.id ?? null;
+}
+
+function belongsToUser(job, userId) {
+  const jobUserId = job && job.data && Number(job.data.userId);
+  return Boolean(job && Number.isInteger(jobUserId) && jobUserId === Number(userId));
 }
 
 // AI tiers:
@@ -77,20 +143,39 @@ router.post(
   validatePrompt,
   async (req, res) => {
     try {
-      const { prompt, useRag = true, conversationId } = req.body;
-      const contextStr = useRag ? await retrieveRagContext(prompt) : '';
+      const { prompt, useRag = true, conversationId, documentIds = [] } = req.body;
+      const rag = useRag
+        ? await retrieveRagContext(prompt, req.user.id, documentIds)
+        : { contextStr: '', sources: [], confidence: 0 };
 
       // Phase 29: inference runs through the BullMQ queue (concurrency 1,
       // GPU protection). waitUntilFinished() blocks the HTTP request until
       // the worker stores the result — same response shape as before.
       const startedAt = Date.now();
-      const job = await inferenceQueue.addInferenceJob(prompt, contextStr);
-      const response = await job.waitUntilFinished();
+      const job = await inferenceQueue.addInferenceJob(prompt, rag.contextStr, {
+        userId: req.user.id,
+        conversationId: conversationId || null,
+        prompt,
+        sources: rag.sources,
+        confidence: rag.confidence
+      });
+      const queueEvents = inferenceQueue.getQueueEvents();
+      const response = queueEvents
+        ? await job.waitUntilFinished(queueEvents)
+        : await job.waitUntilFinished();
       recordAiQueryDuration(Date.now() - startedAt);
 
-      await storeExchange(conversationId, req.user.id, prompt, response);
+      const messageId = await storeExchange(conversationId, req.user.id, prompt, response, job.id, {
+        sources: rag.sources,
+        confidence: rag.confidence
+      });
 
-      res.json({ response });
+      res.json({
+        response,
+        messageId,
+        sources: rag.sources,
+        confidence: rag.confidence
+      });
     } catch (error) {
       console.error('AI query error:', error);
       res.status(500).json({ error: error.message });
@@ -108,10 +193,18 @@ router.post(
   validatePrompt,
   async (req, res) => {
     try {
-      const { prompt, useRag = true } = req.body;
-      const contextStr = useRag ? await retrieveRagContext(prompt) : '';
+      const { prompt, useRag = true, conversationId, documentIds = [] } = req.body;
+      const rag = useRag
+        ? await retrieveRagContext(prompt, req.user.id, documentIds)
+        : { contextStr: '', sources: [], confidence: 0 };
 
-      const job = await inferenceQueue.addInferenceJob(prompt, contextStr);
+      const job = await inferenceQueue.addInferenceJob(prompt, rag.contextStr, {
+        userId: req.user.id,
+        conversationId: conversationId || null,
+        prompt,
+        sources: rag.sources,
+        confidence: rag.confidence
+      });
       res.json({ jobId: job.id });
     } catch (error) {
       console.error('AI stream enqueue error:', error);
@@ -132,12 +225,36 @@ router.get(
   async (req, res) => {
     try {
       const job = await inferenceQueue.getJob(req.params.jobId);
-      if (!job) {
+      if (!belongsToUser(job, req.user.id)) {
         return res.status(404).json({ error: 'Job not found' });
       }
       const state = await job.getState();
       if (state === 'completed') {
-        return res.json({ status: 'completed', result: job.returnvalue });
+        const conversationId = job.data && job.data.conversationId;
+        const answerMetadata = {
+          sources: Array.isArray(job.data && job.data.sources) ? job.data.sources : [],
+          confidence: Number.isFinite(Number(job.data && job.data.confidence))
+            ? Number(job.data.confidence)
+            : 0
+        };
+        let messageId = null;
+        if (conversationId) {
+          messageId = await storeExchange(
+            conversationId,
+            req.user.id,
+            job.data.prompt,
+            job.returnvalue,
+            req.params.jobId,
+            answerMetadata
+          );
+        }
+        return res.json({
+          status: 'completed',
+          result: job.returnvalue,
+          messageId,
+          sources: answerMetadata.sources,
+          confidence: answerMetadata.confidence
+        });
       }
       if (state === 'failed') {
         return res.json({ status: 'failed', error: job.failedReason || 'Job failed' });
@@ -146,6 +263,75 @@ router.get(
     } catch (error) {
       console.error('AI poll error:', error);
       res.status(500).json({ error: error.message });
+    }
+  }
+);
+
+// Submit or replace the current user's feedback for an assistant answer.
+// Message ownership is checked through the parent conversation, and user
+// messages / other users' messages are deliberately indistinguishable from
+// missing IDs to avoid turning this endpoint into an oracle.
+router.post(
+  '/messages/:messageId/feedback',
+  limiters.feedback,
+  rbacMiddleware(['user', 'admin', 'enterprise']),
+  validate([
+    check('helpful').isBoolean().withMessage('helpful must be a boolean'),
+    check('reason').optional({ values: 'null' }).isString().trim().isLength({ max: 500 })
+  ]),
+  async (req, res) => {
+    try {
+      const rawMessageId = String(req.params.messageId || '');
+      const messageId = Number(rawMessageId);
+      if (!/^\d+$/.test(rawMessageId) || !Number.isSafeInteger(messageId) || messageId <= 0) {
+        return res.status(400).json({ error: 'Invalid message id' });
+      }
+
+      const ownedAnswer = await db.query(
+        `SELECT m.id
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.id = $1 AND c.user_id = $2 AND m.role = 'assistant'`,
+        [messageId, req.user.id]
+      );
+      if (ownedAnswer.rows.length === 0) {
+        return res.status(404).json({ error: 'Assistant message not found' });
+      }
+
+      const result = await db.query(
+        `INSERT INTO message_feedback (message_id, user_id, helpful, reason)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (message_id, user_id) DO UPDATE
+         SET helpful = EXCLUDED.helpful,
+             reason = EXCLUDED.reason,
+             updated_at = CURRENT_TIMESTAMP
+         RETURNING id, message_id, user_id, helpful, reason, created_at, updated_at`,
+        [messageId, req.user.id, req.body.helpful, req.body.reason || null]
+      );
+      return res.json({ feedback: result.rows[0] });
+    } catch (error) {
+      console.error('AI feedback error:', error);
+      return res.status(500).json({ error: error.message });
+    }
+  }
+);
+
+// Best-effort cancellation for a user's own queued inference job. Active
+// local-model work cannot be interrupted safely, but waiting jobs are removed.
+router.delete(
+  '/query/stream/:jobId',
+  rbacMiddleware(['user', 'admin', 'enterprise']),
+  async (req, res) => {
+    try {
+      const job = await inferenceQueue.getJob(req.params.jobId);
+      if (!belongsToUser(job, req.user.id)) {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      const removed = await inferenceQueue.cancelJob(req.params.jobId);
+      return res.json({ ok: true, removed });
+    } catch (error) {
+      console.error('AI cancel error:', error);
+      return res.status(500).json({ error: error.message });
     }
   }
 );
@@ -165,9 +351,16 @@ router.post(
 
       const mockTranscription = 'Τι προβλέπει ο νόμος για το δικαίωμα στην προσωπικότητα;';
 
-      const contextStr = await retrieveRagContext(mockTranscription);
+      const rag = await retrieveRagContext(mockTranscription, req.user.id);
 
-      const job = await inferenceQueue.addInferenceJob(mockTranscription, contextStr);
+      const conversationId = req.body && req.body.conversationId;
+      const job = await inferenceQueue.addInferenceJob(mockTranscription, rag.contextStr, {
+        userId: req.user.id,
+        conversationId: conversationId || null,
+        prompt: mockTranscription,
+        sources: rag.sources,
+        confidence: rag.confidence
+      });
       res.json({ jobId: job.id });
     } catch (error) {
       console.error('Audio query error:', error);

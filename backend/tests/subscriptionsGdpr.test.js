@@ -128,6 +128,7 @@ describe('GDPR API (/api/gdpr)', () => {
     db.query.mockResolvedValueOnce({ rows: [{ id: 1, filename: 'a.pdf' }] });           // documents
     db.query.mockResolvedValueOnce({ rows: [{ id: 1, status: 'active' }] });            // subscriptions
     db.query.mockResolvedValueOnce({ rows: [{ action: 'account.deleted' }] });          // audit
+    db.query.mockResolvedValueOnce({ rows: [{ message_id: 4, helpful: true }] });        // feedback
 
     const res = await request(app)
       .get('/api/gdpr/export')
@@ -139,8 +140,9 @@ describe('GDPR API (/api/gdpr)', () => {
     expect(res.body.documents).toHaveLength(1);
     expect(res.body.subscriptions).toHaveLength(1);
     expect(res.body.audit_log).toHaveLength(1);
-    // Export must run 5 queries (profile + 4 collections).
-    expect(db.query).toHaveBeenCalledTimes(6); // 1 authMiddleware + 5 export
+    expect(res.body.message_feedback).toHaveLength(1);
+    // Export must run 6 queries (profile + 5 collections).
+    expect(db.query).toHaveBeenCalledTimes(7); // 1 authMiddleware + 6 export
   });
 
   it('should reject account deletion without confirm:true', async () => {

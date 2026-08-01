@@ -42,7 +42,8 @@ router.post(
       const { document, chunkCount } = await documentService.processAndStoreDocument(
         req.user.id,
         req.file,
-        req.file.detectedType
+        req.file.detectedType,
+        req.body && req.body.title
       );
       res.status(201).json({ document, chunkCount });
     } catch (error) {
@@ -58,7 +59,7 @@ router.get('/', async (req, res) => {
     const limit = Math.min(Number.parseInt(req.query.limit, 10) || 20, 100);
     const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
     const result = await db.query(
-      `SELECT id, filename, content_type, metadata, created_at
+      `SELECT id, filename, title, content_type, metadata, created_at
        FROM legal_documents
        WHERE user_id = $1
        ORDER BY created_at DESC, id DESC
@@ -78,7 +79,7 @@ router.get('/:id', async (req, res) => {
     if (id === null) return res.status(400).json({ error: 'Invalid document id' });
 
     const result = await db.query(
-      `SELECT d.id, d.filename, d.content_type, d.metadata, d.created_at,
+      `SELECT d.id, d.filename, d.title, d.content_type, d.metadata, d.created_at,
               (SELECT COUNT(*) FROM legal_document_chunks c WHERE c.document_id = d.id) AS chunk_count
        FROM legal_documents d
        WHERE d.id = $1 AND d.user_id = $2`,

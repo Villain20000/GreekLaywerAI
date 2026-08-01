@@ -1,9 +1,11 @@
 import { Injectable } from '@angular/core';
 import { environment } from '../../environments/environment';
+import { apiFetch } from './api-client';
 
 export interface LegalDocument {
   id: number;
   filename: string;
+  title?: string | null;
   content_type: string;
   metadata: Record<string, unknown>;
   created_at: string;
@@ -17,6 +19,7 @@ export interface SearchResult {
   similarity: number;
   document_id: number;
   filename: string;
+  title?: string | null;
 }
 
 @Injectable({
@@ -26,7 +29,7 @@ export class DocumentService {
   private apiUrl = `${environment.apiBaseUrl}/api/documents`;
 
   async list(limit = 20, offset = 0): Promise<LegalDocument[]> {
-    const res = await fetch(`${this.apiUrl}?limit=${limit}&offset=${offset}`, {
+    const res = await apiFetch(`${this.apiUrl}?limit=${limit}&offset=${offset}`, {
       headers: { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` }
     });
     if (!res.ok) throw new Error(`List documents failed (HTTP ${res.status})`);
@@ -38,7 +41,7 @@ export class DocumentService {
     const formData = new FormData();
     formData.append('file', file);
     if (title) formData.append('title', title);
-    const res = await fetch(this.apiUrl, {
+    const res = await apiFetch(this.apiUrl, {
       method: 'POST',
       headers: { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` },
       body: formData
@@ -51,7 +54,7 @@ export class DocumentService {
   }
 
   async remove(id: number): Promise<void> {
-    const res = await fetch(`${this.apiUrl}/${id}`, {
+    const res = await apiFetch(`${this.apiUrl}/${id}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` }
     });
@@ -59,7 +62,7 @@ export class DocumentService {
   }
 
   async search(query: string, limit = 5): Promise<SearchResult[]> {
-    const res = await fetch(`${this.apiUrl}/search`, {
+    const res = await apiFetch(`${this.apiUrl}/search`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

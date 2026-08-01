@@ -31,7 +31,9 @@
 - **RAG over Greek legislation** — A pgvector HNSW index enables fast retrieval of relevant Άρθρα (articles) for every question.
 - **RBAC baked in** — JWT auth with role (`user`, `admin`, `enterprise`) and tier (`basic`, `pro`, `enterprise`) gating at the route level.
 - **Multimodal premium tier** — Admin/enterprise users can ask questions via audio or upload PDFs/images.
-- **Streaming responses** — Server-Sent Events for real-time legal drafting in the chat UI.
+- **Cited legal answers (Phase B)** — Structured legislation/document sources and confidence metadata are persisted with conversation messages and shown in an expandable chat panel.
+- **Answer feedback (Phase C)** — Users can rate assistant answers, replace their existing vote, while admins get aggregate quality summaries without exposing private prompts or document content.
+- **Streaming responses** — Queued inference responses are polled for reliable GPU-safe completion.
 - **BullMQ inference queue (Phase 16, currently inactive)** — A concurrency=1 worker scaffold exists for hardware-aware queueing, but the live `ai` routes call the model directly; flip the require on in `src/index.js` to activate.
 - **Privacy Shield** — GDPR-friendly middleware that sanitizes logging, blocks caching of legal responses, and tags requests as locally processed.
 - **Admin Console** — Promote/demote users and adjust subscription tiers without touching the database.
@@ -143,6 +145,17 @@ docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-password-reset-
 
 # Phase 24 — users.verified_at + email_verification_tokens table
 docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-email-verification.js
+
+# Phase A reliability — document titles + queued-message idempotency
+# Run once on existing databases; safe to re-run.
+docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-phase-a-reliability.js
+
+# Phase B — persisted citation metadata for cited answers
+docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-phase-b-citations.js
+
+# Phase C — answer feedback quality loop
+# MUST succeed before deploying/restarting the backend that joins message_feedback.
+docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-phase-c-feedback.js
 ```
 
 ---
@@ -242,8 +255,8 @@ Notes:
 
 | Method | Path             | Body / Form                        | Allowed roles               |
 |--------|------------------|------------------------------------|-----------------------------|
-| POST   | `/query`         | `{ prompt, useRag? }`              | `user`, `admin`, `enterprise` |
-| POST   | `/query/stream`  | `{ prompt, useRag? }` (SSE output) | `user`, `admin`, `enterprise` |
+| POST   | `/query`         | `{ prompt, useRag?, conversationId?, documentIds? }` | `user`, `admin`, `enterprise` |
+| POST   | `/query/stream`  | `{ prompt, useRag?, conversationId?, documentIds? }` | `user`, `admin`, `enterprise` |
 | POST   | `/audio-query`   | `multipart audio` (max 25 MB)      | `admin`, `enterprise`         |
 | POST   | `/multimodal`    | `multipart file` (max 25 MB)       | `admin`, `enterprise`         |
 
@@ -265,6 +278,8 @@ Body: `{ tier: "basic" | "pro" | "enterprise" }`. Currently mocks a Stripe redir
 
 The `PATCH role` endpoint refuses to demote yourself (returns 409) so the system never gets locked out of admins.
 
+`GET /feedback-summary?days=30` returns only aggregate helpful/unhelpful counts and rate; it never returns prompts, answers, document names, or free-text feedback reasons.
+
 ---
 
 ## Frontend Routes & Components
@@ -285,7 +300,7 @@ The `PATCH role` endpoint refuses to demote yourself (returns 409) so the system
 ### Frontend services
 
 - **`AuthService`** — wraps `/api/auth/*` (Phase 24: `register()` now returns a discriminated `RegisterResult` with `requires_verification`; `login()` returns a discriminated result with `kind: 'invalid_credentials' | 'unverified' | 'network' | 'server'`; new `verifyEmail(token)` and `resendVerification(email)` wrappers). Token + user swap on successful password change / reset / verification is implemented identically so guards pick up the rotated credential instantly. RxJS `token$` and `user$` BehaviorSubjects; hydrates from `localStorage` on cold start.
-- **`AiService`** — `streamQuery(prompt)` consumes SSE from `/api/ai/query/stream`; `uploadAudio(blob)` calls `/api/ai/audio-query`.
+- **`AiService`** — `streamQuery(prompt, conversationId, documentIds)` polls queued inference and emits `{ content, messageId, sources, confidence }`; `uploadAudio(blob)` uses the same contract. `submitFeedback(messageId, helpful, reason?)` replaces the signed-in user's existing vote for that answer.
 - **`AdminService`** — `listUsers`, `updateRole`, `updateTier` (auto-logs-out on 401).
 
 ### Frontend guards & interceptors

@@ -56,6 +56,6 @@ describe('AdminService', () => {
     const [url, init] = (window.fetch as jasmine.Spy).calls.mostRecent().args;
     expect(url).toContain('/api/admin/users');
     expect(init.method).toBe('GET');
-    expect(init.headers['Authorization']).toBe('Bearer test-token-abc');
+    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer test-token-abc');
   });
 });

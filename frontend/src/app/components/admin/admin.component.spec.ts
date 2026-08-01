@@ -15,6 +15,7 @@ describe('AdminComponent', () => {
   beforeEach(async () => {
     adminStub = jasmine.createSpyObj<AdminService>('AdminService', [
       'listUsers',
+      'getFeedbackSummary',
       'updateRole',
       'updateTier'
     ]);
@@ -36,6 +37,10 @@ describe('AdminComponent', () => {
     };
 
     routerStub = { navigate: jasmine.createSpy('navigate') };
+
+    adminStub.getFeedbackSummary.and.returnValue(of({
+      days: 30, total: 10, helpful: 8, unhelpful: 2, helpfulRate: 0.8, lastSubmittedAt: null
+    }));
 
     adminStub.listUsers.and.returnValue(
       of([

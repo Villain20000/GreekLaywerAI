@@ -3,7 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import gsap from 'gsap';
-import { AdminService, AdminUser } from '../../services/admin.service';
+import { AdminService, AdminUser, FeedbackSummary } from '../../services/admin.service';
 import { AuthService } from '../../services/auth.service';
 
 /**
@@ -86,6 +86,23 @@ import { AuthService } from '../../services/auth.service';
         >
           {{ isLoading ? 'Refreshing…' : 'Refresh users' }}
         </button>
+      </section>
+
+      <section *ngIf="feedbackSummary" class="nl-admin-card nl-feedback-summary">
+        <div class="nl-feedback-summary-heading">
+          <div>
+            <span class="nl-admin-eyebrow">Quality loop · last {{ feedbackSummary.days }} days</span>
+            <h3>Answer feedback</h3>
+          </div>
+          <strong *ngIf="feedbackSummary.helpfulRate !== null">
+            {{ (feedbackSummary.helpfulRate * 100).toFixed(0) }}% helpful
+          </strong>
+        </div>
+        <div class="nl-feedback-stats">
+          <span><b>{{ feedbackSummary.total }}</b> total</span>
+          <span class="positive"><b>{{ feedbackSummary.helpful }}</b> helpful</span>
+          <span class="negative"><b>{{ feedbackSummary.unhelpful }}</b> unhelpful</span>
+        </div>
       </section>
 
       <section class="nl-admin-card">
@@ -174,6 +191,7 @@ import { AuthService } from '../../services/auth.service';
 })
 export class AdminComponent implements OnInit {
   users: AdminUser[] = [];
+  feedbackSummary: FeedbackSummary | null = null;
   isLoading = false;
   errorMessage = '';
   saving: Record<number, boolean> = {};
@@ -194,6 +212,7 @@ export class AdminComponent implements OnInit {
 
   ngOnInit() {
     this.loadUsers();
+    this.loadFeedbackSummary();
     // Subtle fade-in for the table card. Uses the .nl-admin-card global
     // selector so the GSAP target matches the rendered class name.
     setTimeout(() => {
@@ -232,6 +251,13 @@ export class AdminComponent implements OnInit {
     } catch {
       return String(d);
     }
+  }
+
+  loadFeedbackSummary(): void {
+    this.adminService.getFeedbackSummary().subscribe({
+      next: (summary) => { this.feedbackSummary = summary; },
+      error: () => { this.feedbackSummary = null; }
+    });
   }
 
   loadUsers() {

@@ -3,6 +3,7 @@ const app = require('./app');
 const db = require('../src/config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const inferenceQueue = require('../src/services/inferenceQueue');
 
 const JWT_SECRET = 'nomos-super-secret-key-development';
 
@@ -598,6 +599,48 @@ describe('NomosAI API Endpoints', () => {
         .attach('file', binaryGarbage, 'fake.gif');
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toMatch(/Unsupported file type/);
+    });
+
+    it('attaches the authenticated owner to queued stream jobs', async () => {
+      queueAuth({ id: 2, role: 'user' });
+      const res = await request(app)
+        .post('/api/ai/query/stream')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ prompt: 'ιδιοκτησία', conversationId: 7 });
+
+      expect(res.statusCode).toEqual(200);
+      expect(inferenceQueue.addInferenceJob).toHaveBeenCalledWith(
+        'ιδιοκτησία',
+        'Formatted context',
+        expect.objectContaining({ userId: 2, conversationId: 7, prompt: 'ιδιοκτησία' })
+      );
+    });
+
+    it('hides a queued job from another authenticated user', async () => {
+      queueAuth({ id: 2, role: 'user' });
+      inferenceQueue.getJob.mockResolvedValueOnce({
+        data: { userId: 99, conversationId: null },
+        getState: jest.fn().mockResolvedValue('waiting')
+      });
+
+      const res = await request(app)
+        .get('/api/ai/query/stream/private-job')
+        .set('Authorization', `Bearer ${userToken}`);
+
+      expect(res.statusCode).toEqual(404);
+      expect(res.body.error).toBe('Job not found');
+    });
+
+    it('does not cancel a queued job without matching owner metadata', async () => {
+      queueAuth({ id: 2, role: 'user' });
+      inferenceQueue.getJob.mockResolvedValueOnce({ data: { userId: 99 } });
+
+      const res = await request(app)
+        .delete('/api/ai/query/stream/private-job')
+        .set('Authorization', `Bearer ${userToken}`);
+
+      expect(res.statusCode).toEqual(404);
+      expect(inferenceQueue.cancelJob).not.toHaveBeenCalled();
     });
   });
 

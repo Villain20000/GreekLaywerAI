@@ -692,6 +692,35 @@ button.secondary .spinner,
   border: 1px solid var(--nl-border);
   color: var(--nl-fg);
 }
+.nl-source-toggle {
+  display: inline-flex;
+  margin-top: var(--nl-space-4);
+  padding: var(--nl-space-2) var(--nl-space-3);
+  border: 1px solid var(--nl-border);
+  border-radius: var(--nl-radius-pill);
+  color: var(--nl-fg-muted);
+  font-size: 0.78rem;
+  transition: color var(--nl-t-fast), border-color var(--nl-t-fast), background var(--nl-t-fast);
+}
+.nl-source-toggle:hover { color: var(--nl-fg); border-color: var(--nl-border-strong); background: var(--nl-bg-hover); }
+.nl-source-list { display: grid; gap: var(--nl-space-2); margin-top: var(--nl-space-3); }
+.nl-source-item { display: flex; gap: var(--nl-space-2); align-items: flex-start; padding: var(--nl-space-2) var(--nl-space-3); border-left: 2px solid var(--nl-border-strong); color: var(--nl-fg-muted); font-size: 0.82rem; }
+.nl-source-item strong, .nl-source-item small { display: block; }
+.nl-source-item strong { color: var(--nl-fg); font-weight: 500; }
+.nl-source-item small { margin-top: 2px; color: var(--nl-fg-subtle); }
+.nl-source-index { display: inline-flex; align-items: center; justify-content: center; min-width: 1.35rem; height: 1.35rem; border-radius: 50%; background: var(--nl-bg-elevated); color: var(--nl-fg); font-size: 0.72rem; }
+.nl-feedback { display: flex; align-items: center; gap: var(--nl-space-2); margin-top: var(--nl-space-3); color: var(--nl-fg-subtle); font-size: 0.78rem; }
+.nl-feedback-label { margin-right: var(--nl-space-1); }
+.nl-feedback-button { width: 2rem; height: 2rem; padding: 0; border: 1px solid var(--nl-border); border-radius: 50%; background: var(--nl-bg-input); color: var(--nl-fg-muted); font-size: 0.95rem; transition: transform var(--nl-t-fast), border-color var(--nl-t-fast), background var(--nl-t-fast); }
+.nl-feedback-button:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--nl-border-strong); background: var(--nl-bg-hover); }
+.nl-feedback-button.selected { border-color: var(--nl-focus); background: var(--nl-bg-hover); }
+.nl-feedback-button:disabled { opacity: 0.55; cursor: wait; }
+.nl-feedback-thanks { color: var(--nl-success); margin-left: var(--nl-space-1); }
+.nl-document-picker { padding: var(--nl-space-3) var(--nl-space-6); border-top: 1px solid var(--nl-border); background: var(--nl-bg-card); }
+.nl-document-picker-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--nl-space-2); color: var(--nl-fg-muted); font-size: 0.8rem; }
+.nl-document-clear { color: var(--nl-fg-subtle); font-size: 0.78rem; text-decoration: underline; }
+.nl-document-option { display: inline-flex; align-items: center; gap: var(--nl-space-2); margin: 0 var(--nl-space-3) var(--nl-space-2) 0; color: var(--nl-fg-muted); font-size: 0.82rem; cursor: pointer; }
+.nl-document-option:hover { color: var(--nl-fg); }
 .nl-typing-indicator { color: var(--nl-fg-subtle); font-style: italic; align-self: flex-start; }
 .nl-chat-input-area {
   padding: var(--nl-space-5) var(--nl-space-6);
@@ -745,6 +774,15 @@ button.secondary .spinner,
   padding: var(--nl-space-5);
 }
 .nl-admin-card h3 { margin: 0 0 var(--nl-space-4) 0; font-weight: 500; }
+.nl-feedback-summary { margin-bottom: var(--nl-space-4); }
+.nl-feedback-summary-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--nl-space-4); }
+.nl-feedback-summary-heading h3 { margin-bottom: 0; }
+.nl-admin-eyebrow { color: var(--nl-fg-subtle); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; }
+.nl-feedback-summary-heading > strong { color: var(--nl-success); font-size: 1.1rem; }
+.nl-feedback-stats { display: flex; flex-wrap: wrap; gap: var(--nl-space-5); margin-top: var(--nl-space-4); color: var(--nl-fg-muted); font-size: 0.85rem; }
+.nl-feedback-stats b { color: var(--nl-fg); font-size: 1.05rem; }
+.nl-feedback-stats .positive b { color: var(--nl-success); }
+.nl-feedback-stats .negative b { color: var(--nl-danger); }
 
 .nl-admin-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 .nl-admin-table th, .nl-admin-table td { text-align: left; padding: var(--nl-space-3); border-bottom: 1px solid var(--nl-border); vertical-align: middle; }

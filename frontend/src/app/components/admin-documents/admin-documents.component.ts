@@ -1,6 +1,7 @@
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { environment } from '../../../environments/environment';
+import { apiFetch } from '../../services/api-client';
 
 interface AdminDocument {
   id: number;
@@ -59,7 +60,7 @@ export class AdminDocumentsComponent implements OnInit {
 
   private async load(): Promise<void> {
     try {
-      const res = await fetch(`${this.apiUrl}?limit=100`, {
+      const res = await apiFetch(`${this.apiUrl}?limit=100`, {
         headers: { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` }
       });
       if (!res.ok) throw new Error(`List failed (HTTP ${res.status})`);
@@ -73,7 +74,7 @@ export class AdminDocumentsComponent implements OnInit {
   async deleteDoc(doc: AdminDocument): Promise<void> {
     if (!confirm(`Διαγραφή του εγγράφου "${doc.filename}" του χρήστη ${doc.user_email}?`)) return;
     try {
-      const res = await fetch(`${this.apiUrl}/${doc.id}`, {
+      const res = await apiFetch(`${this.apiUrl}/${doc.id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` }
       });

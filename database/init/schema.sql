@@ -46,15 +46,36 @@ CREATE TABLE messages (
     conversation_id INT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
     content TEXT NOT NULL,
+    -- Optional idempotency key for assistant responses produced by a queued job.
+    source_job_id VARCHAR(255),
+    -- Structured Phase B citation/confidence metadata for assistant answers.
+    citation_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS messages_conversation_id_idx ON messages(conversation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS messages_source_job_id_uidx
+    ON messages(source_job_id) WHERE source_job_id IS NOT NULL;
+
+-- Phase C: one replaceable quality signal per user and assistant answer.
+CREATE TABLE message_feedback (
+    id SERIAL PRIMARY KEY,
+    message_id INT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    helpful BOOLEAN NOT NULL,
+    reason VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (message_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS message_feedback_created_at_idx ON message_feedback(created_at);
+CREATE INDEX IF NOT EXISTS message_feedback_helpful_idx ON message_feedback(helpful);
 
 -- Legal Documents Table (Uploaded Evidence / Contracts)
 CREATE TABLE legal_documents (
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
     filename VARCHAR(255) NOT NULL,
+    title VARCHAR(255),
     file_url VARCHAR(1024),
     content_type VARCHAR(100),
     parsed_text TEXT,

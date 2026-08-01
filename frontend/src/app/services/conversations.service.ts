@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { environment } from '../../environments/environment';
+import { apiFetch } from './api-client';
 
 export interface Conversation {
   id: number;
@@ -8,10 +9,17 @@ export interface Conversation {
   updated_at: string;
 }
 
+import type { AnswerSource } from './ai.service';
+
 export interface Message {
   id: number;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  citation_metadata?: {
+    sources?: AnswerSource[];
+    confidence?: number;
+  } | null;
+  feedback_helpful?: boolean | null;
   created_at: string;
 }
 
@@ -26,14 +34,14 @@ export class ConversationsService {
   }
 
   async list(limit = 20, offset = 0): Promise<Conversation[]> {
-    const res = await fetch(`${this.apiUrl}?limit=${limit}&offset=${offset}`, { headers: this.headers() });
+    const res = await apiFetch(`${this.apiUrl}?limit=${limit}&offset=${offset}`, { headers: this.headers() });
     if (!res.ok) throw new Error(`List conversations failed (HTTP ${res.status})`);
     const data = await res.json();
     return data.conversations || [];
   }
 
   async create(title?: string): Promise<Conversation> {
-    const res = await fetch(this.apiUrl, {
+    const res = await apiFetch(this.apiUrl, {
       method: 'POST',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ title })
@@ -44,13 +52,13 @@ export class ConversationsService {
   }
 
   async get(id: number): Promise<{ conversation: Conversation; messages: Message[] }> {
-    const res = await fetch(`${this.apiUrl}/${id}`, { headers: this.headers() });
+    const res = await apiFetch(`${this.apiUrl}/${id}`, { headers: this.headers() });
     if (!res.ok) throw new Error(`Get conversation failed (HTTP ${res.status})`);
     return res.json();
   }
 
   async rename(id: number, title: string): Promise<Conversation> {
-    const res = await fetch(`${this.apiUrl}/${id}`, {
+    const res = await apiFetch(`${this.apiUrl}/${id}`, {
       method: 'PUT',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ title })
@@ -61,7 +69,7 @@ export class ConversationsService {
   }
 
   async remove(id: number): Promise<void> {
-    const res = await fetch(`${this.apiUrl}/${id}`, {
+    const res = await apiFetch(`${this.apiUrl}/${id}`, {
       method: 'DELETE',
       headers: this.headers()
     });

@@ -1,7 +1,7 @@
 const { Ollama } = require('ollama');
 
 const ollama = new Ollama({ host: process.env.OLLAMA_URL || 'http://127.0.0.1:11434' });
-const MODEL_NAME = 'gemma:2b'; // Placeholder for gemma:4b or gemma:12b
+const MODEL_NAME = process.env.OLLAMA_CHAT_MODEL || 'gemma:2b'; // Placeholder for gemma:4b or gemma:12b
 // Dedicated embedding model. Default to `bge-m3` because it emits
 // 1024-dim vectors — matching the `legislation_embeddings.embedding
 // vector(1024)` schema column (Phase 31). `bge-m3` is properly

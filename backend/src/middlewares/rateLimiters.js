@@ -310,6 +310,13 @@ function createAiRateLimiters(options = {}) {
       max: resolveCap(options.aiPollMax, 120),
       keyGenerator: (req) => userKey(req, 'ai_poll'),
       store: createStore('ai_poll')
+    }),
+    feedback: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.aiFeedbackMax, 30),
+      keyGenerator: (req) => userKey(req, 'ai_feedback'),
+      store: createStore('ai_feedback')
     })
   };
 }

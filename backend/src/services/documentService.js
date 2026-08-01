@@ -162,19 +162,24 @@ async function extractMetadata(buffer, { contentType, filename, title }) {
  * Returns the created document row (without the raw parsed_text for
  * the response envelope, which can be huge).
  */
-async function processAndStoreDocument(userId, file, detectedType) {
+async function processAndStoreDocument(userId, file, detectedType, title) {
+  const normalizedTitle = typeof title === 'string' && title.trim()
+    ? title.trim().slice(0, 255)
+    : null;
   const { meta, text } = await extractMetadata(file.buffer, {
     contentType: detectedType,
-    filename: file.originalname
+    filename: file.originalname,
+    title: normalizedTitle
   });
 
   const chunks = chunkText(text);
 
   const docResult = await db.query(
-    `INSERT INTO legal_documents (user_id, filename, file_url, content_type, parsed_text, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id, user_id, filename, content_type, metadata, created_at`,
-    [userId, file.originalname, null, detectedType, text || null, JSON.stringify(meta)]
+    `INSERT INTO legal_documents
+       (user_id, filename, title, file_url, content_type, parsed_text, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id, user_id, filename, title, content_type, metadata, created_at`,
+    [userId, file.originalname, normalizedTitle, null, detectedType, text || null, JSON.stringify(meta)]
   );
   const document = docResult.rows[0];
 
@@ -204,9 +209,16 @@ async function processAndStoreDocument(userId, file, detectedType) {
  * Vector similarity search across a user's document chunks.
  * Returns top-K chunks with document title/filename + similarity scores.
  */
-async function searchUserDocuments(query, userId, limit = 5) {
+async function searchUserDocuments(query, userId, limit = 5, documentIds = null) {
   const queryEmbedding = await ollamaService.generateEmbedding(query);
   const embeddingStr = `[${queryEmbedding.join(',')}]`;
+  const selectedIds = Array.isArray(documentIds)
+    ? documentIds.filter((id) => Number.isInteger(id) && id > 0)
+    : [];
+  const filter = selectedIds.length ? ' AND d.id = ANY($4::int[])' : '';
+  const params = selectedIds.length
+    ? [embeddingStr, userId, limit, selectedIds]
+    : [embeddingStr, userId, limit];
 
   const result = await db.query(
     `SELECT c.id AS chunk_id, c.content, c.chunk_index,
@@ -214,10 +226,10 @@ async function searchUserDocuments(query, userId, limit = 5) {
             d.id AS document_id, d.filename, d.title
      FROM legal_document_chunks c
      JOIN legal_documents d ON d.id = c.document_id
-     WHERE d.user_id = $2
+     WHERE d.user_id = $2${filter}
      ORDER BY c.embedding <=> $1::vector
      LIMIT $3`,
-    [embeddingStr, userId, limit]
+    params
   );
   return result.rows;
 }

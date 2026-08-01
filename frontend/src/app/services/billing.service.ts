@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { environment } from '../../environments/environment';
+import { apiFetch } from './api-client';
 
 export interface Subscription {
   id: number;
@@ -27,7 +28,7 @@ export class BillingService {
 
   /** Start Stripe Checkout for a tier; returns the redirect URL. */
   async createCheckoutSession(tier: string): Promise<string> {
-    const res = await fetch(`${this.apiUrl}/billing/create-checkout-session`, {
+    const res = await apiFetch(`${this.apiUrl}/billing/create-checkout-session`, {
       method: 'POST',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ tier })
@@ -41,20 +42,20 @@ export class BillingService {
   }
 
   async getSubscription(): Promise<SubscriptionState> {
-    const res = await fetch(`${this.apiUrl}/subscriptions`, { headers: this.headers() });
+    const res = await apiFetch(`${this.apiUrl}/subscriptions`, { headers: this.headers() });
     if (!res.ok) throw new Error(`Get subscription failed (HTTP ${res.status})`);
     return res.json();
   }
 
   async history(): Promise<Subscription[]> {
-    const res = await fetch(`${this.apiUrl}/subscriptions/history`, { headers: this.headers() });
+    const res = await apiFetch(`${this.apiUrl}/subscriptions/history`, { headers: this.headers() });
     if (!res.ok) throw new Error(`Subscription history failed (HTTP ${res.status})`);
     const data = await res.json();
     return data.subscriptions || [];
   }
 
   async cancel(): Promise<void> {
-    const res = await fetch(`${this.apiUrl}/subscriptions/cancel`, {
+    const res = await apiFetch(`${this.apiUrl}/subscriptions/cancel`, {
       method: 'POST',
       headers: this.headers()
     });
@@ -62,7 +63,7 @@ export class BillingService {
   }
 
   async upgrade(tier: string): Promise<string> {
-    const res = await fetch(`${this.apiUrl}/subscriptions/upgrade`, {
+    const res = await apiFetch(`${this.apiUrl}/subscriptions/upgrade`, {
       method: 'POST',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ tier })

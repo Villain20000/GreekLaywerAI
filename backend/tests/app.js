@@ -41,8 +41,10 @@ jest.mock('../src/services/ollamaService', () => ({
   generateEmbedding: jest.fn().mockResolvedValue([0.1, 0.2, 0.3])
 }));
 jest.mock('../src/services/ragService', () => ({
-  retrieveContext: jest.fn().mockResolvedValue([{ content: 'Mock context' }]),
-  formatContextForGemma: jest.fn().mockReturnValue('Formatted context')
+  retrieveContext: jest.fn().mockResolvedValue([{ content: 'Mock context', similarity: 0.8 }]),
+  formatContextForGemma: jest.fn().mockReturnValue('Formatted context'),
+  toSources: jest.fn().mockReturnValue([]),
+  calculateConfidence: jest.fn().mockReturnValue(0)
 }));
 // Phase 29: mock the inference queue so AI routes don't touch Redis.
 jest.mock('../src/services/inferenceQueue', () => ({
@@ -51,6 +53,8 @@ jest.mock('../src/services/inferenceQueue', () => ({
     waitUntilFinished: async () => 'Mock response'
   })),
   getJob: jest.fn().mockResolvedValue(null),
+  cancelJob: jest.fn().mockResolvedValue(false),
+  getQueueEvents: jest.fn().mockReturnValue(null),
   startWorker: jest.fn(),
   getQueueStatus: jest.fn().mockResolvedValue({ enabled: false, reason: 'test env' }),
   pingRedis: jest.fn().mockResolvedValue(null),
@@ -65,13 +69,14 @@ jest.mock('../src/services/documentService', () => ({
       user_id: 2,
       filename: 'doc.pdf',
       content_type: 'application/pdf',
-      metadata: { size_bytes: 10 },
+      title: 'doc',
+      metadata: { size_bytes: 10, title: 'doc' },
       created_at: '2026-01-01T00:00:00Z'
     },
     chunkCount: 3
   }),
   searchUserDocuments: jest.fn().mockResolvedValue([
-    { chunk_id: 1, content: 'chunk', similarity: 0.9, document_id: 1, filename: 'doc.pdf' }
+    { chunk_id: 1, content: 'chunk', similarity: 0.9, document_id: 1, filename: 'doc.pdf', title: 'doc' }
   ]),
   chunkText: jest.fn()
 }));

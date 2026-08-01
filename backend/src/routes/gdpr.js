@@ -16,7 +16,7 @@ router.get('/export', async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const [profile, conversations, documents, subscriptions, audit] = await Promise.all([
+    const [profile, conversations, documents, subscriptions, audit, feedback] = await Promise.all([
       db.query(
         `SELECT id, email, role, subscription_tier, created_at, verified_at
          FROM users WHERE id = $1`,
@@ -43,6 +43,11 @@ router.get('/export', async (req, res) => {
         `SELECT action, resource_type, resource_id, old_value, new_value, ip_address, created_at
          FROM audit_log WHERE user_id = $1`,
         [userId]
+      ),
+      db.query(
+        `SELECT message_id, helpful, reason, created_at, updated_at
+         FROM message_feedback WHERE user_id = $1`,
+        [userId]
       )
     ]);
 
@@ -52,7 +57,8 @@ router.get('/export', async (req, res) => {
       conversations: conversations.rows,
       documents: documents.rows,
       subscriptions: subscriptions.rows,
-      audit_log: audit.rows
+      audit_log: audit.rows,
+      message_feedback: feedback.rows
     });
   } catch (error) {
     console.error('GDPR export error:', error);

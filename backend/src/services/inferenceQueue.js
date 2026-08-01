@@ -8,9 +8,10 @@
 //   - startWorker() is idempotent (singleton-promise pattern) and is called
 //     from index.js on boot.
 //   - getQueueStatus() feeds the /health endpoint.
+//   - cited-answer metadata travels in job.data alongside the prompt/context.
 //   - closeQueue() drains everything for graceful shutdown.
 
-const { Queue, Worker } = require('bullmq');
+const { Queue, QueueEvents, Worker } = require('bullmq');
 const ollamaService = require('./ollamaService');
 const IORedis = require('ioredis');
 
@@ -19,8 +20,12 @@ const QUEUE_NAME = 'GemmaInferenceQueue';
 
 let connection = null;
 let queue = null;
+let queueEvents = null;
 let worker = null;
 let workerStartPromise = null;
+// Inline jobs keep the no-Redis development path compatible with the same
+// enqueue/poll contract used in production.
+const inlineJobs = new Map();
 
 function getConnection() {
   if (NODE_ENV === 'test') return null;
@@ -44,36 +49,84 @@ function getQueue() {
 }
 
 /**
+ * Lazy singleton QueueEvents instance. BullMQ >= 5.x requires an explicit
+ * QueueEvents instance to be passed to Job.waitUntilFinished() — it is NOT
+ * pulled from the queue object anymore.
+ */
+function getQueueEvents() {
+  const conn = getConnection();
+  if (!conn) return null;
+  if (queueEvents) return queueEvents;
+  queueEvents = new QueueEvents(QUEUE_NAME, { connection: conn });
+  return queueEvents;
+}
+
+/**
  * Enqueue an inference job. Returns the BullMQ job (with a working
  * waitUntilFinished()) in production; in no-Redis environments it runs the
  * generation inline and returns a lightweight stand-in with the same shape.
  */
-async function addInferenceJob(prompt, contextStr) {
+async function addInferenceJob(prompt, contextStr, metadata = {}) {
   const q = getQueue();
   if (!q) {
     const response = await ollamaService.generateResponse(prompt, contextStr);
-    return {
-      id: `inline_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-      waitUntilFinished: async () => response
+    const id = `inline_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const job = {
+      id,
+      data: { prompt, contextStr, ...metadata },
+      returnvalue: response,
+      failedReason: null,
+      waitUntilFinished: async () => response,
+      getState: async () => 'completed'
     };
+    inlineJobs.set(id, job);
+    return job;
   }
-  const job = await q.add('generate', { prompt, contextStr });
+  const job = await q.add('generate', { prompt, contextStr, ...metadata });
   return job;
 }
 
 /**
- * Resolve a job for the polling endpoint. Inline (no-Redis) jobs are not
- * resolvable — getJob returns null and the route 404s.
+ * Resolve a job for the polling endpoint. Inline jobs are retained briefly
+ * in memory so development uses the same ownership and polling contract as
+ * the Redis-backed deployment.
  */
 async function getJob(jobId) {
+  if (!jobId) return null;
+  const inlineJob = inlineJobs.get(String(jobId));
+  if (inlineJob) return inlineJob;
+
   const q = getQueue();
-  if (!q || !jobId) return null;
+  if (!q) return null;
   try {
     return await q.getJob(String(jobId));
   } catch (err) {
     console.error(`[QUEUE] getJob(${jobId}) failed:`, err.message);
     return null;
   }
+}
+
+/**
+ * Best-effort cancellation for client disconnects. Waiting/delayed BullMQ
+ * jobs can be removed; active local-model inference cannot be interrupted
+ * safely through BullMQ alone, so it is reported as not removed.
+ */
+async function cancelJob(jobId) {
+  if (!jobId) return false;
+  if (inlineJobs.delete(String(jobId))) return true;
+
+  const job = await getJob(jobId);
+  if (!job) return false;
+  try {
+    const state = await job.getState();
+    if (state === 'waiting' || state === 'delayed') {
+      await job.remove();
+      return true;
+    }
+  } catch (err) {
+    console.error(`[QUEUE] cancelJob(${jobId}) failed:`, err.message);
+  }
+  return false;
 }
 
 /**
@@ -155,11 +208,13 @@ async function pingRedis() {
 }
 
 /**
- * Graceful shutdown: close worker, queue, and the shared connection.
+ * Graceful shutdown: close worker, queue, events, and the shared connection.
  */
 async function closeQueue() {
   try { if (worker) await worker.close(); } catch (_e) { /* ignore */ }
   try { if (queue) await queue.close(); } catch (_e) { /* ignore */ }
+  try { if (queueEvents) await queueEvents.close(); } catch (_e) { /* ignore */ }
+  inlineJobs.clear();
   try {
     if (connection) {
       connection.disconnect();
@@ -171,6 +226,8 @@ async function closeQueue() {
 module.exports = {
   addInferenceJob,
   getJob,
+  cancelJob,
+  getQueueEvents,
   startWorker,
   getQueueStatus,
   pingRedis,

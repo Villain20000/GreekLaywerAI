@@ -2,6 +2,7 @@ import { Injectable } from '@angular/core';
 import { BehaviorSubject, Observable } from 'rxjs';
 import { Router } from '@angular/router';
 import { environment } from '../../environments/environment';
+import { apiFetch } from './api-client';
 
 export interface AuthUser {
   id: number;
@@ -55,6 +56,8 @@ export class AuthService {
    * to /login never accidentally leaks the signal.
    */
   private static readonly MAGIC_LINK_BANNER_KEY = 'nomos_magic_link_banner';
+  private static activeInstance: AuthService | null = null;
+  private static authExpiredHandlerInstalled = false;
 
   /** Phase 25 (admin bypass): banner TTL in ms (30s). Matches admin.component's auto-dismiss. */
   private static readonly MAGIC_LINK_BANNER_DELAY_MS = 30_000;
@@ -74,6 +77,14 @@ export class AuthService {
   public ready$: Observable<boolean>;
 
   constructor(private router: Router) {
+    AuthService.activeInstance = this;
+    if (typeof window !== 'undefined' && !AuthService.authExpiredHandlerInstalled) {
+      window.addEventListener('nomos:auth-expired', () => {
+        AuthService.activeInstance?.logout();
+      });
+      AuthService.authExpiredHandlerInstalled = true;
+    }
+
     const token = localStorage.getItem('nomos_token');
     const userJson = localStorage.getItem('nomos_user');
     this.tokenSubject = new BehaviorSubject<string | null>(token);
@@ -102,15 +113,14 @@ export class AuthService {
 
   private async refreshFromServer(): Promise<void> {
     try {
-      const response = await fetch(`${this.apiUrl}/me`, {
+      const response = await apiFetch(`${this.apiUrl}/me`, {
         method: 'GET',
         headers: this.tokenValue
           ? { Authorization: `Bearer ${this.tokenValue}` }
           : {}
       });
       if (response.status === 401) {
-        // Token is invalid/expired — force a fresh login.
-        this.logout();
+        // apiFetch already notifies the active session handler.
         return;
       }
       if (!response.ok) return;
@@ -164,7 +174,7 @@ export class AuthService {
       }
   > {
     try {
-      const response = await fetch(`${this.apiUrl}/login`, {
+      const response = await apiFetch(`${this.apiUrl}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
@@ -241,7 +251,7 @@ export class AuthService {
     password: string
   ): Promise<RegisterResult> {
     try {
-      const response = await fetch(`${this.apiUrl}/register`, {
+      const response = await apiFetch(`${this.apiUrl}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
@@ -295,7 +305,7 @@ export class AuthService {
     | { ok: false; error: string; status: number }
   > {
     try {
-      const response = await fetch(`${this.apiUrl}/verify-email`, {
+      const response = await apiFetch(`${this.apiUrl}/verify-email`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token })
@@ -349,7 +359,7 @@ export class AuthService {
     | { ok: false; error: string; status: number }
   > {
     try {
-      const response = await fetch(`${this.apiUrl}/admin-magic-link/redeem`, {
+      const response = await apiFetch(`${this.apiUrl}/admin-magic-link/redeem`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token })
@@ -396,7 +406,7 @@ export class AuthService {
     email: string
   ): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
     try {
-      const response = await fetch(`${this.apiUrl}/resend-verification`, {
+      const response = await apiFetch(`${this.apiUrl}/resend-verification`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email })
@@ -446,7 +456,7 @@ export class AuthService {
     newPassword: string
   ): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
     try {
-      const response = await fetch(`${this.apiUrl}/change-password`, {
+      const response = await apiFetch(`${this.apiUrl}/change-password`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -475,11 +485,6 @@ export class AuthService {
           this.userSubject.next(data.user);
         }
         return { ok: true };
-      }
-
-      // 401 = expired/invalid token. Force re-auth.
-      if (response.status === 401) {
-        this.logout();
       }
 
       return {
@@ -513,7 +518,7 @@ export class AuthService {
     email: string
   ): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
     try {
-      const response = await fetch(`${this.apiUrl}/forgot-password`, {
+      const response = await apiFetch(`${this.apiUrl}/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email })
@@ -560,7 +565,7 @@ export class AuthService {
     | { ok: false; error: string; status: number }
   > {
     try {
-      const response = await fetch(`${this.apiUrl}/reset-password`, {
+      const response = await apiFetch(`${this.apiUrl}/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token, newPassword })
@@ -580,12 +585,6 @@ export class AuthService {
         return { ok: true, token: data.token, user: data.user };
       }
 
-      // 401 is unexpected on this route (no JWT) but defensively clear
-      // local state to avoid leaving the user with a stale credential.
-      if (response.status === 401) {
-        this.logout();
-      }
-
       return {
         ok: false,
         error: data?.error || `Reset-password failed (HTTP ${response.status})`,
@@ -603,7 +602,7 @@ export class AuthService {
    * serialize into a downloadable file.
    */
   async exportData(): Promise<unknown> {
-    const response = await fetch(`${this.apiUrl}/export`, {
+    const response = await apiFetch(`${this.apiUrl}/export`, {
       method: 'GET',
       headers: this.tokenValue
         ? { Authorization: `Bearer ${this.tokenValue}` }
@@ -621,7 +620,7 @@ export class AuthService {
    * all associated data. Clears local auth state on success.
    */
   async deleteAccount(): Promise<void> {
-    const response = await fetch(`${this.apiUrl}/delete-account`, {
+    const response = await apiFetch(`${this.apiUrl}/delete-account`, {
       method: 'DELETE',
       headers: this.tokenValue
         ? { Authorization: `Bearer ${this.tokenValue}` }

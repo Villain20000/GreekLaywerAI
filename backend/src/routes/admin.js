@@ -143,6 +143,39 @@ router.get('/audit-log', async (req, res) => {
   }
 });
 
+// GET /api/admin/feedback-summary — aggregate answer-quality signals only.
+// Deliberately excludes prompts, answer text, document names, and free-text
+// reasons so the operational dashboard cannot become a content-export API.
+router.get('/feedback-summary', async (req, res) => {
+  try {
+    const parsedDays = Number.parseInt(req.query.days, 10);
+    const days = Number.isInteger(parsedDays) ? Math.min(Math.max(parsedDays, 1), 365) : 30;
+    const result = await db.query(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE helpful)::int AS helpful,
+         COUNT(*) FILTER (WHERE NOT helpful)::int AS unhelpful,
+         MAX(created_at) AS last_submitted_at
+       FROM message_feedback
+       WHERE created_at >= CURRENT_TIMESTAMP - ($1 * INTERVAL '1 day')`,
+      [days]
+    );
+    const row = result.rows[0] || { total: 0, helpful: 0, unhelpful: 0, last_submitted_at: null };
+    const total = Number(row.total) || 0;
+    const helpful = Number(row.helpful) || 0;
+    return res.json({
+      days,
+      total,
+      helpful,
+      unhelpful: Number(row.unhelpful) || 0,
+      helpfulRate: total ? helpful / total : null,
+      lastSubmittedAt: row.last_submitted_at || null
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/admin/documents — list every user's documents (admin only)
 router.get('/documents', async (req, res) => {
   try {
