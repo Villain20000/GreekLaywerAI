@@ -4,6 +4,7 @@ import { Router } from '@angular/router';
 import { TranslatePipe } from '@ngx-translate/core';
 import * as THREE from 'three';
 import gsap from 'gsap';
+import { ExperimentService } from '../../services/experiment.service';
 
 @Component({
   selector: 'app-landing',
@@ -14,7 +15,7 @@ import gsap from 'gsap';
       <div #canvasContainer class="canvas-container"></div>
       <div class="content">
         <h1 class="hero-title">NomosAI</h1>
-        <p class="hero-subtitle">{{ 'landing.subtitle' | translate }}</p>
+        <p class="hero-subtitle">{{ heroSubtitleKey | translate }}</p>
         <button class="cta-button" (click)="enterApp()">{{ 'landing.enter' | translate }}</button>
       </div>
     </div>
@@ -37,6 +38,9 @@ export class LandingComponent implements OnInit, AfterViewInit, OnDestroy {
   /** True when the OS asks for reduced motion; skips Three.js + GSAP motion. */
   reducedMotion = false;
 
+  /** Assignment for the `landing-hero` experiment; control by default. */
+  heroVariant = 'control';
+
   /**
    * Stable bound handler so ngOnDestroy can actually remove the listener
    * (the old code bound a fresh function on add and could never detach it).
@@ -44,10 +48,27 @@ export class LandingComponent implements OnInit, AfterViewInit, OnDestroy {
   private readonly resizeHandler = (): void => this.onWindowResize();
   private resizeListenerAttached = false;
 
-  constructor(private router: Router) {}
+  constructor(
+    private router: Router,
+    private readonly experiments: ExperimentService
+  ) {}
+
+  get heroSubtitleKey(): string {
+    return this.heroVariant === 'variant'
+      ? 'landing.hero.variant.subtitle'
+      : 'landing.subtitle';
+  }
 
   ngOnInit(): void {
     this.reducedMotion = this.prefersReducedMotion();
+    void this.experiments
+      .ready()
+      .then(() => {
+        this.heroVariant = this.experiments.getVariant('landing-hero');
+      })
+      .catch(() => {
+        this.heroVariant = 'control';
+      });
   }
 
   ngAfterViewInit(): void {

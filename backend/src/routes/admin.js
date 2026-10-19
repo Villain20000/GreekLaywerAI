@@ -230,22 +230,56 @@ router.get('/feedback-summary', async (req, res) => {
   }
 });
 
-// GET /api/admin/documents — list every user's documents (admin only)
+// GET /api/admin/documents — list every user's documents (admin only).
+// Optional `q` searches filename/title/owner email (parameterized ILIKE) and
+// `userId` matches the owner exactly. `total`/`limit`/`offset` are additive
+// so the UI can page; `documents` remains the response array.
 router.get('/documents', async (req, res) => {
   try {
-    const limit = Math.min(Number.parseInt(req.query.limit, 10) || 50, 200);
-    const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 255) : '';
+    const parsedUserId = Number.parseInt(req.query.userId, 10);
+    const userId = Number.isInteger(parsedUserId) && parsedUserId > 0 ? parsedUserId : undefined;
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isInteger(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 100) : 20;
+    const parsedOffset = Number.parseInt(req.query.offset, 10);
+    const offset = Number.isInteger(parsedOffset) ? Math.max(parsedOffset, 0) : 0;
+
+    const clauses = [];
+    const filterParams = [];
+    if (userId !== undefined) {
+      filterParams.push(userId);
+      clauses.push(`d.user_id = $${filterParams.length}`);
+    }
+    if (q) {
+      filterParams.push(`%${q}%`);
+      const placeholder = `$${filterParams.length}`;
+      clauses.push(`(d.filename ILIKE ${placeholder} OR d.title ILIKE ${placeholder} OR u.email ILIKE ${placeholder})`);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limitPlaceholder = `$${filterParams.length + 1}`;
+    const offsetPlaceholder = `$${filterParams.length + 2}`;
+
     const result = await db.query(
-      `SELECT d.id, d.user_id, u.email AS user_email, d.filename, d.content_type,
-              d.metadata, d.created_at,
+      `SELECT d.id, d.user_id, u.email AS user_email, d.filename, d.title, d.content_type,
+              d.file_size, d.metadata, d.created_at,
               (SELECT COUNT(*) FROM legal_document_chunks c WHERE c.document_id = d.id) AS chunk_count
        FROM legal_documents d
        JOIN users u ON u.id = d.user_id
-       ORDER BY d.created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset]
+       ${where}
+       ORDER BY d.created_at DESC, d.id DESC
+       LIMIT ${limitPlaceholder} OFFSET ${offsetPlaceholder}`,
+      [...filterParams, limit, offset]
     );
-    res.json({ documents: result.rows });
+    const countResult = await db.query(
+      `SELECT COUNT(*)::int AS total
+       FROM legal_documents d
+       JOIN users u ON u.id = d.user_id
+       ${where}`,
+      filterParams
+    );
+    const total = Number(countResult.rows[0] && countResult.rows[0].total) || 0;
+
+    res.json({ documents: result.rows, total, limit, offset });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

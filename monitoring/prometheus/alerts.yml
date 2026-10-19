@@ -87,3 +87,26 @@ groups:
         annotations:
           summary: 'NomosAI backup freshness metric is missing'
           description: 'No successful backup has published a Prometheus textfile since Prometheus started; check the backup cron sidecar and PROM_TEXTFILE_DIR.'
+
+  - name: nomosai-observability
+    rules:
+      - alert: AlertmanagerDown
+        expr: up{job="alertmanager"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'NomosAI Alertmanager is unreachable'
+          description: 'Prometheus cannot scrape alertmanager:9093; Slack/email notifications may be silently lost.'
+
+      # Dormant until a blackbox_exporter probe certificate is added (the
+      # staging/prod stacks do not ship one). The external synthetic monitor
+      # in docs/observability.md covers certificate expiry in the meantime.
+      - alert: TLSCertificateExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) < 14 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'NomosAI TLS certificate expires within 14 days'
+          description: 'The probe target {{ $labels.instance }} has {{ $value | humanizeDuration }} left before certificate expiry.'

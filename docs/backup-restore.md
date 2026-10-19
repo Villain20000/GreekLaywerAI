@@ -24,9 +24,9 @@ Not included:
   you need them).
 - `.env`/secrets, TLS certificates, Ollama models, or Redis contents. Redis
   holds ephemeral queue/rate-limit state and is intentionally not restored.
-- The backup volume itself is local storage. It should be replicated off-host
-  (or snapshotted) as a separate operational control; this repository does not
-  ship off-site copy configuration.
+- The backup volume itself is local storage. Set `BACKUP_S3_BUCKET` to upload
+  each dump offsite after it is written (see "Offsite copy" below); otherwise
+  replicate or snapshot the volume as a separate operational control.
 
 The target PostgreSQL server must have the `vector` (pgvector) extension
 available; restoring into a stock Postgres without it fails.
@@ -67,6 +67,30 @@ List backups:
 ls -lht "$BACKUP_DIR"/*.dump | head
 # production compose:
 docker compose -f docker-compose.prod.yml exec backup sh -c 'ls -lht /backups/*.dump | head'
+```
+
+## Offsite copy (S3-compatible)
+
+`backupDb.js` uploads each successful dump when `BACKUP_S3_BUCKET` is set.
+The upload runs **after** the local write and **before** pruning, so a failed
+upload never deletes a local copy and exits non-zero for the cron job.
+
+| Variable | Meaning |
+|---|---|
+| `BACKUP_S3_BUCKET` | Destination bucket. Empty disables the upload. |
+| `S3_PREFIX` | Key prefix, default `nomosai/`. |
+| `S3_REGION` / `AWS_REGION` | Region (`S3_REGION` wins, falling back to `AWS_REGION`, then `us-east-1`). |
+| `S3_ENDPOINT` | Custom endpoint for MinIO/R2/B2-style storage. |
+| `S3_FORCE_PATH_STYLE` | `true` for path-style buckets (most non-AWS endpoints). |
+| `S3_SSE` | Optional server-side encryption algorithm (e.g. `AES256`). |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Explicit credentials; otherwise the AWS default chain (`AWS_*`, instance/task role) is used. |
+
+Both compose files pass these variables to the backup sidecar. Verify with:
+
+```bash
+docker compose -f docker-compose.prod.yml exec backup \
+  sh -c 'echo "$BACKUP_S3_BUCKET $S3_PREFIX"'
+aws s3 ls "s3://$BACKUP_S3_BUCKET/${S3_PREFIX:-nomosai/}"
 ```
 
 ## Freshness metric and alerts

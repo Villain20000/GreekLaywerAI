@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nomosai-frontend
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai-frontend
+    app.kubernetes.io/part-of: nomosai
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nomosai-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nomosai-frontend
+        app.kubernetes.io/part-of: nomosai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+        sysctls:
+          # nginx also listens on port 80; allow the non-root user to bind it.
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nomosai-frontend
+      containers:
+        - name: frontend
+          # Build with --build-arg SITE_URL=https://app.example.com.
+          image: registry.example.com/nomosai/frontend:REPLACE_ME
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+            # Optional Cloudflare real-IP ranges. Create the ConfigMap from
+            # deploy/cloudflare/real-ip.conf, then uncomment:
+            # - name: cloudflare-real-ip
+            #   mountPath: /etc/nginx/cloudflare
+            #   readOnly: true
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        # - name: cloudflare-real-ip
+        #   configMap:
+        #     name: cloudflare-real-ip
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai-frontend
+    app.kubernetes.io/part-of: nomosai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nomosai-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

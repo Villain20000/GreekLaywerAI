@@ -1,19 +1,55 @@
+# NomosAI production stack.
+#
+# Traefik v3 terminates TLS (Let's Encrypt production ACME) and is the only
+# service publishing public host ports. The frontend nginx serves the SPA and
+# proxies /api/ to the backend, so neither the API nor the data stores are
+# exposed directly.
+#
+# Usage:
+#   cp .env.production.example .env.production
+#   chmod 600 .env.production
+#   docker compose -f docker-compose.prod.yml --env-file .env.production config -q
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+#   docker compose -f docker-compose.prod.yml --env-file .env.production exec backend npm run migrate
+#
+# Hardening runbook (TLS, secret files, cache, feature flags):
+#   docs/production-hardening.md
+#
+# Optional observability stack:
+#   docker compose -f docker-compose.prod.yml --env-file .env.production \
+#     --profile monitoring up -d
+
+name: nomosai-prod
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
+  # ── Data stores ────────────────────────────────────────────────────────
   db:
     image: ankane/pgvector:v0.5.1
     environment:
       POSTGRES_USER: nomos_admin
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_prod_password}
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD must be set in .env.production}"
       POSTGRES_DB: nomos_db
     volumes:
       - pgdata_prod:/var/lib/postgresql/data
-      - ./database/init:/docker-entrypoint-initdb.d
+      - ./database/init:/docker-entrypoint-initdb.d:ro
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nomos_admin -d nomos_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
-  # Phase 29: Redis with AOF persistence.
+  # Phase 29: Redis with AOF persistence (queue, rate limits, response cache).
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
@@ -22,91 +58,23 @@ services:
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
-  backend:
-    build:
-      context: ./backend
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_USER=nomos_admin
-      - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
-      - DB_NAME=nomos_db
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_EMBED_MODEL=bge-m3
-      - OLLAMA_EMBED_DIM=1024
-      - OLLAMA_CHAT_MODEL=gemma2b-mmap
-      # Phase 1-6: local speech-to-text (see the `whisper` sidecar below).
-      # Audio stays on the deployment; WHISPER_URL can point at an external
-      # OpenAI-compatible STT service if one is provided deliberately.
-      - WHISPER_URL=${WHISPER_URL:-http://whisper:8000}
-      - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}
-      - WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
-      - STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}
-      - STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}
-      - STRIPE_PRICE_ID_ENTERPRISE=${STRIPE_PRICE_ID_ENTERPRISE:-}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
-      - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set for production}
-      - CORS_ORIGINS=${CORS_ORIGINS:-https://your-domain.gr}
-      - APP_BASE_URL=${APP_BASE_URL:-https://your-domain.gr}
-      # P0-6: production email is mandatory — the backend refuses to boot
-      # without SMTP configured (verification + reset emails are otherwise
-      # silently undeliverable). SMTP_HOST/EMAIL_FROM are required at
-      # compose time so misconfiguration fails before containers start.
-      - EMAIL_TRANSPORT=smtp
-      - EMAIL_FROM=${EMAIL_FROM:?EMAIL_FROM must be set for production}
-      - SMTP_HOST=${SMTP_HOST:?SMTP_HOST must be set for production}
-      - SMTP_PORT=${SMTP_PORT:-587}
-      - SMTP_SECURE=${SMTP_SECURE:-false}
-      - SMTP_USER=${SMTP_USER:-}
-      - SMTP_PASS=${SMTP_PASS:-}
-      - TRUST_PROXY=uniquelocal,loopback
-      - RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}
-      - RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}
-      - RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}
-      - ADMIN_MAGIC_LINK_ENABLED=${ADMIN_MAGIC_LINK_ENABLED:-false}
-      # Phase 1-8: scraper output consumed by the ingest script; bind-mounted
-      # read-only below. Regenerate on the host and re-run the ingest command.
-      - SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json
-    volumes:
-      - ./scraped_laws.json:/usr/src/app/scraped_laws.json:ro
-    depends_on:
-      - db
-      - redis
-      - ollama
-      - whisper
-    networks:
-      - nomos-prod-network
-    restart: always
-
-  frontend:
-    build:
-      context: ./frontend
-    ports:
-      - "80:80" # nginx serves the production bundle on port 80
-    depends_on:
-      - backend
-    networks:
-      - nomos-prod-network
-    restart: always
-
-  # Production Ollama with GPU Pass-through enabled via NVIDIA Container Toolkit
-  # Note: on CPU-only hosts, `gemma2b-mmap` (gemma:2b with use_mmap true)
-  # avoids the --no-mmap CPU_REPACK crash on low-RAM machines.
+  # Production Ollama with GPU pass-through via the NVIDIA Container Toolkit.
+  # `gemma2b-mmap` avoids the CPU_REPACK crash on low-RAM hosts.
   ollama:
     image: ollama/ollama
-    ports:
-      - "11434:11434"
     volumes:
       - ollama_models_prod:/root/.ollama
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
     entrypoint:
       - /bin/sh
       - -c
@@ -125,146 +93,436 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # Phase 1-6: local speech-to-text (STT) sidecar. Same OpenAI-compatible
-  # speaches/faster-whisper image as dev, CPU variant (no GPU reservation —
-  # GPU is reserved for the chat/embedding Ollama above). No published ports:
-  # audio only travels over the internal compose network.
-  #
-  # Model: `Systran/faster-whisper-base`, pre-downloaded into the named cache
-  # volume at boot. Bump WHISPER_MODEL + PRELOAD_MODELS together (and
-  # WHISPER_TIMEOUT_MS for long clips). CPU-only caveat: `base` transcribes at
-  # roughly 1–3× real time on a 4-core host, so a 10-minute recording can take
-  # minutes — size the deploy (or switch to the CUDA image) accordingly.
+  # Local speech-to-text sidecar (CPU variant; the GPU is reserved for
+  # Ollama). Audio never leaves the compose network.
   whisper:
     image: ghcr.io/speaches-ai/speaches:latest-cpu
     environment:
       - WHISPER__INFERENCE_DEVICE=cpu
       - WHISPER__COMPUTE_TYPE=int8
-      - 'PRELOAD_MODELS=["${WHISPER_MODEL:-Systran/faster-whisper-base}"]'
+      - "PRELOAD_MODELS=[\"${WHISPER_MODEL:-Systran/faster-whisper-base}\"]"
     volumes:
       - whisper_cache_prod:/home/ubuntu/.cache/huggingface/hub
     networks:
       - nomos-prod-network
+    restart: always
+    logging: *default-logging
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
-    restart: always
 
-  # Phase 29: daily DB backup (pg_dump, custom format). Wire the cron
-  # inside the container to run backupDb.js at 02:00.
+  # ── Application ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    environment:
+      - "NODE_ENV=production"
+      - "PORT=3000"
+      - "DB_HOST=db"
+      - "DB_PORT=5432"
+      - "DB_USER=nomos_admin"
+      - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.production}"
+      - "DB_PASSWORD_FILE=${DB_PASSWORD_FILE:-}"
+      - "DB_NAME=nomos_db"
+      - "REDIS_URL=redis://redis:6379"
+      - "QUEUE_WORKER_ENABLED=${QUEUE_WORKER_ENABLED:-true}"
+      - "OLLAMA_URL=http://ollama:11434"
+      - "OLLAMA_EMBED_MODEL=bge-m3"
+      - "OLLAMA_EMBED_DIM=1024"
+      - "OLLAMA_CHAT_MODEL=gemma2b-mmap"
+      - "OLLAMA_TIMEOUT_MS=${OLLAMA_TIMEOUT_MS:-120000}"
+      - "WHISPER_URL=${WHISPER_URL:-http://whisper:8000}"
+      - "WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}"
+      - "WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}"
+      - "STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY must be set in .env.production}"
+      - "STRIPE_SECRET_KEY_FILE=${STRIPE_SECRET_KEY_FILE:-}"
+      - "STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}"
+      - "STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}"
+      - "STRIPE_PRICE_ID_ENTERPRISE=${STRIPE_PRICE_ID_ENTERPRISE:-}"
+      - "STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}"
+      - "STRIPE_WEBHOOK_SECRET_FILE=${STRIPE_WEBHOOK_SECRET_FILE:-}"
+      - "JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set in .env.production}"
+      - "JWT_SECRET_FILE=${JWT_SECRET_FILE:-}"
+      - "CORS_ORIGINS=${CORS_ORIGINS:-https://${DOMAIN}}"
+      - "APP_BASE_URL=${APP_BASE_URL:-https://${DOMAIN}}"
+      # Production email is mandatory: the backend refuses to boot without
+      # EMAIL_TRANSPORT=smtp, SMTP_HOST and EMAIL_FROM.
+      - "EMAIL_TRANSPORT=smtp"
+      - "EMAIL_FROM=${EMAIL_FROM:?EMAIL_FROM must be set in .env.production}"
+      - "SMTP_HOST=${SMTP_HOST:?SMTP_HOST must be set in .env.production}"
+      - "SMTP_PORT=${SMTP_PORT:-587}"
+      - "SMTP_SECURE=${SMTP_SECURE:-false}"
+      - "SMTP_USER=${SMTP_USER:-}"
+      - "SMTP_USER_FILE=${SMTP_USER_FILE:-}"
+      - "SMTP_PASS=${SMTP_PASS:-}"
+      - "SMTP_PASS_FILE=${SMTP_PASS_FILE:-}"
+      # Traefik -> frontend nginx -> backend; both hops are private networks.
+      - "TRUST_PROXY=uniquelocal,loopback"
+      - "LOG_LEVEL=${LOG_LEVEL:-info}"
+      - "RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}"
+      - "RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}"
+      - "RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}"
+      - "ADMIN_MAGIC_LINK_ENABLED=${ADMIN_MAGIC_LINK_ENABLED:-false}"
+      # Daily quota (1-4) and cache TTLs (production hardening).
+      - "QUOTA_AI_BASIC=${QUOTA_AI_BASIC:-20}"
+      - "QUOTA_AI_PRO=${QUOTA_AI_PRO:-60}"
+      - "QUOTA_AI_ENTERPRISE=${QUOTA_AI_ENTERPRISE:-120}"
+      - "QUOTA_DOCS_BASIC=${QUOTA_DOCS_BASIC:-10}"
+      - "QUOTA_DOCS_PRO=${QUOTA_DOCS_PRO:-50}"
+      - "QUOTA_DOCS_ENTERPRISE=${QUOTA_DOCS_ENTERPRISE:-unlimited}"
+      - "RAG_CACHE_TTL_SECONDS=${RAG_CACHE_TTL_SECONDS:-300}"
+      - "PLANS_CACHE_TTL_SECONDS=${PLANS_CACHE_TTL_SECONDS:-3600}"
+      - "CACHE_PREFIX=${CACHE_PREFIX:-nomos:cache}"
+      - "FEATURE_FLAGS=${FEATURE_FLAGS:-}"
+      - "AI_QUERY_TIMEOUT_MS=${AI_QUERY_TIMEOUT_MS:-120000}"
+      - "AI_UPLOAD_MAX_BYTES=${AI_UPLOAD_MAX_BYTES:-26214400}"
+      # Live token streaming over Redis pub/sub.
+      - "AI_STREAM_TTL_MS=${AI_STREAM_TTL_MS:-600000}"
+      - "AI_STREAM_MAX_LOG_EVENTS=${AI_STREAM_MAX_LOG_EVENTS:-5000}"
+      - "AI_STREAM_PUBLISH_TIMEOUT_MS=${AI_STREAM_PUBLISH_TIMEOUT_MS:-2000}"
+      - "AI_STREAM_SUBSCRIBE_TIMEOUT_MS=${AI_STREAM_SUBSCRIBE_TIMEOUT_MS:-5000}"
+      - "AI_STREAM_REDIS_COOLDOWN_MS=${AI_STREAM_REDIS_COOLDOWN_MS:-30000}"
+      # Local OCR fallback / optional Ollama vision model.
+      - "OCR_LANGUAGES=${OCR_LANGUAGES:-ell+eng}"
+      - "OCR_TIMEOUT_MS=${OCR_TIMEOUT_MS:-30000}"
+      - "OCR_PDF_MAX_PAGES=${OCR_PDF_MAX_PAGES:-10}"
+      - "OCR_PDF_SCALE=${OCR_PDF_SCALE:-2}"
+      - "OCR_PDF_TIMEOUT_MS=${OCR_PDF_TIMEOUT_MS:-120000}"
+      - "OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-}"
+      - "OLLAMA_VISION_TIMEOUT_MS=${OLLAMA_VISION_TIMEOUT_MS:-120000}"
+      # Account deletion grace period (hours) and A/B experiment config.
+      - "ACCOUNT_DELETION_GRACE_HOURS=${ACCOUNT_DELETION_GRACE_HOURS:-24}"
+      - "AB_EXPERIMENTS=${AB_EXPERIMENTS:-}"
+      # Optional Sentry; no-op when SENTRY_DSN is empty.
+      - "SENTRY_DSN=${SENTRY_DSN:-}"
+      - "SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}"
+      - "SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0}"
+      # Phase 1-8: scraper output consumed by the ingest script.
+      - "SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json"
+      - "ALLOW_MOCK_CORPUS=${ALLOW_MOCK_CORPUS:-false}"
+    volumes:
+      - "${SCRAPED_LAWS_PATH:-./scraped_laws.json}:/usr/src/app/scraped_laws.json:ro"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      whisper:
+        condition: service_started
+    networks:
+      - nomos-prod-network
+    restart: always
+    logging: *default-logging
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        SITE_URL: "${SITE_URL:-https://your-domain.gr}"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - nomos-prod-network
+    volumes:
+      # Cloudflare ranges for nginx real_ip (optional; direct traffic is
+      # unaffected). Refresh from https://www.cloudflare.com/ips/.
+      - ./deploy/cloudflare/real-ip.conf:/etc/nginx/cloudflare/real-ip.conf:ro
+    restart: always
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=nomos-prod-network"
+      # HTTP router exists only to redirect to HTTPS (the web entrypoint also
+      # redirects globally; the middleware keeps the intent visible here).
+      - "traefik.http.routers.nomos-prod-http.rule=Host(`${DOMAIN:?DOMAIN must be set in .env.production}`)"
+      - "traefik.http.routers.nomos-prod-http.entrypoints=web"
+      - "traefik.http.routers.nomos-prod-http.middlewares=nomos-prod-redirect"
+      - "traefik.http.middlewares.nomos-prod-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.nomos-prod-redirect.redirectscheme.permanent=true"
+      # Public HTTPS router.
+      - "traefik.http.routers.nomos-prod.rule=Host(`${DOMAIN:?DOMAIN must be set in .env.production}`)"
+      - "traefik.http.routers.nomos-prod.entrypoints=websecure"
+      - "traefik.http.routers.nomos-prod.tls=true"
+      - "traefik.http.routers.nomos-prod.tls.certresolver=le"
+      - "traefik.http.routers.nomos-prod.service=nomos-prod"
+      - "traefik.http.routers.nomos-prod.middlewares=nomos-prod-ratelimit,nomos-prod-inflight"
+      # Edge flood protection. These are per-request limits: a long-lived SSE
+      # response counts once, not once per event.
+      - "traefik.http.middlewares.nomos-prod-ratelimit.ratelimit.average=${EDGE_RATE_LIMIT_AVERAGE:-50}"
+      - "traefik.http.middlewares.nomos-prod-ratelimit.ratelimit.burst=${EDGE_RATE_LIMIT_BURST:-100}"
+      - "traefik.http.middlewares.nomos-prod-ratelimit.ratelimit.period=1s"
+      - "traefik.http.middlewares.nomos-prod-inflight.inflightreq.amount=${EDGE_INFLIGHT_REQ_AMOUNT:-100}"
+      - "traefik.http.services.nomos-prod.loadbalancer.server.port=80"
+
+  # ── TLS reverse proxy ──────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.7
+    command:
+      - "--configFile=/etc/traefik/traefik.prod.yml"
+      # Let's Encrypt production CA by default. Certificates are issued via
+      # the HTTP-01 challenge on :80 (DNS must point here first).
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:?ACME_EMAIL must be set in .env.production}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.caserver=${PROD_ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+    ports:
+      # ONLY Traefik publishes public host ports.
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/traefik/traefik.prod.yml:/etc/traefik/traefik.prod.yml:ro
+      - traefik_certs_prod:/letsencrypt
+    networks:
+      - nomos-prod-network
+    restart: always
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Scheduled jobs ─────────────────────────────────────────────────────
   backup:
     image: node:20-alpine
     volumes:
-      - ./backend:/app/backend
-      - ./database:/app/database
+      - ./backend:/app/backend:ro
+      - ./database:/app/database:ro
       - backups_prod:/backups
       - prom_textfile_prod:/prom-textfile
     environment:
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_USER=nomos_admin
-      - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
-      - DB_NAME=nomos_db
-      - BACKUP_DIR=/backups
-      # 3-1: publish backup freshness for the BackupStale alert. The path is
-      # a named volume read by node_exporter's textfile collector below.
-      - PROM_TEXTFILE_DIR=/prom-textfile
+      - "DB_HOST=db"
+      - "DB_PORT=5432"
+      - "DB_USER=nomos_admin"
+      - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.production}"
+      - "DB_NAME=nomos_db"
+      - "BACKUP_DIR=/backups"
+      - "PROM_TEXTFILE_DIR=/prom-textfile"
+      - "BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}"
+      - "S3_REGION=${S3_REGION:-}"
+      - "S3_ENDPOINT=${S3_ENDPOINT:-}"
+      - "S3_FORCE_PATH_STYLE=${S3_FORCE_PATH_STYLE:-false}"
+      - "S3_PREFIX=${S3_PREFIX:-nomosai/}"
+      - "S3_SSE=${S3_SSE:-}"
+      - "S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}"
+      - "S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}"
+      - "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}"
+      - "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}"
+      - "AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}"
+      - "AWS_REGION=${AWS_REGION:-}"
     entrypoint: >
       /bin/sh -c "apk add --no-cache postgresql-client > /dev/null 2>&1
       && echo '0 2 * * * cd /app/backend && node src/scripts/backupDb.js' > /etc/crontabs/root
       && crond -f"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
 
-  # 1-5: daily data-retention sweep. Mirrors the `backup` cron sidecar:
-  # runs `retentionCleanup.js` at 03:00 inside the container. The script
-  # prints a per-table summary and records it via the audit log.
-  # Semantics: conversations are pruned by updated_at (active chats
-  # survive), legal_documents + audit_log by created_at.
   retention:
     image: node:20-alpine
     volumes:
-      - ./backend:/app/backend
+      - ./backend:/app/backend:ro
     environment:
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_USER=nomos_admin
-      - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
-      - DB_NAME=nomos_db
-      - RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}
-      - RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}
-      - RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}
+      - "DB_HOST=db"
+      - "DB_PORT=5432"
+      - "DB_USER=nomos_admin"
+      - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.production}"
+      - "DB_NAME=nomos_db"
+      - "RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}"
+      - "RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}"
+      - "RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}"
     entrypoint: >
       /bin/sh -c "echo '0 3 * * * cd /app/backend && node src/scripts/retentionCleanup.js' > /etc/crontabs/root
       && crond -f"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
 
-  # 3-1: observability stack. Prometheus and both exporters are internal-only
-  # (no published ports). Grafana binds to localhost only; access it through
-  # an SSH tunnel (`ssh -L 3001:127.0.0.1:3001 user@host`) or a reverse proxy
-  # with TLS/auth. Dashboards and datasources are provisioned read-only.
+  # ── Optional observability (reuses monitoring/, profile-gated) ────────
+  # Prometheus/exporters stay internal; Grafana binds to loopback only.
   prometheus:
+    profiles: ["monitoring"]
     image: prom/prometheus:v2.54.1
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=30d'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
     volumes:
       - ./monitoring/prometheus:/etc/prometheus:ro
       - prometheus_data:/prometheus
     depends_on:
       - backend
+      - alertmanager
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
+
+  alertmanager:
+    profiles: ["monitoring"]
+    image: prom/alertmanager:v0.27.0
+    # Alertmanager v0.27 does not expand ${VAR} itself, so the entrypoint
+    # renders placeholders into a writable copy before starting.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /tmp/alertmanager
+        awk '
+          function repl(line, token, value,    out, i) {
+            while ((i = index(line, token)) > 0) {
+              out = out substr(line, 1, i - 1) value
+              line = substr(line, i + length(token))
+            }
+            return out line
+          }
+          {
+            line = $$0
+            line = repl(line, "$${SLACK_WEBHOOK_URL}", ENVIRON["SLACK_WEBHOOK_URL"])
+            line = repl(line, "$${SLACK_CHANNEL}", ENVIRON["SLACK_CHANNEL"])
+            line = repl(line, "$${ALERT_EMAIL_TO}", ENVIRON["ALERT_EMAIL_TO"])
+            line = repl(line, "$${ALERT_EMAIL_FROM}", ENVIRON["ALERT_EMAIL_FROM"])
+            line = repl(line, "$${SMTP_HOST}", ENVIRON["SMTP_HOST"])
+            line = repl(line, "$${SMTP_PORT}", ENVIRON["SMTP_PORT"])
+            line = repl(line, "$${SMTP_USER}", ENVIRON["SMTP_USER"])
+            line = repl(line, "$${SMTP_PASS}", ENVIRON["SMTP_PASS"])
+            line = repl(line, "$${SMTP_REQUIRE_TLS}", ENVIRON["SMTP_REQUIRE_TLS"])
+            print line
+          }
+        ' /etc/alertmanager/alertmanager.yml > /tmp/alertmanager/alertmanager.yml
+        exec /bin/alertmanager --config.file=/tmp/alertmanager/alertmanager.yml --storage.path=/alertmanager
+    environment:
+      - "SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-http://127.0.0.1:9/disabled}"
+      - "SLACK_CHANNEL=${SLACK_CHANNEL:-}"
+      - "ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-alerts@localhost}"
+      - "ALERT_EMAIL_FROM=${ALERT_EMAIL_FROM:-nomosai-alerts@localhost}"
+      - "SMTP_HOST=${SMTP_HOST:-localhost}"
+      - "SMTP_PORT=${SMTP_PORT:-25}"
+      - "SMTP_USER=${SMTP_USER:-}"
+      - "SMTP_PASS=${SMTP_PASS:-}"
+      - "SMTP_REQUIRE_TLS=${SMTP_REQUIRE_TLS:-true}"
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - nomos-prod-network
+    restart: always
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  loki:
+    profiles: ["monitoring"]
+    image: grafana/loki:3.1.1
+    command:
+      - "-config.file=/etc/loki/loki-config.yml"
+    volumes:
+      - ./monitoring/loki:/etc/loki:ro
+      - loki_data:/loki
+    networks:
+      - nomos-prod-network
+    restart: always
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  promtail:
+    profiles: ["monitoring"]
+    image: grafana/promtail:3.1.1
+    command:
+      - "-config.file=/etc/promtail/promtail-config.yml"
+    volumes:
+      - ./monitoring/promtail:/etc/promtail:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - nomos-prod-network
+    restart: always
+    logging: *default-logging
 
   grafana:
+    profiles: ["monitoring"]
     image: grafana/grafana:11.2.0
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set when using the monitoring profile}"
+      - "GF_USERS_ALLOW_SIGN_UP=false"
+      - "GF_AUTH_ANONYMOUS_ENABLED=false"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
+      # Loopback-only operator access (SSH tunnel); never public.
       - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     depends_on:
       - prometheus
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
 
-  # Redis signal for the RedisDown alert (redis_up).
   redis_exporter:
+    profiles: ["monitoring"]
     image: oliver006/redis_exporter:v1.66.0
     environment:
-      - REDIS_ADDR=redis://redis:6379
+      - "REDIS_ADDR=redis://redis:6379"
     depends_on:
       - redis
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
 
-  # Host disk/CPU/memory plus the backup-freshness textfile collector. The
-  # backup sidecar writes nomos_backup.prom into the shared prom_textfile_prod
-  # volume; node_exporter exposes it as nomos_backup_last_success_timestamp_seconds.
   node_exporter:
+    profiles: ["monitoring"]
     image: prom/node-exporter:v1.8.2
     command:
-      - '--path.rootfs=/host'
-      - '--collector.textfile.directory=/prom-textfile'
+      - "--path.rootfs=/host"
+      - "--collector.textfile.directory=/prom-textfile"
     pid: host
     volumes:
       - /:/host:ro,rslave
@@ -272,17 +530,22 @@ services:
     networks:
       - nomos-prod-network
     restart: always
+    logging: *default-logging
 
 volumes:
   pgdata_prod:
   redisdata_prod:
   ollama_models_prod:
   whisper_cache_prod:
+  traefik_certs_prod:
   backups_prod:
   prometheus_data:
   grafana_data:
   prom_textfile_prod:
+  alertmanager_data:
+  loki_data:
 
 networks:
   nomos-prod-network:
+    name: nomos-prod-network
     driver: bridge

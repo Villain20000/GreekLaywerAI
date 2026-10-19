@@ -1,0 +1,78 @@
+# Dynamic application security testing (DAST).
+#
+# Runs a ZAP baseline scan against the deployed staging environment once a
+# week and on demand. It deliberately does NOT run on pull requests: staging
+# may be down or mid-deploy, and a PR should not depend on an external host.
+#
+# Required repository secret:
+#   STAGING_BASE_URL  e.g. https://staging.example.com (no trailing slash)
+#
+# Findings at ZAP's FAIL level fail the job (fail_action). The full HTML
+# report is uploaded even when the scan fails.
+name: DAST (ZAP baseline)
+
+on:
+  schedule:
+    # Mondays 04:17 UTC, ahead of the working week.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL override (defaults to the STAGING_BASE_URL secret)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dast-zap-baseline
+  cancel-in-progress: false
+
+jobs:
+  zap-baseline:
+    name: ZAP baseline scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target URL
+        id: target
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          TARGET_OVERRIDE: ${{ inputs.target_url }}
+        run: |
+          set -eu
+          target="${TARGET_OVERRIDE:-${STAGING_BASE_URL:-}}"
+          target="${target%/}"
+          if [ -z "$target" ]; then
+            echo "::error::STAGING_BASE_URL is not configured (or pass target_url when dispatching)."
+            exit 1
+          fi
+          case "$target" in
+            http://*|https://*) ;;
+            *) echo "::error::Target must be an absolute http(s) URL."; exit 1 ;;
+          esac
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: ${{ steps.target.outputs.target }}
+          # Fail the job on FAIL-level alerts; warnings are reported only.
+          # -I keeps WARN-level results from failing the baseline script.
+          cmd_options: '-I'
+          fail_action: true
+          # No issue creation: findings live in the artifact, not the tracker.
+          allow_issue_writing: false
+          artifact_name: zap-baseline-report
+
+      - name: Upload ZAP HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-html
+          path: report_html.html
+          if-no-files-found: warn
+          retention-days: 30

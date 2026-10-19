@@ -2,8 +2,9 @@
 //
 // PDF/DOCX uploads are text-extracted through the shared document pipeline
 // (documentService.extractMetadata — mocked here, matching tests/app.js) and
-// answered via the normal RAG + local-model path. Images get an explicit
-// "not supported" envelope; a document without a text layer gets 422.
+// answered via the normal RAG + local-model path. Images are accepted and
+// analyzed by the configured vision model or, by default, local OCR. A
+// scanned PDF without a text layer still gets 422 (no page rendering).
 // These tests assert the real processing path (extraction → retrieval →
 // generation) — never a canned response string.
 process.env.NODE_ENV = 'test';
@@ -15,6 +16,18 @@ const db = require('../src/config/db');
 const documentService = require('../src/services/documentService');
 const ollamaService = require('../src/services/ollamaService');
 const ragService = require('../src/services/ragService');
+const ocrService = require('../src/services/ocrService');
+const visionService = require('../src/services/visionService');
+
+jest.mock('../src/services/ocrService', () => ({
+  ...jest.requireActual('../src/services/ocrService'),
+  extractText: jest.fn()
+}));
+jest.mock('../src/services/visionService', () => ({
+  ...jest.requireActual('../src/services/visionService'),
+  analyzeImage: jest.fn(),
+  isConfigured: jest.fn()
+}));
 
 const JWT_SECRET = 'nomos-super-secret-key-development';
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -64,6 +77,10 @@ describe('POST /api/ai/multimodal (real PDF/DOCX handling)', () => {
       meta: { filename: 'doc.pdf', contentType: 'application/pdf' },
       text: DEFAULT_EXTRACTED_TEXT
     });
+    ocrService.extractText.mockReset();
+    visionService.isConfigured.mockReset();
+    visionService.isConfigured.mockReturnValue(false);
+    visionService.analyzeImage.mockReset();
     ollamaService.generateResponse.mockClear();
     ragService.retrieveContext.mockClear();
     ragService.formatContextForGemma.mockClear();
@@ -123,15 +140,28 @@ describe('POST /api/ai/multimodal (real PDF/DOCX handling)', () => {
     expect(ollamaService.generateResponse).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects an image with 415 and the explicit not-supported envelope', async () => {
+  it('OCRs an uploaded image and answers through RAG + the local model', async () => {
     queueAuth({ subscription_tier: 'enterprise' });
+    const ocrText = 'Ο μισθωτής καταβάλλει το μίσθωμα την πρώτη ημέρα κάθε μήνα.';
+    ocrService.extractText.mockResolvedValueOnce(ocrText);
+    ollamaService.generateResponse.mockResolvedValueOnce(
+      'Η εικόνα απεικονίζει σύμβαση μίσθωσης.'
+    );
 
     const res = await postDocument(PNG_BUFFER, 'screenshot.png');
 
-    expect(res.statusCode).toEqual(415);
-    expect(res.body.error).toMatch(/Unsupported media type/);
+    expect(res.statusCode).toEqual(200);
+    expect(res.body.response).toBe('Η εικόνα απεικονίζει σύμβαση μίσθωσης.');
+    expect(ocrService.extractText).toHaveBeenCalledWith(PNG_BUFFER, {
+      mimeType: 'image/png'
+    });
     expect(documentService.extractMetadata).not.toHaveBeenCalled();
-    expect(ollamaService.generateResponse).not.toHaveBeenCalled();
+    expect(ragService.retrieveContext).toHaveBeenCalledWith(ocrText);
+
+    const [prompt, context] = ollamaService.generateResponse.mock.calls[0];
+    expect(context).toBe('Formatted context');
+    expect(prompt).toContain(ocrText);
+    expect(prompt).toMatch(/Κείμενο από OCR/);
   });
 
   it('rejects unrecognizable bytes with 400 (matching validateUploadedFile)', async () => {
@@ -154,7 +184,9 @@ describe('POST /api/ai/multimodal (real PDF/DOCX handling)', () => {
     const res = await postDocument(PDF_BUFFER, 'scan.pdf');
 
     expect(res.statusCode).toEqual(422);
-    expect(res.body).toEqual({ error: 'Could not extract text from the document' });
+    expect(res.body).toEqual({
+      error: 'Could not extract text from the document. OCR is not available for scanned PDFs.'
+    });
     expect(ragService.retrieveContext).not.toHaveBeenCalled();
     expect(ollamaService.generateResponse).not.toHaveBeenCalled();
   });

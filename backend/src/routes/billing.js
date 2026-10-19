@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const stripeService = require('../services/stripeService');
+const cacheService = require('../services/cacheService');
 const { rbacMiddleware, ALLOWED_TIERS } = require('../middlewares/authMiddleware');
 const { validate } = require('../middlewares/validation');
 const { check } = require('express-validator');
@@ -11,11 +12,25 @@ const { createApiRateLimiters } = require('../middlewares/rateLimiters');
 // idempotency for it lives in webhook.js via stripe_webhook_events.
 const limiters = createApiRateLimiters();
 
+const PLANS_CACHE_KEY = 'billing:plans';
+const PLANS_CACHE_TTL_SECONDS = (() => {
+  const parsed = Number(process.env.PLANS_CACHE_TTL_SECONDS);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 3600;
+})();
+
 // 2-5: server-owned plan catalog. The billing UI renders this instead of
 // hardcoding tiers/prices/features. Mounted behind authMiddleware in
 // index.js; this handler itself is read-only and needs no extra RBAC.
-router.get('/plans', limiters.subscriptionRead, (req, res) => {
-  res.json({ plans: stripeService.getPlans() });
+// The catalog is identical for every caller, so it is safe to cache.
+router.get('/plans', limiters.subscriptionRead, async (req, res) => {
+  const cached = await cacheService.getJson(PLANS_CACHE_KEY);
+  if (Array.isArray(cached) && cached.length > 0) {
+    return res.json({ plans: cached });
+  }
+
+  const plans = stripeService.getPlans();
+  await cacheService.setJson(PLANS_CACHE_KEY, plans, PLANS_CACHE_TTL_SECONDS);
+  return res.json({ plans });
 });
 
 // Checkout endpoint. Open to user|admin|enterprise so a free-tier 'user'
@@ -40,7 +55,7 @@ router.post(
       });
       res.json({ url: session.url, sessionId: session.id });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 );
@@ -53,9 +68,6 @@ router.post(
   limiters.billingCheckout,
   rbacMiddleware(['user', 'admin', 'enterprise']),
   async (req, res) => {
-    if (stripeService.isMockMode()) {
-      return res.status(403).json({ error: 'Customer portal is only available in live Stripe mode' });
-    }
     try {
       const session = await stripeService.createPortalSession({ user: req.user });
       res.json({ url: session.url, sessionId: session.id });
@@ -91,7 +103,7 @@ router.post(
       });
       res.json({ ok: true, ...result });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 );

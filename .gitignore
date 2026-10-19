@@ -3,8 +3,13 @@ dist/
 out-tsc/
 .angular/
 .env
+.env.staging
+.env.production
 .DS_Store
 
 # Command Code session-local permission grants (machine-specific paths).
 # The durable project preferences under .commandcode/taste/ ARE tracked.
 .commandcode/settings.json
+
+# Tesseract OCR language caches downloaded at runtime
+*.traineddata

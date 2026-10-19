@@ -17,9 +17,10 @@
  *     1024-dim) and throw a descriptive error if the model isn't pulled.
  *   - This script reads `scraped_laws.json` from `SCRAPED_LAWS_PATH`
  *     when set, else `<repo-root>/scraped_laws.json` (the scraper's
- *     default output), and merges it with three small fallback mock
- *     articles so a brand-new env without scraped data still has
- *     something to retrieve.
+ *     default output). In dev/test it merges the file with three small
+ *     fallback mock articles so a brand-new env still has something to
+ *     retrieve; in production the mock fallback is refused unless
+ *     `ALLOW_MOCK_CORPUS=true`.
  *   - Re-runs are idempotent at the DB layer: a single race-free
  *     `INSERT ... ON CONFLICT (source_type, article_number) DO NOTHING`
  *     against the partial unique index created by
@@ -86,6 +87,24 @@ const mockLegislation = [
 const DEFAULT_SCRAPED_LAWS_PATH = path.resolve(
   __dirname, '..', '..', '..', 'scraped_laws.json'
 );
+
+// Production must never silently index the toy corpus: an empty/missing
+// scrape would otherwise look like a healthy RAG deployment. Operators can
+// opt in explicitly for demos with ALLOW_MOCK_CORPUS=true.
+function mockCorpusAllowed() {
+  return process.env.NODE_ENV !== 'production' ||
+    String(process.env.ALLOW_MOCK_CORPUS || '').toLowerCase() === 'true';
+}
+
+function productionCorpusError(reason) {
+  const error = new Error(
+    `[ingest] ${reason} NODE_ENV=production refuses to fall back to the embedded ` +
+    '3-article mock corpus. Mount a real scraped_laws.json (SCRAPED_LAWS_PATH) ' +
+    'or set ALLOW_MOCK_CORPUS=true only for an intentional demo environment.'
+  );
+  error.code = 'PRODUCTION_MOCK_CORPUS_FORBIDDEN';
+  return error;
+}
 
 /**
  * Resolve which `scraped_laws.json` the ingest should read.
@@ -168,16 +187,25 @@ function loadScrapedLaws(scrapedPath) {
         `${DEFAULT_SCRAPED_LAWS_PATH} (or the 3 mock articles).`
       );
     }
+    if (!mockCorpusAllowed()) {
+      throw productionCorpusError(
+        `No scraped_laws.json found at ${filePath}.`
+      );
+    }
     console.log(
       `[ingest] No scraped_laws.json found at ${filePath}. ` +
-      `Falling back to the 3 mock articles.`
+      `Falling back to the 3 mock articles (ALLOW_MOCK_CORPUS or non-production).`
     );
     return [];
   }
+
   try {
     const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) {
+      if (!mockCorpusAllowed()) {
+        throw productionCorpusError(`${filePath} is not a JSON array.`);
+      }
       console.warn(
         `[ingest] ${filePath} is not a JSON array — ignoring and using mocks.`
       );
@@ -199,6 +227,12 @@ function loadScrapedLaws(scrapedPath) {
     );
     return normalized;
   } catch (err) {
+    if (err && err.code === 'PRODUCTION_MOCK_CORPUS_FORBIDDEN') throw err;
+    if (!mockCorpusAllowed()) {
+      throw productionCorpusError(
+        `Failed to read/parse ${filePath}: ${err.message}.`
+      );
+    }
     console.warn(
       `[ingest] Failed to read/parse ${filePath}: ${err.message}. ` +
       `Falling back to the 3 mock articles.`
@@ -219,11 +253,17 @@ function buildEmbeddingText(row) {
 async function ingest() {
   console.log('Starting legislation ingestion...');
 
-  // 1. Merge: scraped laws first (operator's preferred source), then
-  //    fallback mocks. Dedupe happens in Postgres (ON CONFLICT below),
-  //    so this is race-free even if two ingests overlap.
+  // 1. Merge: scraped laws first (operator's preferred source), then the
+  //    fallback mocks when allowed. Production (without ALLOW_MOCK_CORPUS)
+  //    ingests the real corpus exclusively and fails if it is empty.
   const scraped = loadScrapedLaws();
-  const corpus = [...scraped, ...mockLegislation];
+  const allowMocks = mockCorpusAllowed();
+  if (!allowMocks && scraped.length === 0) {
+    throw productionCorpusError(
+      'No usable legislation rows were loaded from the scraped corpus.'
+    );
+  }
+  const corpus = allowMocks ? [...scraped, ...mockLegislation] : scraped;
 
   let inserted = 0;
   let skipped = 0;
@@ -303,6 +343,7 @@ module.exports = {
   ingest,
   loadScrapedLaws,
   resolveScrapedLawsPath,
+  mockCorpusAllowed,
   buildEmbeddingText,
   INSERT_LEGISLATION_SQL,
   DEFAULT_SCRAPED_LAWS_PATH

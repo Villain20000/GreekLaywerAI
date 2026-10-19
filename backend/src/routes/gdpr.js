@@ -1,19 +1,44 @@
 // Phase 29: GDPR endpoints.
 //
-// - GET    /api/gdpr/export   full JSON export of the user's data
-// - DELETE /api/gdpr/account  permanent account deletion (requires
-//                             { confirm: true, email } — double opt-out)
+// - GET    /api/gdpr/export           full JSON export of the user's data
+// - GET    /api/gdpr/deletion-status  scheduled-deletion state for the caller
+// - DELETE /api/gdpr/account          schedule account deletion (requires
+//                                     { confirm: true, email } — double opt-out)
+// - POST   /api/gdpr/cancel-deletion  cancel a scheduled deletion
+//
+// Deletion is delayed by ACCOUNT_DELETION_GRACE_HOURS (default 24, clamped
+// 1..168). The retention sidecar purges accounts whose deadline has passed.
 
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const { validate } = require('../middlewares/validation');
 const { check } = require('express-validator');
-const { logAudit, deleteAuditLogsForUser } = require('../services/auditLog');
+const { logAudit } = require('../services/auditLog');
+const { sendAccountDeletionScheduled } = require('../services/emailService');
 const { createApiRateLimiters } = require('../middlewares/rateLimiters');
 
-// 1-3: per-user caps — export dumps every table; deletion is irreversible.
+// 1-3: per-user caps — export dumps every table; account state changes are
+// rate-limited more tightly.
 const limiters = createApiRateLimiters();
+
+const DEFAULT_GRACE_HOURS = 24;
+const MAX_GRACE_HOURS = 168;
+
+/** Resolve the configured grace period, clamped to [1, 168] hours. */
+function accountDeletionGraceHours() {
+  const raw = process.env.ACCOUNT_DELETION_GRACE_HOURS;
+  const trimmed = typeof raw === 'string' ? raw.trim() : '';
+  const parsed = trimmed === '' ? NaN : Number(trimmed);
+  const hours = Number.isFinite(parsed) ? Math.round(parsed) : DEFAULT_GRACE_HOURS;
+  return Math.min(MAX_GRACE_HOURS, Math.max(1, hours));
+}
+
+function toIso(value) {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
 
 // GET /api/gdpr/export — all user data as JSON
 router.get('/export', limiters.gdprExport, async (req, res) => {
@@ -70,8 +95,25 @@ router.get('/export', limiters.gdprExport, async (req, res) => {
   }
 });
 
-// DELETE /api/gdpr/account — permanent, irreversible deletion.
-// Double opt-out: the caller must confirm with the account email.
+// GET /api/gdpr/deletion-status — whether a deletion is scheduled.
+router.get('/deletion-status', limiters.gdprExport, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT deletion_scheduled_for FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    res.json({
+      deletionScheduledFor: toIso(result.rows[0]?.deletion_scheduled_for)
+    });
+  } catch (error) {
+    console.error('GDPR deletion status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/gdpr/account — schedule deletion after a grace period.
+// Double opt-out: the caller must confirm with the account email. Repeated
+// calls are idempotent and never extend the existing deadline.
 router.delete(
   '/account',
   limiters.gdprDelete,
@@ -89,27 +131,103 @@ router.delete(
       }
 
       const userId = req.user.id;
+      const graceHours = accountDeletionGraceHours();
 
-      // FK cascades wipe conversations, messages, legal_documents,
-      // subscriptions, tokens. Audit rows are cleared explicitly (they have
-      // no FK). A tombstone audit row records the deletion itself.
-      await db.query(`DELETE FROM users WHERE id = $1`, [userId]);
+      const existing = await db.query(
+        `SELECT deletion_scheduled_for FROM users WHERE id = $1`,
+        [userId]
+      );
+      const existingDeadline = toIso(existing.rows[0]?.deletion_scheduled_for);
+      if (existingDeadline) {
+        return res.json({
+          ok: true,
+          deletionScheduledFor: existingDeadline,
+          graceHours,
+          alreadyScheduled: true
+        });
+      }
 
-      await deleteAuditLogsForUser(userId);
+      // The WHERE guard makes the write idempotent under a concurrent
+      // duplicate request: only the first one sets the deadline.
+      const updated = await db.query(
+        `UPDATE users
+         SET deletion_scheduled_for = CURRENT_TIMESTAMP + ($2::int * INTERVAL '1 hour')
+         WHERE id = $1 AND deletion_scheduled_for IS NULL
+         RETURNING deletion_scheduled_for`,
+        [userId, graceHours]
+      );
+
+      let scheduledFor = toIso(updated.rows[0]?.deletion_scheduled_for);
+      if (!scheduledFor) {
+        const raced = await db.query(
+          `SELECT deletion_scheduled_for FROM users WHERE id = $1`,
+          [userId]
+        );
+        scheduledFor = toIso(raced.rows[0]?.deletion_scheduled_for);
+        if (!scheduledFor) {
+          return res.status(500).json({ error: 'Could not schedule account deletion' });
+        }
+        return res.json({
+          ok: true,
+          deletionScheduledFor: scheduledFor,
+          graceHours,
+          alreadyScheduled: true
+        });
+      }
+
       await logAudit({
         userId,
-        action: 'account.deleted',
+        action: 'account.deletion_scheduled',
         resourceType: 'user',
         resourceId: userId,
+        newValue: { deletionScheduledFor: scheduledFor, graceHours },
         ipAddress: req.ip
       });
 
-      res.json({ ok: true, message: 'Account permanently deleted' });
+      // Best-effort notification: email failures are logged, never surfaced.
+      try {
+        await sendAccountDeletionScheduled(req.user.email, scheduledFor);
+      } catch (err) {
+        console.error('[GDPR] deletion-scheduled email failed:', err.message);
+      }
+
+      res.json({ ok: true, deletionScheduledFor: scheduledFor, graceHours });
     } catch (error) {
       console.error('GDPR account deletion error:', error);
       res.status(500).json({ error: error.message });
     }
   }
 );
+
+// POST /api/gdpr/cancel-deletion — clear a pending deadline. Rows and tokens
+// were never removed at scheduling time, so cancellation restores the account.
+router.post('/cancel-deletion', limiters.gdprDelete, async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE users
+       SET deletion_scheduled_for = NULL
+       WHERE id = $1 AND deletion_scheduled_for IS NOT NULL
+       RETURNING id`,
+      [req.user.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(409).json({ error: 'No account deletion is scheduled' });
+    }
+
+    await logAudit({
+      userId: req.user.id,
+      action: 'account.deletion_cancelled',
+      resourceType: 'user',
+      resourceId: req.user.id,
+      ipAddress: req.ip
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('GDPR deletion cancellation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 module.exports = router;

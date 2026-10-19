@@ -218,6 +218,152 @@ describe('AuthService', () => {
   });
 
   // ------------------------------------------------------------------
+  // Phase 30: email change. The request route re-verifies the current
+  // password; the verification route is a one-time-token endpoint that
+  // swaps the JWT exactly like verifyEmail().
+  // ------------------------------------------------------------------
+  describe('changeEmail()', () => {
+    const originalFetch = globalThis.fetch;
+
+    beforeEach(() => {
+      localStorage.setItem('nomos_token', 'jwt-abc');
+    });
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      localStorage.removeItem('nomos_token');
+      localStorage.removeItem('nomos_user');
+    });
+
+    it('POSTs /api/auth/change-email with the bearer token and both fields', async () => {
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true, requires_verification: true })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      const result = await service.changeEmail('new@nomos.ai', 'password123');
+
+      expect(result.ok).toBeTrue();
+      const calls = fetchSpy.calls
+        .allArgs()
+        .filter(
+          ([url, init]) =>
+            url === '/api/auth/change-email' &&
+            (init as RequestInit | undefined)?.method === 'POST'
+        );
+      expect(calls.length).toBe(1);
+      const init = calls[0][1] as RequestInit;
+      expect(init.body).toBe(
+        JSON.stringify({ newEmail: 'new@nomos.ai', currentPassword: 'password123' })
+      );
+      expect((init.headers as Headers).get('Authorization')).toBe('Bearer jwt-abc');
+    });
+
+    it('maps a 409 email_taken to kind=email_taken', async () => {
+      spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: false,
+          status: 409,
+          json: async () => ({ error: 'Email already in use', code: 'email_taken' })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      const result = await service.changeEmail('taken@nomos.ai', 'password123');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({
+          ok: false,
+          kind: 'email_taken',
+          code: 'email_taken',
+          status: 409
+        })
+      );
+    });
+
+    it('returns kind=network when fetch rejects', async () => {
+      spyOn(globalThis, 'fetch').and.rejectWith(new Error('offline'));
+      service = new AuthService(mockRouter);
+
+      const result = await service.changeEmail('new@nomos.ai', 'password123');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({ ok: false, kind: 'network', status: 0 })
+      );
+    });
+  });
+
+  describe('verifyEmailChange()', () => {
+    const originalFetch = globalThis.fetch;
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      localStorage.removeItem('nomos_token');
+      localStorage.removeItem('nomos_user');
+    });
+
+    it('swaps the returned JWT + user into storage like verifyEmail()', async () => {
+      const newUser: AuthUser = {
+        id: 1,
+        email: 'new@nomos.ai',
+        role: 'user',
+        subscription_tier: 'basic',
+        token_version: 5,
+        verified_at: '2026-01-01T00:00:00.000Z'
+      };
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true, token: 'jwt-new', user: newUser })
+        } as unknown as Response)
+      );
+
+      const result = await service.verifyEmailChange('a'.repeat(64));
+
+      expect(result).toEqual({ ok: true, token: 'jwt-new', user: newUser });
+      expect(localStorage.getItem('nomos_token')).toBe('jwt-new');
+      expect(JSON.parse(localStorage.getItem('nomos_user')!)).toEqual(newUser);
+      expect(service.tokenValue).toBe('jwt-new');
+      expect(service.userValue?.email).toBe('new@nomos.ai');
+
+      const calls = fetchSpy.calls
+        .allArgs()
+        .filter(([url]) => url === '/api/auth/verify-email-change');
+      expect(calls.length).toBe(1);
+    });
+
+    it('maps an invalid_token rejection', async () => {
+      spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: false,
+          status: 400,
+          json: async () => ({
+            error: 'Invalid or expired email-change link',
+            code: 'invalid_token'
+          })
+        } as unknown as Response)
+      );
+
+      const result = await service.verifyEmailChange('b'.repeat(64));
+
+      expect(result).toEqual(
+        jasmine.objectContaining({
+          ok: false,
+          kind: 'invalid_token',
+          code: 'invalid_token',
+          status: 400
+        })
+      );
+      expect(localStorage.getItem('nomos_token')).toBeNull();
+    });
+  });
+
+  // ------------------------------------------------------------------
   // Rate limiting: a 429 is classified by HTTP STATUS, never by the body.
   // The backend rate-limits the auth surface (POST /api/auth/login at
   // 10/min per IP) and its limiter answers
@@ -355,18 +501,28 @@ describe('AuthService', () => {
       await expectAsync(service.exportData()).toBeRejectedWithError('Unauthorized');
     });
 
-    it('deleteAccount() DELETEs /api/gdpr/account with confirm+email and clears the session', async () => {
+    it('deleteAccount() schedules deletion, returns the deadline, and keeps the session', async () => {
+      const scheduledFor = '2026-10-20T12:00:00.000Z';
       const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
         Promise.resolve({
           ok: true,
           status: 200,
-          json: async () => ({ ok: true })
+          json: async () => ({
+            ok: true,
+            deletionScheduledFor: scheduledFor,
+            graceHours: 24
+          })
         } as unknown as Response)
       );
       service = new AuthService(mockRouter);
 
-      await service.deleteAccount('user@nomos.ai');
+      const result = await service.deleteAccount('user@nomos.ai');
 
+      expect(result).toEqual({
+        ok: true,
+        deletionScheduledFor: scheduledFor,
+        graceHours: 24
+      });
       const deleteCalls = fetchSpy.calls
         .allArgs()
         .filter(
@@ -377,9 +533,103 @@ describe('AuthService', () => {
       expect(deleteCalls.length).toBe(1);
       const init = deleteCalls[0][1] as RequestInit;
       expect(init.body).toBe(JSON.stringify({ confirm: true, email: 'user@nomos.ai' }));
-      // Successful deletion signs the user out locally.
-      expect(localStorage.getItem('nomos_token')).toBeNull();
-      expect(mockRouter.navigate).toHaveBeenCalledWith(['/login']);
+      // Scheduling must not sign the user out — the profile stays usable
+      // until the deadline so the deletion can be cancelled.
+      expect(localStorage.getItem('nomos_token')).toBe('jwt-abc');
+      expect(mockRouter.navigate).not.toHaveBeenCalledWith(['/login']);
+    });
+
+    it('deleteAccount() surfaces the server error on non-OK responses', async () => {
+      spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'Email does not match the account email' })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      await expectAsync(service.deleteAccount('other@nomos.ai'))
+        .toBeRejectedWithError('Email does not match the account email');
+    });
+
+    it('getDeletionStatus() GETs /api/gdpr/deletion-status with the bearer token', async () => {
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ deletionScheduledFor: '2026-10-20T12:00:00.000Z' })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      const status = await service.getDeletionStatus();
+
+      expect(status).toEqual({ deletionScheduledFor: '2026-10-20T12:00:00.000Z' });
+      const calls = fetchSpy.calls
+        .allArgs()
+        .filter(
+          ([url, init]) =>
+            url === '/api/gdpr/deletion-status' &&
+            ((init as RequestInit | undefined)?.method ?? 'GET') === 'GET'
+        );
+      expect(calls.length).toBe(1);
+      expect(((calls[0][1] as RequestInit).headers as Headers).get('Authorization'))
+        .toBe('Bearer jwt-abc');
+    });
+
+    it('getDeletionStatus() normalizes a missing deadline to null', async () => {
+      spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ deletionScheduledFor: null })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      await expectAsync(service.getDeletionStatus())
+        .toBeResolvedTo({ deletionScheduledFor: null });
+    });
+
+    it('cancelAccountDeletion() POSTs /api/gdpr/cancel-deletion with the bearer token', async () => {
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      await service.cancelAccountDeletion();
+
+      const calls = fetchSpy.calls
+        .allArgs()
+        .filter(
+          ([url, init]) =>
+            url === '/api/gdpr/cancel-deletion' &&
+            (init as RequestInit | undefined)?.method === 'POST'
+        );
+      expect(calls.length).toBe(1);
+      expect(((calls[0][1] as RequestInit).headers as Headers).get('Authorization'))
+        .toBe('Bearer jwt-abc');
+      // Cancellation restores the account; the session is still valid.
+      expect(localStorage.getItem('nomos_token')).toBe('jwt-abc');
+    });
+
+    it('cancelAccountDeletion() surfaces a 409 when nothing is scheduled', async () => {
+      spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: false,
+          status: 409,
+          json: async () => ({ error: 'No account deletion is scheduled' })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      await expectAsync(service.cancelAccountDeletion())
+        .toBeRejectedWithError('No account deletion is scheduled');
     });
   });
 });

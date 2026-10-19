@@ -7,10 +7,25 @@ import { AuthService, authErrorMessage } from '../../services/auth.service';
 @Component({
   selector: 'app-verify-email',
   standalone: true,
-  imports: [CommonModule, RouterLink, TranslatePipe],  templateUrl: './verify-email.component.html',
-  // Phase 27 — zero per-component CSS. All chrome lives in
-  // src/styles.scss via legacy-name aliases; templates untouched.
-  styles: [] 
+  imports: [CommonModule, RouterLink, TranslatePipe],
+  // Inline template (the copy depends on ?type=change) — all chrome lives in
+  // src/styles.scss via legacy-name aliases, so no per-component CSS.
+  template: `
+    <div class="verify-container">
+      <div class="verify-box">
+        <h2>{{ 'auth.verify.title' | translate }}</h2>
+        <p *ngIf="!finished">{{ (isEmailChange ? 'auth.verify.changeWaiting' : 'auth.verify.waiting') | translate }}</p>
+        <div *ngIf="finished && success" class="success-msg">
+          {{ (isEmailChange ? 'auth.verify.changeSuccess' : 'auth.verify.success') | translate }}
+        </div>
+        <div *ngIf="finished && !success" class="error-msg">{{ error }}</div>
+        <p *ngIf="finished && !success" class="footer-link">
+          <a routerLink="/login">{{ 'common.backToSignIn' | translate }}</a>
+        </p>
+      </div>
+    </div>
+  `,
+  styles: []
 })
 export class VerifyEmailComponent implements OnInit {
   private readonly translate = inject(TranslateService);
@@ -18,6 +33,8 @@ export class VerifyEmailComponent implements OnInit {
   finished = false;
   success = false;
   error = '';
+  /** True when the link came from the change-email flow (`?type=change`). */
+  isEmailChange = false;
 
   constructor(
     private authService: AuthService,
@@ -26,16 +43,24 @@ export class VerifyEmailComponent implements OnInit {
   ) {}
 
   async ngOnInit() {
-    // ActivatedRoute.snapshot is fine for a one-shot ?token= read.
-    const token = this.route.snapshot.queryParamMap.get('token');
+    // ActivatedRoute.snapshot is fine for a one-shot token/type read.
+    const params = this.route.snapshot.queryParamMap;
+    const token = params.get('token');
+    this.isEmailChange = params.get('type') === 'change';
+
     if (!token || !/^[a-f0-9]{64}$/i.test(token)) {
       this.finished = true;
       this.success = false;
-      this.error = this.translate.instant('auth.verify.invalid');
+      this.error = this.translate.instant(
+        this.isEmailChange ? 'auth.verify.changeInvalid' : 'auth.verify.invalid'
+      );
       return;
     }
 
-    const result = await this.authService.verifyEmail(token);
+    const result = this.isEmailChange
+      ? await this.authService.verifyEmailChange(token)
+      : await this.authService.verifyEmail(token);
+
     this.finished = true;
     if (result.ok) {
       this.success = true;

@@ -5,15 +5,16 @@ const crypto = require('crypto');
 const db = require('../config/db');
 const { authMiddleware, normalizeRole } = require('../middlewares/authMiddleware');
 const { createRateLimiters } = require('../middlewares/rateLimiters');
-const { sendPasswordReset, sendEmailVerification } = require('../services/emailService');
+const { sendPasswordReset, sendEmailVerification, sendEmailChangeVerification } = require('../services/emailService');
 const { logAudit } = require('../services/auditLog');
 // Stable, machine-readable error codes. Every error response below carries
 // a `code` next to its (unchanged) human-readable `error` string so clients
 // can branch on the code instead of pattern-matching English prose.
 // See src/constants/authErrors.js for the full contract.
 const { AUTH_ERROR_CODES } = require('../constants/authErrors');
+const { getSecret } = require('../config/secrets');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'nomos-super-secret-key-development';
+const JWT_SECRET = getSecret('JWT_SECRET', 'nomos-super-secret-key-development');
 const MIN_PASSWORD_LENGTH = 8;
 const RESET_TOKEN_EXPIRY_HOURS = 1;
 /**
@@ -24,6 +25,8 @@ const RESET_TOKEN_EXPIRY_HOURS = 1;
  * bouncing out mid-session.
  */
 const VERIFICATION_TOKEN_EXPIRY_HOURS = 24;
+/** Email-change links use the same 24h horizon as registration verification. */
+const EMAIL_CHANGE_TOKEN_EXPIRY_HOURS = 24;
 
 /**
  * Sign a JWT whose role claim reflects users.role (with legacy-compat).
@@ -846,6 +849,283 @@ function buildAuthRouter(options = {}) {
         }
       } catch (error) {
         console.error('Verify-email error:', error);
+        res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
+      }
+    }
+  );
+
+  /**
+   * Phase 30: request an email-address change.
+   *
+   * Body: { currentPassword, newEmail }. JWT required.
+   *
+   * Mirrors /change-password's posture: the JWT alone is not enough — the
+   * current password is re-verified so a stolen session cannot redirect the
+   * account's email. users.email is NOT touched here; the new address only
+   * becomes authoritative after /verify-email-change consumes the token
+   * mailed to that NEW address.
+   *
+   * Reuses PASSWORD_CHANGE_FAILED for a wrong password (same coarse
+   * "operation not permitted" semantics) and EMAIL_TAKEN for a taken
+   * address. 23505 is translated to 409 in case the address is claimed
+   * between the pre-check and the insert.
+   */
+  router.post(
+    '/change-email',
+    limiters.changeEmailPreAuth,
+    authMiddleware,
+    limiters.changeEmailPerAccount,
+    async (req, res) => {
+      try {
+        const { currentPassword, newEmail } = req.body || {};
+
+        if (
+          typeof currentPassword !== 'string' ||
+          currentPassword.length === 0 ||
+          typeof newEmail !== 'string' ||
+          newEmail.length === 0 ||
+          newEmail.length > 320
+        ) {
+          return res.status(400).json({
+            error: 'Current password and a valid new email required',
+            code: AUTH_ERROR_CODES.INVALID_REQUEST
+          });
+        }
+
+        const normalizedEmail = newEmail.trim().toLowerCase();
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
+          return res.status(400).json({
+            error: 'Current password and a valid new email required',
+            code: AUTH_ERROR_CODES.INVALID_REQUEST
+          });
+        }
+
+        const lookup = await db.query(
+          'SELECT id, email, password_hash FROM users WHERE id = $1',
+          [req.user.id]
+        );
+        if (lookup.rows.length === 0) {
+          return res.status(401).json({
+            error: 'User not found',
+            code: AUTH_ERROR_CODES.USER_NOT_FOUND
+          });
+        }
+        const user = lookup.rows[0];
+
+        const matches = await bcrypt.compare(currentPassword, user.password_hash);
+        if (!matches) {
+          return res.status(400).json({
+            error: 'Current password is incorrect',
+            code: AUTH_ERROR_CODES.PASSWORD_CHANGE_FAILED
+          });
+        }
+
+        if (String(user.email).trim().toLowerCase() === normalizedEmail) {
+          return res.status(400).json({
+            error: 'New email must be different from your current email',
+            code: AUTH_ERROR_CODES.INVALID_REQUEST
+          });
+        }
+
+        const taken = await db.query(
+          'SELECT 1 FROM users WHERE email = $1 AND id <> $2',
+          [normalizedEmail, req.user.id]
+        );
+        if (taken.rows.length > 0) {
+          return res.status(409).json({
+            error: 'Email already in use',
+            code: AUTH_ERROR_CODES.EMAIL_TAKEN
+          });
+        }
+
+        const plaintextToken = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto
+          .createHash('sha256')
+          .update(plaintextToken)
+          .digest('hex');
+        const expiresAt = new Date(
+          Date.now() + EMAIL_CHANGE_TOKEN_EXPIRY_HOURS * 60 * 60 * 1000
+        );
+
+        // Only the newest request stays redeemable.
+        await db.query(
+          `UPDATE email_change_tokens
+           SET used_at = NOW()
+           WHERE user_id = $1 AND used_at IS NULL`,
+          [req.user.id]
+        );
+        await db.query(
+          `INSERT INTO email_change_tokens
+             (user_id, new_email, token_hash, expires_at)
+           VALUES ($1, $2, $3, $4)`,
+          [req.user.id, normalizedEmail, tokenHash, expiresAt]
+        );
+
+        // Fire-and-forget: the request has succeeded once the row is
+        // persisted; SMTP failures must not turn into 5xx.
+        sendEmailChangeVerification(normalizedEmail, plaintextToken)
+          .catch((err) => console.error('[CHANGE EMAIL] send failed:', err.message));
+
+        await logAudit({
+          action: 'auth.email_change_requested',
+          resourceType: 'user',
+          resourceId: req.user.id,
+          ipAddress: req.ip,
+          newValue: { new_email: normalizedEmail }
+        });
+
+        return res.json({ ok: true, requires_verification: true });
+      } catch (error) {
+        if (error && error.code === '23505') {
+          return res.status(409).json({
+            error: 'Email already in use',
+            code: AUTH_ERROR_CODES.EMAIL_TAKEN
+          });
+        }
+        console.error('Change-email error:', error);
+        res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
+      }
+    }
+  );
+
+  /**
+   * Phase 30: consume an email-change token (public; token IS the bearer).
+   *
+   * BEGIN / SELECT … FOR UPDATE / verify the new address is still free /
+   * UPDATE used_at (compare-and-set) / UPDATE users.email + token_version /
+   * COMMIT. The token and the users.email switch move together, and the
+   * tv bump invalidates every JWT issued for the old address before the
+   * response's freshly-minted one takes over.
+   *
+   * Any address conflict (another account claimed it, UNIQUE violation on
+   * users.email) rolls back with 409 — the user row is never modified.
+   * Invalid/used/expired tokens answer the same generic 400 as
+   * /verify-email.
+   */
+  router.post(
+    '/verify-email-change',
+    limiters.verifyEmailChangeIp,
+    async (req, res) => {
+      try {
+        const { token } = req.body || {};
+
+        if (typeof token !== 'string' || !/^[a-f0-9]{64}$/i.test(token)) {
+          return res.status(400).json({
+            error: 'Invalid or expired email-change link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
+        }
+
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+        const client = await db.connect();
+        try {
+          await client.query('BEGIN');
+
+          const lookupRes = await client.query(
+            `SELECT id, user_id, new_email
+             FROM email_change_tokens
+             WHERE token_hash = $1
+               AND used_at IS NULL
+               AND expires_at > NOW()
+             FOR UPDATE`,
+            [tokenHash]
+          );
+          if (lookupRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              error: 'Invalid or expired email-change link',
+              code: AUTH_ERROR_CODES.INVALID_TOKEN
+            });
+          }
+
+          const tokenRowId = lookupRes.rows[0].id;
+          const userId = lookupRes.rows[0].user_id;
+          const newEmail = String(lookupRes.rows[0].new_email).trim().toLowerCase();
+
+          // The address may have been claimed by someone else between the
+          // request and the click. Abort without touching users.
+          const taken = await client.query(
+            'SELECT 1 FROM users WHERE email = $1 AND id <> $2',
+            [newEmail, userId]
+          );
+          if (taken.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              error: 'Email already in use',
+              code: AUTH_ERROR_CODES.EMAIL_TAKEN
+            });
+          }
+
+          const consumeRes = await client.query(
+            `UPDATE email_change_tokens
+             SET used_at = NOW()
+             WHERE id = $1 AND used_at IS NULL
+             RETURNING id`,
+            [tokenRowId]
+          );
+          if (!consumeRes.rowCount || consumeRes.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              error: 'Email change conflict, please request a new link',
+              code: AUTH_ERROR_CODES.INVALID_TOKEN
+            });
+          }
+
+          const userUpdate = await client.query(
+            `UPDATE users
+             SET email = $1,
+                 token_version = token_version + 1
+             WHERE id = $2
+             RETURNING id, email, role, subscription_tier, token_version, verified_at`,
+            [newEmail, userId]
+          );
+          if (!userUpdate.rowCount) {
+            await client.query('ROLLBACK');
+            return res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
+          }
+
+          const freshUser = userUpdate.rows[0];
+          const newToken = signUserToken(freshUser);
+
+          await client.query('COMMIT');
+
+          await logAudit({
+            action: 'auth.email_changed',
+            resourceType: 'user',
+            resourceId: freshUser.id,
+            ipAddress: req.ip,
+            newValue: { email: freshUser.email }
+          });
+
+          return res.json({
+            ok: true,
+            token: newToken,
+            user: {
+              id: freshUser.id,
+              email: freshUser.email,
+              role: freshUser.role,
+              subscription_tier: freshUser.subscription_tier,
+              token_version: freshUser.token_version,
+              verified_at: freshUser.verified_at
+            }
+          });
+        } catch (innerErr) {
+          try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+          throw innerErr;
+        } finally {
+          client.release();
+        }
+      } catch (error) {
+        // users_email_key race: another account took the address after the
+        // in-transaction check (or between request and consume).
+        if (error && error.code === '23505') {
+          return res.status(409).json({
+            error: 'Email already in use',
+            code: AUTH_ERROR_CODES.EMAIL_TAKEN
+          });
+        }
+        console.error('Verify-email-change error:', error);
         res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
       }
     }

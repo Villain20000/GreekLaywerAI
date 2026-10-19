@@ -103,6 +103,8 @@ jest.mock('../src/services/transcriptionService', () => {
 jest.mock('../src/services/emailService', () => ({
   sendPasswordReset: jest.fn().mockResolvedValue(undefined),
   sendEmailVerification: jest.fn().mockResolvedValue(undefined),
+  sendEmailChangeVerification: jest.fn().mockResolvedValue(undefined),
+  sendAccountDeletionScheduled: jest.fn().mockResolvedValue(undefined),
   APP_BASE_URL: 'http://localhost:4200'
 }));
 // Phase 29: audit logging must not break tests — route handlers call it

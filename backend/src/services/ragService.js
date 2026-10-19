@@ -1,8 +1,30 @@
 const db = require('../config/db');
 const ollamaService = require('./ollamaService');
+const cacheService = require('./cacheService');
+
+const RAG_CACHE_TTL_SECONDS = positiveInt(process.env.RAG_CACHE_TTL_SECONDS, 300);
+
+function positiveInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+// Legislation retrieval is global (no user-scoped rows), so the cache key is
+// a hash of the normalized query plus the top-K. Normalization collapses
+// whitespace/case so equivalent prompts share an entry.
+function ragCacheKey(query, limit) {
+  const normalized = String(query || '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+  return `rag:context:${cacheService.hashKey(normalized)}:${limit}`;
+}
 
 // Perform a similarity search in pgvector using the HNSW index
 async function retrieveContext(query, limit = 5) {
+  const cacheKey = ragCacheKey(query, limit);
+  const cached = await cacheService.getJson(cacheKey);
+  if (Array.isArray(cached) && cached.length > 0) {
+    return cached;
+  }
+
   try {
     const queryEmbedding = await ollamaService.generateEmbedding(query);
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
@@ -16,6 +38,9 @@ async function retrieveContext(query, limit = 5) {
     `;
     
     const result = await db.query(sql, [embeddingStr, limit]);
+    if (Array.isArray(result.rows) && result.rows.length > 0) {
+      await cacheService.setJson(cacheKey, result.rows, RAG_CACHE_TTL_SECONDS);
+    }
     return result.rows;
   } catch (error) {
     console.error('RAG Retrieval Error:', error);

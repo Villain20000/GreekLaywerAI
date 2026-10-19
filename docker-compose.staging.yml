@@ -128,12 +128,15 @@ services:
       - "DB_PORT=5432"
       - "DB_USER=nomos_admin"
       - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.staging}"
+      - "DB_PASSWORD_FILE=${DB_PASSWORD_FILE:-}"
       - "DB_NAME=nomos_db"
       - "REDIS_URL=redis://redis:6379"
+      - "QUEUE_WORKER_ENABLED=${QUEUE_WORKER_ENABLED:-true}"
       - "OLLAMA_URL=http://ollama:11434"
       - "OLLAMA_EMBED_MODEL=bge-m3"
       - "OLLAMA_EMBED_DIM=1024"
       - "OLLAMA_CHAT_MODEL=gemma2b-mmap"
+      - "OLLAMA_TIMEOUT_MS=${OLLAMA_TIMEOUT_MS:-120000}"
       - "WHISPER_URL=http://whisper:8000"
       - "WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}"
       - "WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}"
@@ -141,11 +144,14 @@ services:
       # exercise the mock checkout without any Stripe account. Webhooks need
       # a public HTTPS URL; see docs/staging-deployment.md.
       - "STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY must be set (test key or sk_test_mock)}"
+      - "STRIPE_SECRET_KEY_FILE=${STRIPE_SECRET_KEY_FILE:-}"
       - "STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}"
       - "STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}"
       - "STRIPE_PRICE_ID_ENTERPRISE=${STRIPE_PRICE_ID_ENTERPRISE:-}"
       - "STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}"
+      - "STRIPE_WEBHOOK_SECRET_FILE=${STRIPE_WEBHOOK_SECRET_FILE:-}"
       - "JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set in .env.staging}"
+      - "JWT_SECRET_FILE=${JWT_SECRET_FILE:-}"
       - "CORS_ORIGINS=https://${STAGING_DOMAIN}"
       - "APP_BASE_URL=https://${STAGING_DOMAIN}"
       # Backend production boot guard: EMAIL_TRANSPORT=smtp + SMTP_HOST +
@@ -157,7 +163,9 @@ services:
       - "SMTP_PORT=${SMTP_PORT:-587}"
       - "SMTP_SECURE=${SMTP_SECURE:-false}"
       - "SMTP_USER=${SMTP_USER:-}"
+      - "SMTP_USER_FILE=${SMTP_USER_FILE:-}"
       - "SMTP_PASS=${SMTP_PASS:-}"
+      - "SMTP_PASS_FILE=${SMTP_PASS_FILE:-}"
       # Traefik -> frontend nginx -> backend; both hops are private Docker
       # networks, so trust uniquelocal/loopback for rate-limit client IPs.
       - "TRUST_PROXY=uniquelocal,loopback"
@@ -166,6 +174,38 @@ services:
       - "RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}"
       - "ADMIN_MAGIC_LINK_ENABLED=${ADMIN_MAGIC_LINK_ENABLED:-false}"
       - "LOG_LEVEL=${LOG_LEVEL:-info}"
+      # Caching, feature flags, quotas and streaming (mirror production).
+      - "RAG_CACHE_TTL_SECONDS=${RAG_CACHE_TTL_SECONDS:-300}"
+      - "PLANS_CACHE_TTL_SECONDS=${PLANS_CACHE_TTL_SECONDS:-3600}"
+      - "CACHE_PREFIX=${CACHE_PREFIX:-nomos:cache}"
+      - "FEATURE_FLAGS=${FEATURE_FLAGS:-}"
+      - "QUOTA_AI_BASIC=${QUOTA_AI_BASIC:-20}"
+      - "QUOTA_AI_PRO=${QUOTA_AI_PRO:-60}"
+      - "QUOTA_AI_ENTERPRISE=${QUOTA_AI_ENTERPRISE:-120}"
+      - "QUOTA_DOCS_BASIC=${QUOTA_DOCS_BASIC:-10}"
+      - "QUOTA_DOCS_PRO=${QUOTA_DOCS_PRO:-50}"
+      - "QUOTA_DOCS_ENTERPRISE=${QUOTA_DOCS_ENTERPRISE:-unlimited}"
+      - "AI_QUERY_TIMEOUT_MS=${AI_QUERY_TIMEOUT_MS:-120000}"
+      - "AI_UPLOAD_MAX_BYTES=${AI_UPLOAD_MAX_BYTES:-26214400}"
+      - "AI_STREAM_TTL_MS=${AI_STREAM_TTL_MS:-600000}"
+      - "AI_STREAM_MAX_LOG_EVENTS=${AI_STREAM_MAX_LOG_EVENTS:-5000}"
+      - "AI_STREAM_PUBLISH_TIMEOUT_MS=${AI_STREAM_PUBLISH_TIMEOUT_MS:-2000}"
+      - "AI_STREAM_SUBSCRIBE_TIMEOUT_MS=${AI_STREAM_SUBSCRIBE_TIMEOUT_MS:-5000}"
+      - "AI_STREAM_REDIS_COOLDOWN_MS=${AI_STREAM_REDIS_COOLDOWN_MS:-30000}"
+      # Local OCR / optional Ollama vision path.
+      - "OCR_LANGUAGES=${OCR_LANGUAGES:-ell+eng}"
+      - "OCR_TIMEOUT_MS=${OCR_TIMEOUT_MS:-30000}"
+      - "OCR_PDF_MAX_PAGES=${OCR_PDF_MAX_PAGES:-10}"
+      - "OCR_PDF_SCALE=${OCR_PDF_SCALE:-2}"
+      - "OCR_PDF_TIMEOUT_MS=${OCR_PDF_TIMEOUT_MS:-120000}"
+      - "OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-}"
+      - "OLLAMA_VISION_TIMEOUT_MS=${OLLAMA_VISION_TIMEOUT_MS:-120000}"
+      - "ACCOUNT_DELETION_GRACE_HOURS=${ACCOUNT_DELETION_GRACE_HOURS:-24}"
+      - "AB_EXPERIMENTS=${AB_EXPERIMENTS:-}"
+      - "SENTRY_DSN=${SENTRY_DSN:-}"
+      - "SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-staging}"
+      - "SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0}"
+      - "ALLOW_MOCK_CORPUS=${ALLOW_MOCK_CORPUS:-false}"
       # Phase 1-8: scraper output consumed by the ingest script. The file is
       # bind-mounted read-only below; ensure it exists on the host (or
       # comment the mount out if staging does not need legislation ingest).
@@ -201,12 +241,18 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        SITE_URL: "${SITE_URL:-https://your-domain.gr}"
     image: ${STAGING_FRONTEND_IMAGE:-nomosai-staging-frontend:local}
     depends_on:
       backend:
         condition: service_healthy
     networks:
       - nomos-staging-network
+    volumes:
+      # Cloudflare ranges for nginx real_ip (optional; direct traffic is
+      # unaffected). Refresh from https://www.cloudflare.com/ips/.
+      - ./deploy/cloudflare/real-ip.conf:/etc/nginx/cloudflare/real-ip.conf:ro
     restart: unless-stopped
     logging: *default-logging
     healthcheck:
@@ -228,15 +274,21 @@ services:
       # variant: docs/staging-deployment.md → "Self-signed / localhost fallback".
       - "traefik.http.routers.nomos-staging.tls.certresolver=le"
       - "traefik.http.routers.nomos-staging.service=nomos-staging"
+      - "traefik.http.routers.nomos-staging.middlewares=nomos-staging-ratelimit,nomos-staging-inflight"
+      # Edge flood protection, mirroring production. Per-request limits keep
+      # long-lived SSE responses working.
+      - "traefik.http.middlewares.nomos-staging-ratelimit.ratelimit.average=${EDGE_RATE_LIMIT_AVERAGE:-50}"
+      - "traefik.http.middlewares.nomos-staging-ratelimit.ratelimit.burst=${EDGE_RATE_LIMIT_BURST:-100}"
+      - "traefik.http.middlewares.nomos-staging-ratelimit.ratelimit.period=1s"
+      - "traefik.http.middlewares.nomos-staging-inflight.inflightreq.amount=${EDGE_INFLIGHT_REQ_AMOUNT:-100}"
       - "traefik.http.services.nomos-staging.loadbalancer.server.port=80"
       # HSTS is intentionally NOT enabled until the certificate path is
       # validated (a mis-issued staging cert would otherwise pin browsers to
       # an untrusted origin). After validation, uncomment these three labels
-      # and add the middleware to the router:
+      # and prepend nomos-staging-hsts to the router middlewares list above:
       # - "traefik.http.middlewares.nomos-staging-hsts.headers.stsSeconds=31536000"
       # - "traefik.http.middlewares.nomos-staging-hsts.headers.stsIncludeSubdomains=true"
       # - "traefik.http.middlewares.nomos-staging-hsts.headers.stsPreload=true"
-      # - "traefik.http.routers.nomos-staging.middlewares=nomos-staging-hsts"
 
   # ── TLS reverse proxy ──────────────────────────────────────────────────
   traefik:
@@ -290,6 +342,23 @@ services:
       - "DB_NAME=nomos_db"
       - "BACKUP_DIR=/backups"
       - "PROM_TEXTFILE_DIR=/prom-textfile"
+      # Optional S3 offsite copy. Leave BACKUP_S3_BUCKET empty to keep
+      # local-only backups. The upload uses the host-mounted backend's
+      # node_modules, so run `npm ci` in ./backend on the Docker host once.
+      - "BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}"
+      - "S3_REGION=${S3_REGION:-}"
+      - "S3_ENDPOINT=${S3_ENDPOINT:-}"
+      - "S3_FORCE_PATH_STYLE=${S3_FORCE_PATH_STYLE:-false}"
+      - "S3_PREFIX=${S3_PREFIX:-nomosai/}"
+      - "S3_SSE=${S3_SSE:-}"
+      - "S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}"
+      - "S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}"
+      # Forwarded for the AWS default credential chain when S3_* keys are not
+      # used (an instance/task role still works without any of these).
+      - "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}"
+      - "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}"
+      - "AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}"
+      - "AWS_REGION=${AWS_REGION:-}"
     entrypoint: >
       /bin/sh -c "apk add --no-cache postgresql-client > /dev/null 2>&1
       && echo '0 2 * * * cd /app/backend && node src/scripts/backupDb.js' > /etc/crontabs/root
@@ -341,6 +410,7 @@ services:
       - prometheus_data_staging:/prometheus
     depends_on:
       - backend
+      - alertmanager
     networks:
       - nomos-staging-network
     restart: unless-stopped
@@ -393,6 +463,108 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  alertmanager:
+    profiles: ["monitoring"]
+    image: prom/alertmanager:v0.27.0
+    # Alertmanager v0.27 has no --config.expand-env flag, so the entrypoint
+    # renders ${VAR} placeholders into a writable copy before starting it.
+    # Compose escapes ($$) keep the tokens literal until this shell runs.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        : "$${SLACK_WEBHOOK_URL:=http://127.0.0.1:9/disabled}"
+        : "$${SLACK_CHANNEL:=}"
+        : "$${ALERT_EMAIL_TO:=alerts@localhost}"
+        : "$${ALERT_EMAIL_FROM:=nomosai-alerts@localhost}"
+        : "$${SMTP_HOST:=localhost}"
+        : "$${SMTP_PORT:=25}"
+        : "$${SMTP_USER:=}"
+        : "$${SMTP_PASS:=}"
+        : "$${SMTP_REQUIRE_TLS:=true}"
+        export SLACK_WEBHOOK_URL SLACK_CHANNEL ALERT_EMAIL_TO ALERT_EMAIL_FROM \
+          SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_REQUIRE_TLS
+        mkdir -p /tmp/alertmanager
+        awk '
+          BEGIN {
+            n = split("SLACK_WEBHOOK_URL SLACK_CHANNEL ALERT_EMAIL_TO ALERT_EMAIL_FROM SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_REQUIRE_TLS", names, " ")
+          }
+          function repl(line, token, value,    out, i) {
+            while ((i = index(line, token)) > 0) {
+              out = out substr(line, 1, i - 1) value
+              line = substr(line, i + length(token))
+            }
+            return out line
+          }
+          {
+            line = $$0
+            for (i = 1; i <= n; i++) line = repl(line, "$${" names[i] "}", ENVIRON[names[i]])
+            print line
+          }
+        ' /etc/alertmanager/alertmanager.yml > /tmp/alertmanager/alertmanager.yml
+        exec /bin/alertmanager --config.file=/tmp/alertmanager/alertmanager.yml --storage.path=/alertmanager
+    environment:
+      # Empty Slack webhook / placeholder email keep the config loadable when
+      # alert delivery is not configured; sends then fail per-notification.
+      - "SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-http://127.0.0.1:9/disabled}"
+      - "SLACK_CHANNEL=${SLACK_CHANNEL:-}"
+      - "ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-alerts@localhost}"
+      - "ALERT_EMAIL_FROM=${ALERT_EMAIL_FROM:-nomosai-alerts@localhost}"
+      - "SMTP_HOST=${SMTP_HOST:-localhost}"
+      - "SMTP_PORT=${SMTP_PORT:-25}"
+      - "SMTP_USER=${SMTP_USER:-}"
+      - "SMTP_PASS=${SMTP_PASS:-}"
+      - "SMTP_REQUIRE_TLS=${SMTP_REQUIRE_TLS:-true}"
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+      - alertmanager_data_staging:/alertmanager
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  loki:
+    profiles: ["monitoring"]
+    image: grafana/loki:3.1.1
+    command:
+      - "-config.file=/etc/loki/loki-config.yml"
+    volumes:
+      - ./monitoring/loki:/etc/loki:ro
+      - loki_data_staging:/loki
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  promtail:
+    profiles: ["monitoring"]
+    image: grafana/promtail:3.1.1
+    command:
+      - "-config.file=/etc/promtail/promtail-config.yml"
+    volumes:
+      - ./monitoring/promtail:/etc/promtail:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
 volumes:
   pgdata_staging:
   redisdata_staging:
@@ -403,6 +575,8 @@ volumes:
   prometheus_data_staging:
   grafana_data_staging:
   prom_textfile_staging:
+  alertmanager_data_staging:
+  loki_data_staging:
 
 networks:
   nomos-staging-network:

@@ -2,6 +2,7 @@
 //
 // - GET  /api/subscriptions        current subscription (latest row)
 // - GET  /api/subscriptions/history  full history
+// - GET  /api/subscriptions/invoices paginated payment history
 // - GET  /api/subscriptions/usage  quota usage for the caller (read-only)
 // - POST /api/subscriptions/cancel  cancel at period end (Stripe live mode
 //                                   calls cancel_at_period_end=true)
@@ -21,9 +22,25 @@ const { ALLOWED_TIERS } = require('../middlewares/authMiddleware');
 const { validate } = require('../middlewares/validation');
 const { check } = require('express-validator');
 const { createApiRateLimiters } = require('../middlewares/rateLimiters');
+const { getSecret } = require('../config/secrets');
 
 // 1-3: per-user caps (see rateLimiters.js).
 const limiters = createApiRateLimiters();
+
+const DEFAULT_INVOICE_LIMIT = 20;
+const MAX_INVOICE_LIMIT = 100;
+
+function parsePagination(query) {
+  const requestedLimit = Number(query.limit);
+  const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, MAX_INVOICE_LIMIT)
+    : DEFAULT_INVOICE_LIMIT;
+  const requestedOffset = Number(query.offset);
+  const offset = Number.isInteger(requestedOffset) && requestedOffset > 0
+    ? requestedOffset
+    : 0;
+  return { limit, offset };
+}
 
 // GET /api/subscriptions — current subscription
 router.get('/', limiters.subscriptionRead, async (req, res) => {
@@ -42,7 +59,7 @@ router.get('/', limiters.subscriptionRead, async (req, res) => {
       tier: req.user.subscription_tier || 'basic'
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -58,7 +75,41 @@ router.get('/history', limiters.subscriptionRead, async (req, res) => {
     );
     res.json({ subscriptions: result.rows });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// GET /api/subscriptions/invoices?limit=&offset= — paginated payment history.
+// The invoices table is populated by the Stripe invoice webhooks; rows whose
+// owner could not be resolved have user_id NULL and are never returned here.
+router.get('/invoices', limiters.subscriptionRead, async (req, res) => {
+  try {
+    const { limit, offset } = parsePagination(req.query);
+
+    const countResult = await db.query(
+      `SELECT COUNT(*)::int AS total FROM invoices WHERE user_id = $1`,
+      [req.user.id]
+    );
+    const result = await db.query(
+      `SELECT id, stripe_invoice_id, stripe_customer_id, stripe_subscription_id,
+              amount_due, amount_paid, currency, status, hosted_invoice_url, invoice_pdf,
+              period_start, period_end, created_at, updated_at
+       FROM invoices
+       WHERE user_id = $1
+       ORDER BY created_at DESC, id DESC
+       LIMIT $2 OFFSET $3`,
+      [req.user.id, limit, offset]
+    );
+
+    const totalRow = countResult.rows[0] || {};
+    res.json({
+      invoices: result.rows,
+      total: Number(totalRow.total) || 0,
+      limit,
+      offset
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -141,7 +192,7 @@ router.post('/cancel', limiters.subscriptionCancel, async (req, res) => {
     }
 
     if (stripeService.isConfigured() && sub.stripe_subscription_id) {
-      const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+      const stripe = Stripe(getSecret('STRIPE_SECRET_KEY', 'sk_test_mock'));
       await stripe.subscriptions.update(sub.stripe_subscription_id, {
         cancel_at_period_end: true
       });
@@ -154,7 +205,7 @@ router.post('/cancel', limiters.subscriptionCancel, async (req, res) => {
 
     res.json({ ok: true, subscription: { id: sub.id, status: 'canceled_at_period_end' } });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -205,7 +256,7 @@ router.post('/reactivate', limiters.subscriptionCancel, async (req, res) => {
 
     res.json({ ok: true, subscription: { id: sub.id, status } });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -223,7 +274,7 @@ router.post(
       });
       res.json({ url: session.url, sessionId: session.id });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 );

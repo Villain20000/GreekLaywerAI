@@ -2,9 +2,11 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const aiRoutes = require('./routes/ai');
+const aiStreamRoutes = require('./routes/aiStream');
 const billingRoutes = require('./routes/billing');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
+const configRoutes = require('./routes/config');
 const conversationsRoutes = require('./routes/conversations');
 const documentsRoutes = require('./routes/documents');
 const subscriptionsRoutes = require('./routes/subscriptions');
@@ -19,6 +21,9 @@ const ollamaService = require('./services/ollamaService');
 const inferenceQueue = require('./services/inferenceQueue');
 const stripeService = require('./services/stripeService');
 const db = require('./config/db');
+const { initSentry, captureException } = require('./config/sentry');
+
+initSentry();
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -153,7 +158,14 @@ app.get('/api/ai/health', (req, res) => {
   });
 });
 
+// Public client configuration (feature flags). Registered before every auth
+// mount so the SPA can read it while signed out.
+app.use('/api/config', configRoutes);
+
 app.use('/api/auth', authRoutes); // buildAuthRouter(factory) already wired in require
+// Live streaming routes authenticate per route and must be mounted before
+// the legacy `/api/ai` auth guard (see routes/aiStream.js).
+app.use('/api/ai', aiStreamRoutes);
 app.use('/api/ai', authMiddleware, aiRoutes); // Per-route RBAC inside ai.js
 
 // Stripe webhook MUST be mounted BEFORE the authMiddleware-guarded
@@ -181,6 +193,8 @@ app.get('/metrics', metricsHandler);
 // ===========================================================================
 function globalErrorHandler(err, req, res, next) {
   if (res.headersSent) return next(err);
+
+  captureException(err);
 
   // Multer aborts oversized uploads with a MulterError raised from inside the
   // upload middleware, so route-level try/catch blocks never see it.

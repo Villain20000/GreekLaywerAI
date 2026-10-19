@@ -140,6 +140,9 @@ Compose interpolation happens on the host. Values marked **required** cause
 | Variable | Required | Purpose |
 |---|---|---|
 | `STAGING_DOMAIN` | yes | Public hostname; ACL/Traefik `Host()` rule and `APP_BASE_URL`/`CORS_ORIGINS` |
+| `SITE_URL` | no | Frontend build-time origin for canonical/OG/sitemap/robots; default `https://your-domain.gr` |
+| `EDGE_RATE_LIMIT_AVERAGE` / `EDGE_RATE_LIMIT_BURST` | no | Traefik requests/second and burst, defaults 50/100 |
+| `EDGE_INFLIGHT_REQ_AMOUNT` | no | Traefik concurrent request cap, default 100 |
 | `ACME_EMAIL` | yes | Let's Encrypt account/expiry contact |
 | `STAGING_ACME_CA` | no | ACME directory URL; defaults to the **staging** CA |
 | `STAGING_HTTP_PORT` / `STAGING_HTTPS_PORT` | no | Host ports, default 80/443 |
@@ -155,6 +158,10 @@ Compose interpolation happens on the host. Values marked **required** cause
 | `STRIPE_WEBHOOK_SECRET` | no* | *Required for real webhook signature verification |
 | `GRAFANA_ADMIN_PASSWORD` | yes | Compose requires it even when the profile is off; used by `grafana` |
 | `RETENTION_CONVERSATIONS_DAYS` / `RETENTION_DOCUMENTS_DAYS` / `RETENTION_AUDIT_LOG_DAYS` | no | Defaults 365/365/90 |
+| `ACCOUNT_DELETION_GRACE_HOURS` | no | Scheduled deletion grace period, default 24 (1-168) |
+| `OCR_PDF_MAX_PAGES` / `OCR_PDF_SCALE` / `OCR_PDF_TIMEOUT_MS` | no | Scanned-PDF OCR limits, defaults 10 / 2 / 120000 |
+| `SENTRY_DSN` / `SENTRY_ENVIRONMENT` / `SENTRY_TRACES_SAMPLE_RATE` | no | Optional backend Sentry; no-op with an empty DSN |
+| `AB_EXPERIMENTS` | no | JSON experiment config; empty uses landing-hero 50/50 |
 | `WHISPER_MODEL` / `WHISPER_TIMEOUT_MS` | no | Must match the sidecar's `PRELOAD_MODELS` |
 | `LOG_LEVEL` | no | pino level, default `info` |
 | `SCRAPED_LAWS_PATH` | no | Host path to scraper JSON; must exist before boot |
@@ -175,9 +182,22 @@ https://${STAGING_DOMAIN}/api/billing/webhook
 ```
 
 Add that endpoint in the Stripe Dashboard (test mode) or forward with the
-Stripe CLI, then put its signing secret in `STRIPE_WEBHOOK_SECRET`. The path
-is mounted before the JSON body parser so raw-body signature verification
-works. Rotating the secret requires updating both sides.
+Stripe CLI, then put its signing secret in `STRIPE_WEBHOOK_SECRET`. With a real
+test key you can also register it from the running backend:
+
+```bash
+docker compose -f docker-compose.staging.yml --env-file .env.staging \
+  exec backend npm run stripe:webhook -- --dry-run
+docker compose -f docker-compose.staging.yml --env-file .env.staging \
+  exec backend npm run stripe:webhook
+```
+
+The script prints a newly created signing secret once; store it and restart
+the backend. The path is mounted before the JSON body parser so raw-body
+signature verification works. Rotating the secret requires updating both
+sides. Cloudflare real-IP ranges are mounted into the frontend from
+`deploy/cloudflare/real-ip.conf`; see
+[`deploy/cloudflare/README.md`](../deploy/cloudflare/README.md).
 
 ## TLS and ACME
 
@@ -272,8 +292,10 @@ The shipped path is a single env file read by Compose:
 ```bash
 cp .env.staging.example .env.staging
 chmod 600 .env.staging
-echo '.env.staging' >> .git/info/exclude   # repo .gitignore only covers `.env`
 ```
+
+`.env.staging` is ignored by the repository `.gitignore` (alongside
+`.env.production`).
 
 Rules:
 
@@ -286,13 +308,20 @@ Rules:
 - Back up secrets in a password manager, not in the repository or the
   `backups_staging` volume.
 
-### Next step: Docker secrets (with an honest caveat)
+### Docker secrets and `*_FILE` variables
 
 Docker Compose `secrets:` mounts files under `/run/secrets/<name>` (this is a
-bind mount, not encrypted at rest outside Swarm). The backend currently reads
-**only environment variables** and does **not** implement `*_FILE` variables:
-setting `JWT_SECRET_FILE` or `SMTP_PASS_FILE` does nothing today. To use
-Docker secrets you must wrap startup and export the values into env, e.g.:
+bind mount, not encrypted at rest outside Swarm). The backend implements
+`*_FILE` resolution for the supported secrets: set `JWT_SECRET_FILE`,
+`DB_PASSWORD_FILE`, `STRIPE_SECRET_KEY_FILE`, `STRIPE_WEBHOOK_SECRET_FILE`,
+`SMTP_USER_FILE` or `SMTP_PASS_FILE` to a readable path and the file value
+takes precedence over the plain variable. Trailing CR/LF is stripped; a
+configured-but-unreadable file aborts boot instead of silently falling back to
+a weaker default. Because the value is resolved when the module first loads,
+file-only deployments behave identically regardless of require order.
+
+The staging compose file forwards every `*_FILE` variable to the backend. Use
+Compose secrets together with those variables, for example:
 
 ```yaml
 services:
@@ -300,13 +329,9 @@ services:
     secrets:
       - jwt_secret
       - db_password
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        export JWT_SECRET="$$(cat /run/secrets/jwt_secret)"
-        export DB_PASSWORD="$$(cat /run/secrets/db_password)"
-        exec npm start
+    environment:
+      - "JWT_SECRET_FILE=/run/secrets/jwt_secret"
+      - "DB_PASSWORD_FILE=/run/secrets/db_password"
 
 secrets:
   jwt_secret:
@@ -315,16 +340,17 @@ secrets:
     file: ./secrets/db_password
 ```
 
-Create `secrets/` with mode `0700` and files with mode `0600`, and replace
-the corresponding `environment:` entries (Compose lets the entrypoint's
-exports coexist, but do not keep duplicate plaintext values in the file).
+Compose interpolation still requires the plain variables used by the service
+definitions (`${JWT_SECRET:?…}`, `${DB_PASSWORD:?…}`), so keep a non-sensitive
+placeholder in `.env.staging`; the mounted file always wins at runtime. Create
+`secrets/` with mode `0700` and the files with mode `0600`.
 
-This still exposes the values as process env (and therefore to
-`docker inspect`); it mainly removes them from the compose file and shell
-history. True `_FILE` support requires a small entrypoint in the backend image
-that reads the files before `node src/index.js`; that is not implemented in
-this repository. Vault/OpenBao integration is a further stretch goal and is
-also not shipped.
+Values resolved from a file still end up in process memory (and are visible in
+`/proc/<pid>/environ` only if the app exports them; it does not). The files
+themselves stay out of the compose environment and shell history. See
+`production-hardening.md` for the production variant and the full supported
+secret list. Vault/OpenBao integration is a further stretch goal and is not
+shipped.
 
 ### Rotation
 
@@ -390,7 +416,8 @@ The staging stack mirrors production's cron sidecars:
 - `backup` runs `backend/src/scripts/backupDb.js` at 02:00 into the
   `backups_staging` volume (`/backups`), retaining 14 dumps.
 - `retention` runs `backend/src/scripts/retentionCleanup.js` at 03:00
-  (conversations by `updated_at`; documents/audit by `created_at`).
+  (scheduled accounts by deletion deadline; conversations by `updated_at`;
+  documents/audit by `created_at`).
 - Backup freshness is published to `prom_textfile_staging` for the
   `BackupStale` alert when the monitoring profile is enabled.
 

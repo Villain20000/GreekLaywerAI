@@ -15,8 +15,9 @@ const router = express.Router();
 const Stripe = require('stripe');
 const db = require('../config/db');
 const stripeService = require('../services/stripeService');
+const { getSecret } = require('../config/secrets');
 
-const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const WEBHOOK_SECRET = getSecret('STRIPE_WEBHOOK_SECRET', undefined);
 
 router.post('/', async (req, res) => {
   if (!WEBHOOK_SECRET) {
@@ -31,7 +32,7 @@ router.post('/', async (req, res) => {
 
   let event;
   try {
-    const stripe = Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_mock');
+    const stripe = Stripe(getSecret('STRIPE_SECRET_KEY', 'sk_test_mock'));
     event = stripe.webhooks.constructEvent(req.body, sig, WEBHOOK_SECRET);
   } catch (err) {
     console.error('[STRIPE] Webhook signature verification failed:', err.message);

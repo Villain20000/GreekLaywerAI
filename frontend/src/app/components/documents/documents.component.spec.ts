@@ -31,6 +31,7 @@ describe('DocumentsComponent', () => {
     search: jasmine.Spy;
     get: jasmine.Spy;
     getContent: jasmine.Spy;
+    downloadOriginal: jasmine.Spy;
   };
   let confirmStub: { ask: jasmine.Spy };
 
@@ -42,7 +43,11 @@ describe('DocumentsComponent', () => {
       remove: jasmine.createSpy('remove').and.resolveTo(undefined),
       search: jasmine.createSpy('search').and.resolveTo([]),
       get: jasmine.createSpy('get').and.callFake((id: number) => Promise.resolve(documentStub(id))),
-      getContent: jasmine.createSpy('getContent').and.resolveTo('Περιεχόμενο εγγράφου')
+      getContent: jasmine.createSpy('getContent').and.resolveTo('Περιεχόμενο εγγράφου'),
+      downloadOriginal: jasmine.createSpy('downloadOriginal').and.resolveTo({
+        blob: new Blob(['%PDF-1.4'], { type: 'application/pdf' }),
+        filename: null
+      })
     };
 
     await TestBed.configureTestingModule({
@@ -81,17 +86,49 @@ describe('DocumentsComponent', () => {
     expect(component.previewDoc?.id).toBe(4);
   });
 
-  it('downloads a document as a text blob', async () => {
+  it('downloads the original file using the Content-Disposition filename', async () => {
+    const blob = new Blob(['%PDF-1.4'], { type: 'application/pdf' });
+    serviceStub.downloadOriginal.and.resolveTo({ blob, filename: 'σύμβαση.pdf' });
     const createObjectURL = spyOn(URL, 'createObjectURL').and.returnValue('blob:test');
     const revokeObjectURL = spyOn(URL, 'revokeObjectURL');
-    const click = spyOn(HTMLAnchorElement.prototype, 'click');
+    let downloadedName = '';
+    const click = spyOn(HTMLAnchorElement.prototype, 'click').and.callFake(function (this: HTMLAnchorElement) {
+      downloadedName = this.download;
+    });
 
     await component.downloadDocument(documentStub(5));
 
-    expect(serviceStub.getContent).toHaveBeenCalledWith(5);
-    expect(createObjectURL).toHaveBeenCalled();
+    expect(serviceStub.downloadOriginal).toHaveBeenCalledWith(5);
+    expect(serviceStub.getContent).not.toHaveBeenCalled();
+    expect(createObjectURL).toHaveBeenCalledWith(blob);
     expect(click).toHaveBeenCalled();
+    expect(downloadedName).toBe('σύμβαση.pdf');
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:test');
+  });
+
+  it('falls back to the stored filename when the header has none', async () => {
+    spyOn(URL, 'createObjectURL').and.returnValue('blob:test');
+    spyOn(URL, 'revokeObjectURL');
+    let downloadedName = '';
+    spyOn(HTMLAnchorElement.prototype, 'click').and.callFake(function (this: HTMLAnchorElement) {
+      downloadedName = this.download;
+    });
+
+    await component.downloadDocument(documentStub(5));
+
+    expect(downloadedName).toBe('doc-5.pdf');
+  });
+
+  it('shows file_size when present, falling back to metadata size_bytes', async () => {
+    component.documents = [
+      { ...documentStub(1), file_size: 4096 },
+      documentStub(2)
+    ];
+    fixture.detectChanges();
+
+    const cells = fixture.nativeElement.querySelectorAll('tbody tr td:nth-child(3)');
+    expect(cells[0].textContent.trim()).toBe('4.0 KB');
+    expect(cells[1].textContent.trim()).toBe('4.0 KB');
   });
 
   it('appends the next page with load more', async () => {
@@ -228,7 +265,7 @@ describe('DocumentsComponent', () => {
   });
 
   it('reports a failed download in the download channel, not the upload channel', async () => {
-    serviceStub.getContent.and.rejectWith(new Error('download failed'));
+    serviceStub.downloadOriginal.and.rejectWith(new Error('download failed'));
 
     await component.downloadDocument(documentStub(5));
 

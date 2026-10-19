@@ -4,7 +4,7 @@
   "scripts": {
     "ng": "ng",
     "start": "ng serve --host 0.0.0.0",
-    "build": "ng build",
+    "build": "ng build && node scripts/apply-site-url.js",
     "watch": "ng build --watch --configuration development",
     "test": "ng test"
   },
@@ -18,8 +18,10 @@
     "@angular/platform-browser": "^17.3.0",
     "@angular/platform-browser-dynamic": "^17.3.0",
     "@angular/router": "^17.3.0",
+    "@angular/service-worker": "^17.3.12",
     "@ngx-translate/core": "^16.0.4",
     "@ngx-translate/http-loader": "^8.0.0",
+    "@sentry/browser": "^11.8.0",
     "dompurify": "^3.4.17",
     "gsap": "^3.12.5",
     "marked": "^18.1.1",

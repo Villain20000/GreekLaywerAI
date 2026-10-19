@@ -7,6 +7,8 @@ const documentService = require('../services/documentService');
 const ollamaService = require('../services/ollamaService');
 const transcriptionService = require('../services/transcriptionService');
 const inferenceQueue = require('../services/inferenceQueue');
+const ocrService = require('../services/ocrService');
+const visionService = require('../services/visionService');
 const { rbacMiddleware } = require('../middlewares/authMiddleware');
 const { requireTier } = require('../middlewares/tierMiddleware');
 const { enforceAiQuota } = require('../middlewares/quotaMiddleware');
@@ -488,32 +490,56 @@ router.post(
 // Multimodal Upload Endpoint — premium (enterprise tier or higher).
 // Same tier-not-role rationale as /audio-query above.
 //
-// Phase 1-7: real document handling. PDF and DOCX are text-extracted through
-// the shared document pipeline (documentService.extractMetadata — the same
-// parser processAndStoreDocument uses) and then answered with the normal
-// RAG + local-LLM path. Vision is out of scope by decision (2026-10-18):
-// images get an explicit "not supported" envelope instead of a canned reply.
+// PDF/DOCX are text-extracted through the shared document pipeline
+// (documentService.extractMetadata) and answered with the normal RAG +
+// local-LLM path. Images are analyzed by the optional Ollama vision model
+// (OLLAMA_VISION_MODEL) when configured, otherwise — and as a fallback when
+// vision fails — through local OCR (ocrService). Scanned PDFs without a text
+// layer are rasterized and OCRed through ocrService.ocrPdf.
 const MULTIMODAL_DOCUMENT_TYPES = [
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 ];
+const MULTIMODAL_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+const MULTIMODAL_ALLOWED_TYPES = [...MULTIMODAL_DOCUMENT_TYPES, ...MULTIMODAL_IMAGE_TYPES];
 // Prompt char budget: enough for a multi-page contract excerpt while keeping
 // the local model's context window + latency bounded.
 const MULTIMODAL_DOCUMENT_MAX_CHARS = 8000;
+// Images have a tighter per-endpoint cap than multer's global 25 MB.
+const MULTIMODAL_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+
+const MULTIMODAL_IMAGE_PROMPT = [
+  'Ανέλυσε την ακόλουθη εικόνα νομικού εγγράφου που επισύναψε ο χρήστης και απάντησε με βάση το περιεχόμενό της.',
+  'Σχολίασε τα βασικά νομικά σημεία, τις υποχρεώσεις και τυχόν κινδύνους που προκύπτουν.'
+].join('\n');
+
+// sniffFileType recognizes PDF/PNG/JPEG but not WEBP. Add that one check
+// locally instead of widening the shared validation whitelist.
+function sniffMultimodalType(buffer) {
+  if (
+    Buffer.isBuffer(buffer) &&
+    buffer.length >= 12 &&
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  return sniffFileType(buffer);
+}
 
 // The shared validateUploadedFile('multimodal') whitelist predates DOCX
 // support and rejects it before the handler can see the bytes, so the route
 // sniffs with the same dependency-free magic-byte helper instead:
-//   - unrecognizable bytes        → 400 (validateUploadedFile's convention)
-//   - recognized, but not PDF/DOCX (images, plain text, …) → 415 below
+//   - unrecognizable bytes                  → 400 (validateUploadedFile's convention)
+//   - recognized, but not allowed here      → 415 below
 function validateMultimodalUpload(req, res, next) {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
-  const detectedType = sniffFileType(req.file.buffer);
+  const detectedType = sniffMultimodalType(req.file.buffer);
   if (!detectedType) {
     return res.status(400).json({
-      error: `Unsupported file type. Allowed: ${MULTIMODAL_DOCUMENT_TYPES.join(', ')}`
+      error: `Unsupported file type. Allowed: ${MULTIMODAL_ALLOWED_TYPES.join(', ')}`
     });
   }
   // Strip path components so a crafted multipart name can never traverse
@@ -535,24 +561,114 @@ router.post(
   async (req, res) => {
     try {
       const detectedType = req.file.detectedType;
+      const buffer = req.file.buffer;
+      const uploadSize = buffer.length;
+
+      if (MULTIMODAL_IMAGE_TYPES.includes(detectedType)) {
+        if (uploadSize > MULTIMODAL_IMAGE_MAX_BYTES) {
+          return res.status(413).json({ error: 'Image too large. Maximum size is 5 MB' });
+        }
+
+        // Vision is operator-provisioned through OLLAMA_VISION_MODEL; no
+        // model is pulled on demand. Any vision failure falls back to OCR.
+        if (visionService.isConfigured()) {
+          const grounding = await retrieveRagContext(MULTIMODAL_IMAGE_PROMPT, req.user.id);
+          try {
+            const response = await visionService.analyzeImage(buffer, {
+              mimeType: detectedType,
+              prompt: MULTIMODAL_IMAGE_PROMPT,
+              context: grounding.contextStr
+            });
+            console.log(
+              `Multimodal image of ${uploadSize} bytes (${detectedType}) → vision response of ${String(response).length} chars`
+            );
+            return res.json({
+              response,
+              sources: grounding.sources,
+              confidence: grounding.confidence
+            });
+          } catch (error) {
+            if (!(error instanceof visionService.VisionError)) throw error;
+            console.warn(
+              `Vision analysis failed (${error.code}) for ${detectedType} image of ${uploadSize} bytes; falling back to OCR`
+            );
+          }
+        }
+
+        let ocrText;
+        try {
+          ocrText = await ocrService.extractText(buffer, { mimeType: detectedType });
+        } catch (error) {
+          if (error instanceof ocrService.OcrError) {
+            console.error(
+              `Image OCR failed (${error.code}) for ${detectedType} image of ${uploadSize} bytes: ${error.message}`
+            );
+            return res.status(error.status).json({ error: error.publicMessage });
+          }
+          throw error;
+        }
+
+        const excerpt = typeof ocrText === 'string'
+          ? ocrText.trim().slice(0, MULTIMODAL_DOCUMENT_MAX_CHARS)
+          : '';
+        if (!excerpt) {
+          return res.status(422).json({ error: 'Could not extract text from the image' });
+        }
+        console.log(
+          `Multimodal image of ${uploadSize} bytes (${detectedType}) → ${excerpt.length} OCR chars`
+        );
+
+        // OCR text is the question; retrieved legislation is the grounding —
+        // same Greek prompt/envelope as the document branch.
+        const prompt = [
+          MULTIMODAL_IMAGE_PROMPT,
+          '',
+          'Κείμενο από OCR:',
+          excerpt
+        ].join('\n');
+        const rag = await retrieveRagContext(excerpt, req.user.id);
+        const response = await ollamaService.generateResponse(prompt, rag.contextStr);
+        return res.json({ response, sources: rag.sources, confidence: rag.confidence });
+      }
+
       if (!MULTIMODAL_DOCUMENT_TYPES.includes(detectedType)) {
         return res.status(415).json({
-          error: 'Unsupported media type. Upload a PDF or DOCX document.'
+          error: `Unsupported media type. Allowed: ${MULTIMODAL_ALLOWED_TYPES.join(', ')}`
         });
       }
 
-      const { text } = await documentService.extractMetadata(req.file.buffer, {
+      const { text } = await documentService.extractMetadata(buffer, {
         contentType: detectedType,
         filename: req.file.originalname
       });
-      const excerpt = typeof text === 'string' ? text.trim().slice(0, MULTIMODAL_DOCUMENT_MAX_CHARS) : '';
+      let excerpt = typeof text === 'string' ? text.trim().slice(0, MULTIMODAL_DOCUMENT_MAX_CHARS) : '';
+
+      // Scanned PDFs have no text layer; rasterize + OCR before giving up.
+      if (!excerpt && detectedType === 'application/pdf') {
+        try {
+          const ocrText = await ocrService.ocrPdf(buffer);
+          excerpt = typeof ocrText === 'string'
+            ? ocrText.trim().slice(0, MULTIMODAL_DOCUMENT_MAX_CHARS)
+            : '';
+        } catch (error) {
+          if (!(error instanceof ocrService.OcrError)) throw error;
+          console.warn(
+            `PDF OCR failed (${error.code}) for document of ${uploadSize} bytes: ${error.message}`
+          );
+          // Non-empty failures keep the legacy 422 contract; a valid scan with
+          // no readable text gets an explicit message.
+          const message = error.code === ocrService.ERROR_CODES.EMPTY
+            ? 'Could not extract text from the document. OCR did not find readable text in the scanned PDF.'
+            : 'Could not extract text from the document. OCR is not available for scanned PDFs.';
+          return res.status(422).json({ error: message });
+        }
+      }
+
       if (!excerpt) {
-        // Scanned/image-only PDFs have no text layer — say so instead of
-        // letting the model invent a summary of an empty context.
         return res.status(422).json({ error: 'Could not extract text from the document' });
       }
       console.log(
-        `Multimodal document of ${req.file.buffer.length} bytes (${detectedType}) → ${excerpt.length} prompt chars`
+        `Multimodal document of ${uploadSize} bytes (${detectedType}) → ${excerpt.length} prompt chars`
       );
 
       // The attached document is the question; retrieved legislation is the
@@ -587,3 +703,14 @@ router.get('/models', (req, res) => {
 });
 
 module.exports = router;
+
+// Additive exports for routes/aiStream.js: the live SSE route reuses the
+// exact same persistence, ownership, RAG and validation helpers instead of
+// duplicating SQL or prompt rules. The router itself remains the module
+// export so existing `app.use('/api/ai', ..., aiRoutes)` wiring is unchanged.
+module.exports.storeExchange = storeExchange;
+module.exports.retrieveRagContext = retrieveRagContext;
+module.exports.parseConversationId = parseConversationId;
+module.exports.isValidJobId = isValidJobId;
+module.exports.belongsToUser = belongsToUser;
+module.exports.validatePrompt = validatePrompt;

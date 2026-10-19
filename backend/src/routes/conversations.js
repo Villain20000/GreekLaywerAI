@@ -15,10 +15,20 @@ const { createApiRateLimiters } = require('../middlewares/rateLimiters');
 const limiters = createApiRateLimiters();
 
 const DEFAULT_TITLE = 'Νέα συνομιλία';
+// messages.id is a PostgreSQL SERIAL (int4); larger cursors are invalid.
+const MAX_MESSAGE_ID = 2147483647;
 
 function parsePositiveInt(raw) {
   const n = Number.parseInt(raw, 10);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// Strict variant for query-string pagination: rejects arrays, nulls,
+// fractions and out-of-range values instead of silently truncating.
+function parseBoundedInt(raw, min, max) {
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) && n >= min && n <= max ? n : null;
 }
 
 // GET /api/conversations?limit=20&offset=0&q= — list user's conversations
@@ -80,10 +90,28 @@ router.post(
 );
 
 // GET /api/conversations/:id — conversation + messages
+//
+// Without `messageLimit` the response keeps its original shape: every
+// message in ascending order. With `messageLimit` (1..100) the newest page
+// is returned plus `hasMore`/`nextCursor`; `before` (a positive message id)
+// selects the page older than that cursor. Cursor pagination on the
+// messages primary key keeps pages stable while new messages are appended.
 router.get('/:id', async (req, res) => {
   try {
     const id = parsePositiveInt(req.params.id);
     if (id === null) return res.status(400).json({ error: 'Invalid conversation id' });
+
+    const paginated = req.query.messageLimit !== undefined;
+    let messageLimit = null;
+    let before = null;
+    if (paginated) {
+      messageLimit = parseBoundedInt(req.query.messageLimit, 1, 100);
+      if (messageLimit === null) return res.status(400).json({ error: 'Invalid messageLimit' });
+    }
+    if (req.query.before !== undefined) {
+      before = parseBoundedInt(req.query.before, 1, MAX_MESSAGE_ID);
+      if (before === null) return res.status(400).json({ error: 'Invalid before' });
+    }
 
     const conv = await db.query(
       `SELECT id, title, created_at, updated_at
@@ -95,17 +123,46 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Conversation not found' });
     }
 
+    if (!paginated) {
+      const msgs = await db.query(
+        `SELECT m.id, m.role, m.content, m.citation_metadata, m.created_at,
+                mf.helpful AS feedback_helpful
+         FROM messages m
+         LEFT JOIN message_feedback mf
+           ON mf.message_id = m.id AND mf.user_id = $2
+         WHERE m.conversation_id = $1
+         ORDER BY m.created_at ASC, m.id ASC`,
+        [id, req.user.id]
+      );
+      return res.json({ conversation: conv.rows[0], messages: msgs.rows });
+    }
+
+    // Fetch one extra row to learn whether an older page exists without a
+    // second COUNT query.
+    const params = [id, req.user.id];
+    let beforeSql = '';
+    if (before !== null) {
+      params.push(before);
+      beforeSql = ` AND m.id < $${params.length}`;
+    }
+    params.push(messageLimit + 1);
+
     const msgs = await db.query(
       `SELECT m.id, m.role, m.content, m.citation_metadata, m.created_at,
               mf.helpful AS feedback_helpful
        FROM messages m
        LEFT JOIN message_feedback mf
          ON mf.message_id = m.id AND mf.user_id = $2
-       WHERE m.conversation_id = $1
-       ORDER BY m.created_at ASC, m.id ASC`,
-      [id, req.user.id]
+       WHERE m.conversation_id = $1${beforeSql}
+       ORDER BY m.id DESC
+       LIMIT $${params.length}`,
+      params
     );
-    res.json({ conversation: conv.rows[0], messages: msgs.rows });
+
+    const hasMore = msgs.rows.length > messageLimit;
+    const messages = msgs.rows.slice(0, messageLimit).reverse();
+    const nextCursor = messages.length > 0 ? messages[0].id : null;
+    res.json({ conversation: conv.rows[0], messages, hasMore, nextCursor });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

@@ -10,10 +10,11 @@
 
 const Stripe = require('stripe');
 const db = require('../config/db');
+const { getSecret } = require('../config/secrets');
 const { logAudit } = require('./auditLog');
 
 const MOCK_KEY = 'sk_test_mock';
-const stripeKey = process.env.STRIPE_SECRET_KEY || MOCK_KEY;
+const stripeKey = getSecret('STRIPE_SECRET_KEY', MOCK_KEY);
 const stripe = Stripe(stripeKey);
 
 const mockMode = stripeKey === MOCK_KEY;
@@ -83,6 +84,18 @@ function isConfigured() {
 }
 
 /**
+ * Live billing is mandatory in production: a mock key (or no key at all)
+ * must never silently simulate a payment there.
+ */
+function assertBillingConfigured() {
+  if (mockMode && process.env.NODE_ENV === 'production') {
+    const err = new Error('Stripe billing is not configured');
+    err.statusCode = 503;
+    throw err;
+  }
+}
+
+/**
  * Whether the service is running against the local mock (no real Stripe key).
  * @returns {boolean}
  */
@@ -96,6 +109,8 @@ function isMockMode() {
  * @returns {Promise<{id: string, url: string}>}
  */
 async function createCheckoutSession({ tier, user }) {
+  assertBillingConfigured();
+
   if (mockMode) {
     const mockUrl = `${APP_BASE_URL}/chat?mock_payment=success&tier=${encodeURIComponent(tier)}`;
     return { id: `mock_cs_${Date.now()}`, url: mockUrl };
@@ -181,6 +196,7 @@ async function upsertSubscription({ userId, stripeCustomerId, stripeSubscription
  * Never available in live Stripe mode.
  */
 async function completeMockCheckout({ user, tier }) {
+  assertBillingConfigured();
   if (!mockMode) {
     throw new Error('Mock checkout is only available in mock mode');
   }
@@ -208,6 +224,8 @@ async function completeMockCheckout({ user, tier }) {
  * @returns {Promise<{id: string, url: string}>}
  */
 async function createPortalSession({ user, returnUrl }) {
+  assertBillingConfigured();
+
   if (mockMode) {
     const err = new Error('Customer portal is only available in live Stripe mode');
     err.statusCode = 403;
@@ -251,6 +269,115 @@ async function resumeSubscription({ stripeSubscriptionId }) {
     cancel_at_period_end: false
   });
   return { status: subscription.status || 'active' };
+}
+
+/**
+ * Convert a Stripe epoch-seconds value to an ISO timestamp.
+ * @param {number|string|null|undefined} value
+ * @returns {string|null}
+ */
+function toIsoTimestamp(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return null;
+  return new Date(seconds * 1000).toISOString();
+}
+
+/**
+ * Resolve the invoice owner from our subscriptions table: the subscription id
+ * is authoritative, the customer id is the fallback for invoices that predate
+ * the subscription row. Returns null when nothing matches.
+ */
+async function resolveInvoiceOwner({ stripeSubscriptionId, stripeCustomerId }) {
+  if (stripeSubscriptionId) {
+    const bySubscription = await db.query(
+      `SELECT user_id FROM subscriptions WHERE stripe_subscription_id = $1 LIMIT 1`,
+      [stripeSubscriptionId]
+    );
+    if (bySubscription.rows.length && bySubscription.rows[0].user_id != null) {
+      return bySubscription.rows[0].user_id;
+    }
+  }
+  if (stripeCustomerId) {
+    const byCustomer = await db.query(
+      `SELECT user_id FROM subscriptions
+       WHERE stripe_customer_id = $1
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [stripeCustomerId]
+    );
+    if (byCustomer.rows.length && byCustomer.rows[0].user_id != null) {
+      return byCustomer.rows[0].user_id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Upsert a Stripe invoice by stripe_invoice_id. An unresolved owner is stored
+ * as NULL and never fails the webhook; a transient DB error still propagates
+ * so Stripe retries the delivery.
+ */
+async function upsertInvoice(invoice) {
+  if (!invoice || !invoice.id) {
+    console.warn('[STRIPE] Invoice event without an invoice id — skipping');
+    return { handled: false, reason: 'missing invoice id' };
+  }
+
+  const stripeInvoiceId = String(invoice.id);
+  const stripeCustomerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : (invoice.customer && invoice.customer.id) || null;
+  const stripeSubscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : (invoice.subscription && invoice.subscription.id) || null;
+
+  let userId = null;
+  try {
+    userId = await resolveInvoiceOwner({ stripeSubscriptionId, stripeCustomerId });
+  } catch (err) {
+    console.error(`[STRIPE] Failed to resolve the owner of invoice ${stripeInvoiceId}:`, err.message);
+  }
+  if (userId == null) {
+    console.warn(`[STRIPE] Invoice ${stripeInvoiceId} has no resolvable owner — storing without user_id`);
+  }
+
+  await db.query(
+    `INSERT INTO invoices
+       (user_id, stripe_invoice_id, stripe_customer_id, stripe_subscription_id,
+        amount_due, amount_paid, currency, status, hosted_invoice_url, invoice_pdf,
+        period_start, period_end)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (stripe_invoice_id) DO UPDATE SET
+       user_id = COALESCE(EXCLUDED.user_id, invoices.user_id),
+       stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, invoices.stripe_customer_id),
+       stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, invoices.stripe_subscription_id),
+       amount_due = EXCLUDED.amount_due,
+       amount_paid = EXCLUDED.amount_paid,
+       currency = EXCLUDED.currency,
+       status = EXCLUDED.status,
+       hosted_invoice_url = EXCLUDED.hosted_invoice_url,
+       invoice_pdf = EXCLUDED.invoice_pdf,
+       period_start = EXCLUDED.period_start,
+       period_end = EXCLUDED.period_end,
+       updated_at = CURRENT_TIMESTAMP`,
+    [
+      userId,
+      stripeInvoiceId,
+      stripeCustomerId,
+      stripeSubscriptionId,
+      invoice.amount_due ?? null,
+      invoice.amount_paid ?? null,
+      invoice.currency ?? null,
+      invoice.status ?? null,
+      invoice.hosted_invoice_url ?? null,
+      invoice.invoice_pdf ?? null,
+      toIsoTimestamp(invoice.period_start),
+      toIsoTimestamp(invoice.period_end)
+    ]
+  );
+
+  return { handled: true };
 }
 
 /**
@@ -360,6 +487,11 @@ async function handleWebhookEvent(event) {
       }
       return { handled: true };
     }
+
+    case 'invoice.paid':
+    case 'invoice.payment_succeeded':
+    case 'invoice.payment_failed':
+      return upsertInvoice(event.data && event.data.object);
 
     default:
       return { handled: false, reason: `unhandled event type ${event.type}` };

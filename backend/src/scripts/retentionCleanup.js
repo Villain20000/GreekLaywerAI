@@ -9,6 +9,7 @@
 // The same summary is written to the audit log by runRetention().
 //
 // Pruning key per table (see services/retention.js):
+//   users           → deletion_scheduled_for (elapsed grace period)
 //   conversations   → updated_at (activity-based: active chats survive)
 //   legal_documents → created_at (age-based)
 //   audit_log       → created_at (age-based)
@@ -22,8 +23,8 @@ async function main() {
   const summary = await runRetention();
   console.log(
     `[RETENTION] cleanup complete: ` +
-    `conversations=${summary.conversations} documents=${summary.documents} ` +
-    `audit_log=${summary.auditLog}`
+    `accounts=${summary.accounts} conversations=${summary.conversations} ` +
+    `documents=${summary.documents} audit_log=${summary.auditLog}`
   );
   return summary;
 }

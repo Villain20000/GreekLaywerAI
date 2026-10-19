@@ -4,6 +4,7 @@ import { BehaviorSubject } from 'rxjs';
 import { MenuComponent } from './menu.component';
 import { AuthService, AuthUser } from '../../services/auth.service';
 import { ThemeService } from '../../services/theme.service';
+import { FeatureFlagsService } from '../../services/feature-flags.service';
 import { lookupTranslation, provideTestTranslate } from '../../i18n/testing';
 
 /**
@@ -29,6 +30,8 @@ describe('MenuComponent (responsive + keyboard)', () => {
     logout: jasmine.Spy;
   };
   let themeStub: { current: 'dark' | 'light'; toggle: jasmine.Spy };
+  let flags: Record<string, boolean>;
+  let featureFlagsStub: { ensureLoaded: jasmine.Spy; isEnabled: jasmine.Spy };
 
   const user: AuthUser = {
     id: 7,
@@ -44,12 +47,20 @@ describe('MenuComponent (responsive + keyboard)', () => {
       logout: jasmine.createSpy('logout')
     };
     themeStub = { current: 'dark', toggle: jasmine.createSpy('toggle') };
+    flags = { billing: true, documents: true, audio: true, adminDocuments: true };
+    featureFlagsStub = {
+      ensureLoaded: jasmine.createSpy('ensureLoaded').and.returnValue(Promise.resolve()),
+      isEnabled: jasmine.createSpy('isEnabled').and.callFake(
+        (flag: string) => flags[flag] !== false
+      )
+    };
 
     await TestBed.configureTestingModule({
       imports: [MenuComponent, RouterTestingModule],
       providers: [
         { provide: AuthService, useValue: authStub },
         { provide: ThemeService, useValue: themeStub },
+        { provide: FeatureFlagsService, useValue: featureFlagsStub },
         // 2-8 (i18n): the nav template (and the embedded language switcher)
         // use the `translate` pipe, so the spec needs the ngx-translate
         // providers (TranslateStore is not `providedIn: 'root'` in
@@ -148,5 +159,62 @@ describe('MenuComponent (responsive + keyboard)', () => {
 
     expect(component.userMenuOpen()).toBeFalse();
     expect(authStub.logout).toHaveBeenCalled();
+  });
+
+  describe('feature-flag gating', () => {
+    function menuLinkLabels(): string[] {
+      const links = fixture.nativeElement.querySelectorAll(
+        '#nl-menu-links .nl-menu-link'
+      ) as NodeListOf<Element>;
+      return Array.from(links).map((el) => (el.textContent || '').trim());
+    }
+
+    function dropdownLabels(): string[] {
+      component.toggleUserMenu();
+      fixture.detectChanges();
+      const links = fixture.nativeElement.querySelectorAll(
+        '#nl-menu-dropdown a'
+      ) as NodeListOf<Element>;
+      return Array.from(links).map((el) => (el.textContent || '').trim());
+    }
+
+    it('shows documents and billing by default while keeping chat visible', () => {
+      const labels = menuLinkLabels();
+
+      expect(labels).toContain(elCopy('nav.chat'));
+      expect(labels).toContain(elCopy('nav.documents'));
+      expect(labels).toContain(elCopy('nav.plans'));
+      expect(dropdownLabels()).toContain(elCopy('nav.subscription'));
+    });
+
+    it('hides the Documents link when documents is disabled', () => {
+      flags['documents'] = false;
+      fixture.detectChanges();
+
+      const labels = menuLinkLabels();
+      expect(labels).not.toContain(elCopy('nav.documents'));
+      expect(labels).toContain(elCopy('nav.chat'));
+      expect(labels).toContain(elCopy('nav.conversations'));
+    });
+
+    it('hides Billing and Subscriptions when billing is disabled', () => {
+      flags['billing'] = false;
+      fixture.detectChanges();
+
+      expect(menuLinkLabels()).not.toContain(elCopy('nav.plans'));
+      const dropdown = dropdownLabels();
+      expect(dropdown).not.toContain(elCopy('nav.subscription'));
+      expect(dropdown).toContain(elCopy('nav.profile'));
+    });
+
+    it('hides admin-documents when adminDocuments is disabled but keeps admin', () => {
+      authStub.isAdmin = true;
+      flags['adminDocuments'] = false;
+      fixture.detectChanges();
+
+      const labels = menuLinkLabels();
+      expect(labels).toContain(elCopy('nav.admin'));
+      expect(labels).not.toContain(elCopy('nav.adminDocuments'));
+    });
   });
 });

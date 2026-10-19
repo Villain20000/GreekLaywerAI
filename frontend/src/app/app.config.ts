@@ -1,6 +1,7 @@
 import {
   APP_INITIALIZER,
   ApplicationConfig,
+  ErrorHandler,
   LOCALE_ID,
   importProvidersFrom
 } from '@angular/core';
@@ -8,11 +9,14 @@ import { HttpClient, provideHttpClient } from '@angular/common/http';
 import { registerLocaleData } from '@angular/common';
 import localeEl from '@angular/common/locales/el';
 import { provideRouter, TitleStrategy, withInMemoryScrolling } from '@angular/router';
+import { provideServiceWorker } from '@angular/service-worker';
 import { TranslateLoader, TranslateModule } from '@ngx-translate/core';
 import { TranslateHttpLoader } from '@ngx-translate/http-loader';
 import { routes } from './app.routes';
+import { environment } from '../environments/environment';
 import { LanguageService } from './i18n/language.service';
 import { TranslatedTitleStrategy } from './i18n/translated-title.strategy';
+import { GlobalErrorHandler } from './services/global-error-handler';
 
 // 2-8 (i18n): Greek-first locale data for the date/number/currency pipes.
 // Angular 17 cannot swap LOCALE_ID at runtime without recreating the root
@@ -69,6 +73,15 @@ export const appConfig: ApplicationConfig = {
     },
     { provide: LOCALE_ID, useValue: 'el-GR' },
     // 2-8 (i18n): tab titles resolve `data.titleKey` per language.
-    { provide: TitleStrategy, useClass: TranslatedTitleStrategy }
+    { provide: TitleStrategy, useClass: TranslatedTitleStrategy },
+    // Resilience: surface unhandled errors in the shell instead of failing
+    // silently, and optionally report them upstream.
+    { provide: ErrorHandler, useClass: GlobalErrorHandler },
+    // PWA: the service worker is only generated and registered in production
+    // builds; dev builds keep the normal dev-server/HMR flow.
+    provideServiceWorker('ngsw-worker.js', {
+      enabled: environment.production,
+      registrationStrategy: 'registerWhenStable:30000'
+    })
   ]
 };

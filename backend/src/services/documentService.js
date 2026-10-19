@@ -6,10 +6,12 @@
 // in one transaction (1-9).
 //
 // file_url is intentionally always NULL until object storage exists; the
-// column is retained for forward compatibility (see database/init/schema.sql).
+// original upload bytes are persisted in `original_file` (BYTEA) together
+// with `file_size` so the exact file can be downloaded (see schema.sql).
 
 const db = require('../config/db');
 const ollamaService = require('./ollamaService');
+const ocrService = require('./ocrService');
 const { logAudit } = require('./auditLog');
 
 // Lazy requires so tests that never touch PDFs/DOCX don't pay the load cost.
@@ -184,9 +186,22 @@ async function extractMetadata(buffer, { contentType, filename, title }) {
 }
 
 /**
+ * Derive a page count from OCR page separators when pdf-parse could not
+ * report `numpages` (e.g. the PDF metadata pass failed but mupdf rendered it).
+ */
+function countOcrPages(text) {
+  const labels = [...String(text || '').matchAll(/--- Σελίδα (\d+) ---/g)]
+    .map((match) => Number(match[1]));
+  return labels.length > 0 ? Math.max(...labels) : 1;
+}
+
+/**
  * Full ingest pipeline: extract → chunk → embed → persist.
  * Returns the created document row (without the raw parsed_text for
  * the response envelope, which can be huge).
+ *
+ * Scanned PDFs (no text layer) are rasterized and OCRed before chunking.
+ * OCR failures are non-fatal: the upload is stored without text.
  *
  * 1-9 atomicity + batching:
  *   - All embeddings are computed BEFORE any row is written, using a
@@ -201,11 +216,33 @@ async function processAndStoreDocument(userId, file, detectedType, title) {
   const normalizedTitle = typeof title === 'string' && title.trim()
     ? title.trim().slice(0, 255)
     : null;
-  const { meta, text } = await extractMetadata(file.buffer, {
+  const extraction = await extractMetadata(file.buffer, {
     contentType: detectedType,
     filename: file.originalname,
     title: normalizedTitle
   });
+  const { meta } = extraction;
+  let { text } = extraction;
+
+  if (detectedType === 'application/pdf' && !text.trim()) {
+    try {
+      text = await ocrService.ocrPdf(file.buffer);
+      meta.ocr_applied = true;
+      if (!(Number.isFinite(meta.page_count) && meta.page_count > 0)) {
+        meta.page_count = countOcrPages(text);
+      }
+      meta.char_count = text.length;
+      meta.word_count = (text.match(/\S+/g) || []).length;
+    } catch (error) {
+      // Keep the upload successful; the file is stored without parsed text.
+      text = '';
+      meta.char_count = 0;
+      meta.word_count = 0;
+      console.warn(
+        `[DOC] OCR failed for textless PDF (${error.code || 'OCR_ERROR'}): ${error.message}`
+      );
+    }
+  }
 
   const chunks = chunkText(text);
 
@@ -214,7 +251,7 @@ async function processAndStoreDocument(userId, file, detectedType, title) {
     ollamaService.generateEmbedding(chunk)
   );
 
-  // file_url stays NULL — see the header note (no storage backend yet).
+  // file_url stays NULL — the original bytes live in original_file.
   const client = await db.connect();
   let document;
   try {
@@ -222,10 +259,20 @@ async function processAndStoreDocument(userId, file, detectedType, title) {
 
     const docResult = await client.query(
       `INSERT INTO legal_documents
-         (user_id, filename, title, file_url, content_type, parsed_text, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, user_id, filename, title, content_type, metadata, created_at`,
-      [userId, file.originalname, normalizedTitle, null, detectedType, text || null, JSON.stringify(meta)]
+         (user_id, filename, title, file_url, content_type, parsed_text, metadata, original_file, file_size)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, user_id, filename, title, content_type, metadata, file_size, created_at`,
+      [
+        userId,
+        file.originalname,
+        normalizedTitle,
+        null,
+        detectedType,
+        text || null,
+        JSON.stringify(meta),
+        file.buffer,
+        file.buffer.length
+      ]
     );
     document = docResult.rows[0];
 

@@ -1,10 +1,19 @@
 User-agent: *
-Disallow: /admin
 Allow: /
+Disallow: /admin
+Disallow: /admin-login
 
 # Authenticated application views are not useful to crawlers.
 Disallow: /chat
 Disallow: /documents
 Disallow: /conversations
 Disallow: /billing
+Disallow: /subscriptions
 Disallow: /profile
+Disallow: /change-password
+
+# Token-driven utility pages (reset links, email verification).
+Disallow: /reset-password
+Disallow: /verify-email
+
+Sitemap: https://your-domain.gr/sitemap.xml

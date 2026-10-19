@@ -8,5 +8,11 @@
  */
 export const environment = {
   production: true,
-  apiBaseUrl: ''
+  apiBaseUrl: '',
+  // Empty disables client-error reporting. Set to an absolute URL or a
+  // same-origin path (e.g. '/api/client-errors') to enable the POST.
+  errorReportingUrl: '',
+  // Empty disables Sentry; set at build time to enable error reporting.
+  sentryDsn: '',
+  sentryTracesSampleRate: 0
 };

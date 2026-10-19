@@ -51,9 +51,6 @@ const FORGOT_PASSWORD_TEMPLATE = require(
 const RESET_PASSWORD_TEMPLATE = require(
   '../components/reset-password/reset-password.component.html?ngResource'
 ) as string;
-const VERIFY_EMAIL_TEMPLATE = require(
-  '../components/verify-email/verify-email.component.html?ngResource'
-) as string;
 const MAGIC_LOGIN_TEMPLATE = require(
   '../components/magic-login/magic-login.component.html?ngResource'
 ) as string;
@@ -89,9 +86,9 @@ const CHANGE_PASSWORD_TEMPLATE = require(
  *
  * How the derivation works:
  *
- *  - **Templates.** The seven auth components keep their template in a
+ *  - **Templates.** The six auth components keep their template in a
  *    dedicated `.html` file, which webpack hands over verbatim through the
- *    CLI's `?ngResource` query. The other eight keep the template INLINE
+ *    CLI's `?ngResource` query. The other nine keep the template INLINE
  *    in the `.ts` file; there the only runtime handle on that text is the
  *    component's own decorator metadata (`__annotations__`), which the JIT
  *    compiler copies into the component definition without altering it.
@@ -164,6 +161,7 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'chat.inputPlaceholder',
     'chat.legalSource',
     'chat.legislation',
+    'chat.loadOlder',
     'chat.messagesAria',
     'chat.newConversation',
     'chat.noConversations',
@@ -287,6 +285,9 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'billing.upgradeError'
   ],
   subscriptions: [
+    'billing.reactivate',
+    'billing.reactivateError',
+    'billing.reactivatedOk',
     'subscriptions.cancel',
     'subscriptions.cancelBack',
     'subscriptions.cancelError',
@@ -295,18 +296,32 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'subscriptions.cancelledOk',
     'subscriptions.changePlan',
     'subscriptions.colCreated',
+    'subscriptions.colInvoiceAmount',
+    'subscriptions.colInvoiceDate',
+    'subscriptions.colInvoiceLink',
+    'subscriptions.colInvoiceStatus',
     'subscriptions.colPeriodEnd',
     'subscriptions.colStatus',
     'subscriptions.current',
+    'subscriptions.downloadPdf',
     'subscriptions.expires',
     'subscriptions.history',
     'subscriptions.historyAria',
     'subscriptions.historyEmpty',
     'subscriptions.loadError',
+    'subscriptions.nextPage',
     'subscriptions.none',
+    'subscriptions.pageOf',
+    'subscriptions.paymentHistory',
+    'subscriptions.paymentHistoryAria',
+    'subscriptions.paymentHistoryEmpty',
+    'subscriptions.paymentHistoryError',
+    'subscriptions.paymentHistoryLoading',
     'subscriptions.planLabel',
+    'subscriptions.prevPage',
     'subscriptions.status',
-    'subscriptions.title'
+    'subscriptions.title',
+    'subscriptions.viewInvoice'
   ],
   profile: [
     'profile.account',
@@ -317,6 +332,23 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'profile.deleteError',
     'profile.deleteMessage',
     'profile.deleteTitle',
+    'profile.deletionScheduledTitle',
+    'profile.deletionScheduledMessage',
+    'profile.cancelDeletion',
+    'profile.deletionCancelled',
+    'profile.cancelDeletionError',
+    'profile.emailChangeCurrentPassword',
+    'profile.emailChangeEmailPlaceholder',
+    'profile.emailChangeHint',
+    'profile.emailChangeInvalidEmail',
+    'profile.emailChangeNewEmail',
+    'profile.emailChangePasswordRequired',
+    'profile.emailChangeSameEmail',
+    'profile.emailChangeSent',
+    'profile.emailChangeSubmit',
+    'profile.emailChangeSubmitting',
+    'profile.emailChangeTitle',
+    'profile.emailChangeWrongPassword',
     'profile.export',
     'profile.exportError',
     'profile.exportOk',
@@ -397,6 +429,7 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'admin.users.youTitle'
   ],
   adminDocuments: [
+    'adminDocuments.clear',
     'adminDocuments.colChunks',
     'adminDocuments.colFile',
     'adminDocuments.colType',
@@ -408,8 +441,16 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'adminDocuments.deleteTitle',
     'adminDocuments.empty',
     'adminDocuments.loadError',
+    'adminDocuments.loading',
+    'adminDocuments.next',
+    'adminDocuments.pager',
+    'adminDocuments.previous',
+    'adminDocuments.search',
+    'adminDocuments.searchPlaceholder',
     'adminDocuments.tableAria',
     'adminDocuments.title',
+    'adminDocuments.userIdAria',
+    'adminDocuments.userIdPlaceholder',
     'common.cancel'
   ],
   // The seven auth surfaces. Each group holds the keys the component
@@ -497,6 +538,9 @@ const COMPONENT_KEYS: Readonly<Record<string, readonly string[]>> = {
     'common.passwordsMismatch'
   ],
   authVerify: [
+    'auth.verify.changeInvalid',
+    'auth.verify.changeSuccess',
+    'auth.verify.changeWaiting',
     'auth.verify.invalid',
     'auth.verify.success',
     'auth.verify.title',
@@ -574,10 +618,9 @@ const LANGUAGES: readonly AppLanguage[] = ['el', 'en'];
  * Where the keys of every component group are read from at runtime.
  *
  * `template` — the component's template file, handed over verbatim by
- *   webpack (`?ngResource` → `asset/source`). Only the seven auth
- *   components have one; the other eight keep their template inline in
- *   the `.ts` file, where it is read from the component's own metadata
- *   instead (see `inlineTemplate`).
+ *   webpack (`?ngResource` → `asset/source`). Six auth components have one;
+ *   the rest keep their template inline in the `.ts` file, where it is
+ *   read from the component's own metadata instead (see `inlineTemplate`).
  * `component` — the component class. Its decorator metadata carries the
  *   template, and its compiled source carries the `translate.instant()`
  *   calls and the keys passed to component-local helpers.
@@ -610,7 +653,6 @@ const COMPONENT_SOURCES: Readonly<Record<string, ComponentSources>> = {
     component: ResetPasswordComponent
   },
   authVerify: {
-    template: [VERIFY_EMAIL_TEMPLATE],
     component: VerifyEmailComponent
   },
   authMagic: { template: [MAGIC_LOGIN_TEMPLATE], component: MagicLoginComponent },

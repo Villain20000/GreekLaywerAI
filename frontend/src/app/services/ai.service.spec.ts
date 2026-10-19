@@ -1,5 +1,5 @@
 import { TestBed } from '@angular/core/testing';
-import { AiService, RESPONSE_TIMEOUT_NOTICE } from './ai.service';
+import { AiAnswer, AiService, RESPONSE_TIMEOUT_NOTICE } from './ai.service';
 import { QuotaExceededError } from './quota.service';
 
 function jsonResponse(body: Record<string, unknown>, status = 200): Response {
@@ -11,8 +11,28 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   } as unknown as Response;
 }
 
+function sseResponse(chunks: string[], status = 200): Response {
+  const encoder = new TextEncoder();
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      }
+    }),
+    json: () => Promise.resolve({}),
+    text: () => Promise.resolve(chunks.join(''))
+  } as unknown as Response;
+}
+
 function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+async function flushTimes(times: number): Promise<void> {
+  for (let i = 0; i < times; i += 1) await flush();
 }
 
 describe('AiService', () => {
@@ -31,14 +51,16 @@ describe('AiService', () => {
 
   afterEach(() => {
     window.fetch = originalFetch;
+    localStorage.removeItem('nomos_token');
   });
 
   it('should be created', () => {
     expect(service).toBeTruthy();
   });
 
-  it('should have streamQuery method', () => {
+  it('should have streamQuery and streamQueryLive methods', () => {
     expect(typeof service.streamQuery).toBe('function');
+    expect(typeof service.streamQueryLive).toBe('function');
   });
 
   it('should have uploadAudio method', () => {
@@ -232,5 +254,204 @@ describe('AiService', () => {
     expect(received).not.toBeNull();
     expect(received!).not.toBeInstanceOf(QuotaExceededError);
     expect(received!.message).toBe('Enqueue failed (HTTP 500)');
+  });
+
+  // ------------------------------------------------------------------
+  // Live SSE token streaming.
+  // ------------------------------------------------------------------
+
+  it('consumes SSE chunks, emits partial answers and completes with the final result', async () => {
+    localStorage.setItem('nomos_token', 'jwt-live');
+    fetchSpy.and.callFake((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/query/live')) return Promise.resolve(jsonResponse({ jobId: 'live-1' }, 202));
+      if (url.includes('/query/live/live-1/events')) {
+        return Promise.resolve(sseResponse([
+          ': connected\n\n',
+          'event: chunk\ndata: {"content":"Γεια "}\n\n',
+          'event: chunk\ndata: {"content":"σου"}\n\n',
+          'event: done\ndata: {"result":"Γεια σου","messageId":"12","sources":[],"confidence":0.4}\n\n'
+        ]));
+      }
+      return Promise.resolve(jsonResponse({}));
+    });
+
+    const emissions: AiAnswer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      service.streamQueryLive('ερώτηση').subscribe({
+        next: answer => emissions.push(answer),
+        error: reject,
+        complete: resolve
+      });
+    });
+
+    expect(emissions.map(answer => answer.content)).toEqual(['Γεια ', 'σου', 'Γεια σου']);
+    expect(emissions[0].partial).toBeTrue();
+    expect(emissions[1].partial).toBeTrue();
+    expect(emissions[2].partial).toBeUndefined();
+    expect(emissions[2].messageId).toBe(12);
+    expect(emissions[2].confidence).toBe(0.4);
+
+    const calls = fetchSpy.calls.all();
+    const enqueue = calls.find(call => String(call.args[0]).endsWith('/query/live'));
+    expect(enqueue).toBeDefined();
+    expect((enqueue!.args[1] as RequestInit).method).toBe('POST');
+    expect(new Headers((enqueue!.args[1] as RequestInit).headers).get('Authorization'))
+      .toBe('Bearer jwt-live');
+
+    const events = calls.find(call => String(call.args[0]).includes('/query/live/live-1/events'));
+    expect(events).toBeDefined();
+    expect(new Headers((events!.args[1] as RequestInit).headers).get('Authorization'))
+      .toBe('Bearer jwt-live');
+  });
+
+  it('joins multi-line SSE data and ignores heartbeat comments', async () => {
+    fetchSpy.and.callFake((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/query/live')) return Promise.resolve(jsonResponse({ jobId: 'live-multi' }));
+      if (url.includes('/events')) {
+        return Promise.resolve(sseResponse([
+          ': heartbeat\n\n',
+          'event: chunk\ndata: {"content":\ndata: "Α"}\n\n',
+          'event: done\ndata: {"result":"Α","messageId":null,"sources":[],"confidence":0}\n\n'
+        ]));
+      }
+      return Promise.resolve(jsonResponse({}));
+    });
+
+    const contents: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      service.streamQueryLive('ερώτηση').subscribe({
+        next: answer => contents.push(answer.content),
+        error: reject,
+        complete: resolve
+      });
+    });
+
+    expect(contents).toEqual(['Α', 'Α']);
+  });
+
+  it('cancels the live stream and deletes the queued job on unsubscribe', async () => {
+    let eventsSignal: AbortSignal | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start() { /* keep the connection open */ }
+    });
+    fetchSpy.and.callFake((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'DELETE') return Promise.resolve(jsonResponse({ ok: true }));
+      if (url.endsWith('/query/live')) return Promise.resolve(jsonResponse({ jobId: 'live-2' }));
+      if (url.includes('/query/live/live-2/events')) {
+        eventsSignal = init?.signal ?? undefined;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          body: stream,
+          json: () => Promise.resolve({})
+        } as unknown as Response);
+      }
+      return Promise.resolve(jsonResponse({}));
+    });
+
+    const subscription = service.streamQueryLive('ερώτηση').subscribe();
+    await flushTimes(4);
+
+    subscription.unsubscribe();
+    await flushTimes(2);
+
+    expect(eventsSignal).toBeDefined();
+    expect(eventsSignal!.aborted).toBeTrue();
+    const deleteCall = fetchSpy.calls.all().find(call => call.args[1]?.method === 'DELETE');
+    expect(deleteCall).toBeDefined();
+    expect(String(deleteCall!.args[0])).toContain('/api/ai/query/stream/live-2');
+  });
+
+  it('falls back to polling the same job when the SSE connection fails before content', async () => {
+    service.pollIntervalMs = 1;
+    fetchSpy.and.callFake((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/query/live')) return Promise.resolve(jsonResponse({ jobId: 'live-3' }));
+      if (url.includes('/query/live/live-3/events')) {
+        return Promise.resolve(jsonResponse({ error: 'Job not found' }, 404));
+      }
+      if (url.endsWith('/query/stream/live-3')) {
+        return Promise.resolve(jsonResponse({
+          status: 'completed',
+          result: 'απάντηση από polling',
+          messageId: 31,
+          sources: [],
+          confidence: 0.3
+        }));
+      }
+      return Promise.resolve(jsonResponse({}));
+    });
+
+    const emissions: AiAnswer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      service.streamQueryLive('ερώτηση').subscribe({
+        next: answer => emissions.push(answer),
+        error: reject,
+        complete: resolve
+      });
+    });
+
+    expect(emissions.length).toBe(1);
+    expect(emissions[0].content).toBe('απάντηση από polling');
+    expect(emissions[0].messageId).toBe(31);
+    expect(fetchSpy.calls.all().some(call => String(call.args[0]).endsWith('/query/stream/live-3')))
+      .toBeTrue();
+  });
+
+  it('falls back to the legacy enqueue+poll path when the live endpoint is unavailable', async () => {
+    service.pollIntervalMs = 1;
+    fetchSpy.and.callFake((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/query/live')) return Promise.resolve(jsonResponse({ error: 'Not found' }, 404));
+      if (url.endsWith('/query/stream')) return Promise.resolve(jsonResponse({ jobId: 'legacy-1' }));
+      if (url.endsWith('/query/stream/legacy-1')) {
+        return Promise.resolve(jsonResponse({
+          status: 'completed',
+          result: 'απάντηση legacy',
+          messageId: null,
+          sources: [],
+          confidence: 0
+        }));
+      }
+      return Promise.resolve(jsonResponse({}));
+    });
+
+    const emissions: AiAnswer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      service.streamQueryLive('ερώτηση').subscribe({
+        next: answer => emissions.push(answer),
+        error: reject,
+        complete: resolve
+      });
+    });
+
+    expect(emissions.map(answer => answer.content)).toEqual(['απάντηση legacy']);
+    const posts = fetchSpy.calls.all()
+      .filter(call => call.args[1]?.method === 'POST')
+      .map(call => String(call.args[0]));
+    expect(posts.some(url => url.endsWith('/query/live'))).toBeTrue();
+    expect(posts.some(url => url.endsWith('/query/stream'))).toBeTrue();
+  });
+
+  it('surfaces a quota error from the live enqueue without falling back', async () => {
+    fetchSpy.and.returnValue(Promise.resolve(jsonResponse({
+      error: 'Daily AI query limit reached for your plan',
+      limit: 20,
+      used: 20,
+      tier: 'basic',
+      resetAt: '2026-01-02T00:00:00.000Z'
+    }, 429)));
+
+    let received: Error | null = null;
+    service.streamQueryLive('ερώτηση').subscribe({ error: err => { received = err; } });
+    await flushTimes(2);
+
+    expect(received).toBeInstanceOf(QuotaExceededError);
+    expect((received as unknown as { stage?: string }).stage).toBe('enqueue');
+    const posts = fetchSpy.calls.all().filter(call => call.args[1]?.method === 'POST');
+    expect(posts.length).toBe(1);
   });
 });

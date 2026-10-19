@@ -1,0 +1,199 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nomosai-backend
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai-backend
+    app.kubernetes.io/part-of: nomosai
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nomosai-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nomosai-backend
+        app.kubernetes.io/part-of: nomosai
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nomosai-backend
+      containers:
+        - name: backend
+          image: registry.example.com/nomosai/backend:REPLACE_ME
+          imagePullPolicy: IfNotPresent
+          # Keep the working directory on the writable /tmp volume so OCR
+          # language caches and other transient files work read-only.
+          command: ["node", "/usr/src/app/src/index.js"]
+          workingDir: /tmp
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: nomosai-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: DB_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: JWT_SECRET
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: STRIPE_SECRET_KEY
+            - name: STRIPE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: STRIPE_WEBHOOK_SECRET
+            - name: SMTP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: SMTP_USER
+                  optional: true
+            - name: SMTP_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: SMTP_PASS
+                  optional: true
+            - name: SENTRY_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: SENTRY_DSN
+                  optional: true
+            # Web replicas must not run the inference worker; worker.yaml owns
+            # the single GPU-safe consumer.
+            - name: QUEUE_WORKER_ENABLED
+              value: "false"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # Liveness is process-level: /health also checks PostgreSQL/Redis,
+          # so an external outage must not restart every backend pod.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai-backend
+    app.kubernetes.io/part-of: nomosai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nomosai-backend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nomosai-backend
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai-backend
+    app.kubernetes.io/part-of: nomosai
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nomosai-backend
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60

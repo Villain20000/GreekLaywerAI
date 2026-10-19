@@ -11,6 +11,7 @@ import { RouterLink, RouterLinkActive } from '@angular/router';
 import { TranslatePipe } from '@ngx-translate/core';
 import { AuthService, AuthUser } from '../../services/auth.service';
 import { ThemeService } from '../../services/theme.service';
+import { FeatureFlagsService } from '../../services/feature-flags.service';
 import { LanguageSwitcherComponent } from '../../i18n/language-switcher.component';
 
 @Component({
@@ -64,7 +65,8 @@ import { LanguageSwitcherComponent } from '../../i18n/language-switcher.componen
           </svg>
           <span>{{ 'nav.chat' | translate }}</span>
         </a>
-        <a routerLink="/documents"
+        <a *ngIf="featureFlags.isEnabled('documents')"
+           routerLink="/documents"
            routerLinkActive="active"
            class="nl-menu-link"
            [attr.title]="'nav.documentsTitle' | translate">
@@ -82,7 +84,8 @@ import { LanguageSwitcherComponent } from '../../i18n/language-switcher.componen
           </svg>
           <span>{{ 'nav.conversations' | translate }}</span>
         </a>
-        <a routerLink="/billing"
+        <a *ngIf="featureFlags.isEnabled('billing')"
+           routerLink="/billing"
            routerLinkActive="active"
            class="nl-menu-link"
            [attr.title]="'nav.plansTitle' | translate">
@@ -103,7 +106,7 @@ import { LanguageSwitcherComponent } from '../../i18n/language-switcher.componen
           <span>{{ 'nav.admin' | translate }}</span>
         </a>
         <!-- 2-4: /admin/documents existed but was orphaned; expose it to admins. -->
-        <a *ngIf="auth.isAdmin"
+        <a *ngIf="auth.isAdmin && featureFlags.isEnabled('adminDocuments')"
            routerLink="/admin/documents"
            routerLinkActive="active"
            class="nl-menu-link"
@@ -166,7 +169,9 @@ import { LanguageSwitcherComponent } from '../../i18n/language-switcher.componen
             <div class="nl-menu-dropdown-role" [class.admin]="u.role === 'admin'">{{ u.role }}</div>
             <div class="nl-menu-dropdown-divider"></div>
             <a routerLink="/profile" (click)="closeUserMenu()">{{ 'nav.profile' | translate }}</a>
-            <a routerLink="/subscriptions" (click)="closeUserMenu()">{{ 'nav.subscription' | translate }}</a>
+            <a *ngIf="featureFlags.isEnabled('billing')"
+               routerLink="/subscriptions"
+               (click)="closeUserMenu()">{{ 'nav.subscription' | translate }}</a>
             <a routerLink="/change-password" (click)="closeUserMenu()">{{ 'nav.changePassword' | translate }}</a>
             <button type="button" (click)="logout()">{{ 'nav.signOut' | translate }}</button>
           </div>
@@ -197,12 +202,14 @@ export class MenuComponent implements OnInit {
   constructor(
     public auth: AuthService,
     public theme: ThemeService,
+    public featureFlags: FeatureFlagsService,
     private elementRef: ElementRef<HTMLElement>
   ) {}
 
   ngOnInit(): void {
-    // No-op: ThemeService constructor already set the document attribute,
-    // AuthService already hydrated from localStorage. Nothing to async-load.
+    // The service memoizes the public /api/config request; callers only
+    // trigger it, they never await it (nav hides no core links on failure).
+    void this.featureFlags.ensureLoaded();
   }
 
   initials(u: AuthUser): string {

@@ -16,7 +16,11 @@ CREATE TABLE users (
     -- `/api/auth/login` rejects unverified accounts with 400 "Email not
     -- verified". `verified_at TIMESTAMPTZ` (rather than BOOLEAN) lets us
     -- audit WHEN verification happened.
-    verified_at TIMESTAMPTZ
+    verified_at TIMESTAMPTZ,
+    -- Deletion grace period: when set, the account is purged by the
+    -- retention job once this timestamp passes. The user can cancel any
+    -- time before then (POST /api/gdpr/cancel-deletion).
+    deletion_scheduled_for TIMESTAMPTZ
 );
 
 -- Subscriptions Table
@@ -34,6 +38,29 @@ CREATE TABLE subscriptions (
 CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_stripe_subscription_id_uidx
     ON subscriptions(stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS subscriptions_user_id_idx ON subscriptions(user_id);
+
+-- Invoices (payment history). Populated by the Stripe webhook handler from
+-- invoice.paid / invoice.payment_failed. `stripe_invoice_id` is the idempotency
+-- key: webhook replays upsert instead of duplicating rows.
+CREATE TABLE IF NOT EXISTS invoices (
+    id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
+    stripe_invoice_id VARCHAR(255) UNIQUE NOT NULL,
+    stripe_customer_id VARCHAR(255),
+    stripe_subscription_id VARCHAR(255),
+    amount_due INT,
+    amount_paid INT,
+    currency VARCHAR(10),
+    status VARCHAR(50),
+    hosted_invoice_url TEXT,
+    invoice_pdf TEXT,
+    period_start TIMESTAMPTZ,
+    period_end TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS invoices_user_id_created_at_idx
+    ON invoices(user_id, created_at DESC);
 
 -- Daily usage counters (1-4): one atomic row per user / UTC day / quota kind.
 -- `day` is a UTC calendar date; quotaService resets at the next UTC midnight.
@@ -105,6 +132,10 @@ CREATE TABLE legal_documents (
     file_url VARCHAR(1024),
     content_type VARCHAR(100),
     parsed_text TEXT,
+    -- Original uploaded bytes (PDF/DOCX/TXT). Stored in Postgres so a
+    -- document row and its file are backed up and deleted atomically.
+    original_file BYTEA,
+    file_size INTEGER,
     metadata JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -246,3 +277,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS password_reset_tokens_unused_hash_uidx
     ON password_reset_tokens(token_hash) WHERE used_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS email_verification_tokens_unused_hash_uidx
     ON email_verification_tokens(token_hash) WHERE used_at IS NULL;
+
+-- Email-change verification tokens. `new_email` is the address the user
+-- asked to switch to; it only becomes users.email after the token is
+-- consumed. Same SHA-256-at-rest + single-use pattern as the other tokens.
+CREATE TABLE IF NOT EXISTS email_change_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    new_email VARCHAR(255) NOT NULL,
+    token_hash VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS email_change_tokens_token_hash_idx
+    ON email_change_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS email_change_tokens_user_id_idx
+    ON email_change_tokens(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS email_change_tokens_unused_hash_uidx
+    ON email_change_tokens(token_hash) WHERE used_at IS NULL;

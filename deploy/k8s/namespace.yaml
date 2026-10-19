@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai
+    app.kubernetes.io/part-of: nomosai

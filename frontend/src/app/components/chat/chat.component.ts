@@ -19,6 +19,9 @@ import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import gsap from 'gsap';
 
+/** Messages fetched per conversation page (initial load and "load older"). */
+const CONVERSATION_PAGE_SIZE = 50;
+
 interface Message {
   role: 'user' | 'assistant';
   content: string;
@@ -67,6 +70,13 @@ interface Message {
              announce every streaming chunk. Coarse status changes (slow,
              stop, error, completion) use the sr-only status region below. -->
         <div class="nl-chat-messages" #scrollMe [attr.aria-label]="'chat.messagesAria' | translate">
+          <button
+            *ngIf="hasMoreMessages && !isLoading"
+            type="button"
+            class="nl-btn-secondary nl-load-older"
+            [disabled]="isLoadingOlder"
+            (click)="loadOlderMessages()"
+          >{{ 'chat.loadOlder' | translate }}</button>
           <p class="nl-success-msg" *ngIf="checkoutNotice">{{ checkoutNotice }}</p>
           <div
             *ngFor="let msg of messages; let i = index"
@@ -232,6 +242,7 @@ interface Message {
   styles: [`
     .nl-quota-upgrade { margin: 0 0 var(--nl-space-4); }
     .nl-quota-upgrade-link { color: var(--nl-fg); font-weight: 600; text-decoration: underline; cursor: pointer; }
+    .nl-load-older { display: block; margin: 0 auto var(--nl-space-4); }
   `]
 })
 export class ChatComponent implements OnInit, OnDestroy {
@@ -241,6 +252,10 @@ export class ChatComponent implements OnInit, OnDestroy {
   @ViewChild('chatInput') private chatInputRef?: ElementRef<HTMLTextAreaElement>;
 
   messages: Message[] = [];
+  /** Cursor pagination state for the loaded conversation. */
+  hasMoreMessages = false;
+  olderMessagesCursor: number | null = null;
+  isLoadingOlder = false;
   documents: LegalDocument[] = [];
   selectedDocumentIds: number[] = [];
   recentConversations: Conversation[] = [];
@@ -509,6 +524,9 @@ export class ChatComponent implements OnInit, OnDestroy {
     this.conversationId = null;
     this.conversation = null;
     this.messages = [];
+    this.hasMoreMessages = false;
+    this.olderMessagesCursor = null;
+    this.isLoadingOlder = false;
     this.loadError = '';
     this.quotaError = null;
     this.isLoading = false;
@@ -535,27 +553,52 @@ export class ChatComponent implements OnInit, OnDestroy {
       const conversationId = await this.ensureConversation(prompt);
       if (this.destroyed) return;
 
-      this.responseSubscription = this.aiService.streamQuery(prompt, conversationId, this.selectedDocumentIds).subscribe({
+      this.responseSubscription = this.aiService.streamQueryLive(prompt, conversationId, this.selectedDocumentIds).subscribe({
         next: (answer: AiAnswer) => {
+          const assistant = this.messages[assistantMsgIndex];
+          if (!assistant) return;
           if (answer.pending) {
             this.isSlow = true;
             return;
           }
           this.isSlow = false;
-          this.isLoading = false;
           this.quotaError = null;
-          this.messages[assistantMsgIndex].content += answer.content;
-          this.messages[assistantMsgIndex].sources = answer.sources;
-          this.messages[assistantMsgIndex].confidence = answer.confidence;
-          this.messages[assistantMsgIndex].messageId = answer.messageId;
+
+          if (answer.partial) {
+            // Token delta: append, never replace what was already shown.
+            assistant.content += answer.content;
+            this.scrollToBottom();
+            return;
+          }
+
+          // Final answer (live `done` or polling fallback): metadata is only
+          // trusted here. The final text is authoritative, but it must not be
+          // appended again on top of the chunks that already rendered it.
+          this.isLoading = false;
+          if (answer.content) {
+            // Prefer the authoritative final text when it contains what the
+            // chunks already rendered (covers chunks missed before attach).
+            if (!assistant.content || answer.content.includes(assistant.content)) {
+              assistant.content = answer.content;
+            }
+          }
+          assistant.sources = answer.sources;
+          assistant.confidence = answer.confidence;
+          assistant.messageId = answer.messageId;
           this.scrollToBottom();
         },
         error: (err) => {
           console.error(err);
-          this.messages[assistantMsgIndex].content = this.describeError(err, 'chat.errors.model');
+          const assistant = this.messages[assistantMsgIndex];
+          if (assistant) {
+            const errorText = this.describeError(err, 'chat.errors.model');
+            assistant.content = assistant.content
+              ? `${assistant.content}\n\n${errorText}`
+              : errorText;
+            this.screenReaderStatus = errorText;
+          }
           this.isLoading = false;
           this.isSlow = false;
-          this.screenReaderStatus = this.messages[assistantMsgIndex].content;
           if (!hadConversation && (err as { stage?: string })?.stage === 'enqueue') {
             void this.removeEmptyConversation(conversationId);
           }
@@ -668,29 +711,22 @@ export class ChatComponent implements OnInit, OnDestroy {
     this.responseSubscription?.unsubscribe();
     this.responseSubscription = null;
     this.pendingConversationId = id;
+    this.hasMoreMessages = false;
+    this.olderMessagesCursor = null;
+    this.isLoadingOlder = false;
     this.isLoading = true;
     this.isSlow = false;
     this.loadError = '';
     try {
-      const result = await this.conversationsService.get(id);
+      const result = await this.conversationsService.get(id, { messageLimit: CONVERSATION_PAGE_SIZE });
       if (this.destroyed) return;
       this.conversationId = result.conversation.id;
       this.conversation = result.conversation;
-      this.messages = result.messages
-        .filter((message: StoredMessage) => message.role !== 'system')
-        .map((message: StoredMessage) => ({
-          role: message.role === 'user' ? 'user' : 'assistant',
-          content: message.content,
-          messageId: message.id,
-          feedback: typeof message.feedback_helpful === 'boolean' ? message.feedback_helpful : null,
-          feedbackSubmitted: typeof message.feedback_helpful === 'boolean',
-          sources: message.citation_metadata?.sources || [],
-          sourcesOpen: false,
-          confidence: typeof message.citation_metadata?.confidence === 'number'
-            ? message.citation_metadata.confidence
-            : null,
-          createdAt: message.created_at
-        }));
+      this.messages = this.mapStoredMessages(result.messages);
+      this.hasMoreMessages = result.hasMore === true;
+      this.olderMessagesCursor = typeof result.nextCursor === 'number'
+        ? result.nextCursor
+        : this.oldestStoredMessageId(result.messages);
       this.scrollToBottom();
     } catch (err) {
       console.error(err);
@@ -699,6 +735,81 @@ export class ChatComponent implements OnInit, OnDestroy {
       this.pendingConversationId = null;
       if (!this.destroyed) this.isLoading = false;
     }
+  }
+
+  /**
+   * Prepends the page older than the current cursor, de-duplicating ids and
+   * compensating the scroll offset so the reading position does not jump.
+   */
+  async loadOlderMessages(): Promise<void> {
+    const conversationId = this.conversationId;
+    const cursor = this.olderMessagesCursor;
+    if (this.isLoading || this.isLoadingOlder || !this.hasMoreMessages ||
+        conversationId === null || cursor === null) {
+      return;
+    }
+
+    const container = this.myScrollContainer?.nativeElement as HTMLElement | undefined;
+    const previousScrollHeight = container?.scrollHeight ?? 0;
+    const previousScrollTop = container?.scrollTop ?? 0;
+    this.isLoadingOlder = true;
+    try {
+      const result = await this.conversationsService.get(conversationId, {
+        messageLimit: CONVERSATION_PAGE_SIZE,
+        before: cursor
+      });
+      if (this.destroyed || this.conversationId !== conversationId) return;
+
+      const older = this.mapStoredMessages(result.messages);
+      const existingIds = new Set(
+        this.messages
+          .map(message => message.messageId)
+          .filter((messageId): messageId is number => typeof messageId === 'number')
+      );
+      const fresh = older.filter(
+        message => message.messageId === null || !existingIds.has(message.messageId)
+      );
+      this.messages = [...fresh, ...this.messages];
+      this.hasMoreMessages = result.hasMore === true;
+      this.olderMessagesCursor = typeof result.nextCursor === 'number'
+        ? result.nextCursor
+        : this.oldestStoredMessageId(result.messages) ?? cursor;
+      this.restoreScrollPosition(previousScrollHeight, previousScrollTop);
+    } catch (err) {
+      console.error('Unable to load older messages', err);
+    } finally {
+      this.isLoadingOlder = false;
+    }
+  }
+
+  private mapStoredMessages(stored: StoredMessage[]): Message[] {
+    return stored
+      .filter((message: StoredMessage) => message.role !== 'system')
+      .map((message: StoredMessage) => ({
+        role: message.role === 'user' ? 'user' : 'assistant',
+        content: message.content,
+        messageId: message.id,
+        feedback: typeof message.feedback_helpful === 'boolean' ? message.feedback_helpful : null,
+        feedbackSubmitted: typeof message.feedback_helpful === 'boolean',
+        sources: message.citation_metadata?.sources || [],
+        sourcesOpen: false,
+        confidence: typeof message.citation_metadata?.confidence === 'number'
+          ? message.citation_metadata.confidence
+          : null,
+        createdAt: message.created_at
+      }));
+  }
+
+  private oldestStoredMessageId(stored: StoredMessage[]): number | null {
+    return stored.length > 0 ? stored[0].id : null;
+  }
+
+  private restoreScrollPosition(previousScrollHeight: number, previousScrollTop: number): void {
+    setTimeout(() => {
+      if (this.destroyed || !this.myScrollContainer) return;
+      const element = this.myScrollContainer.nativeElement as HTMLElement;
+      element.scrollTop = previousScrollTop + (element.scrollHeight - previousScrollHeight);
+    });
   }
 
   private async loadDocuments(): Promise<void> {

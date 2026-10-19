@@ -27,6 +27,8 @@
 
 const { Queue, QueueEvents, Worker } = require('bullmq');
 const ollamaService = require('./ollamaService');
+const streamHub = require('./streamHub');
+const sentry = require('../config/sentry');
 const IORedis = require('ioredis');
 const { inferenceQueueDepth } = require('../middlewares/metrics');
 
@@ -195,10 +197,61 @@ function getQueueEvents() {
   return queueEvents;
 }
 
+function isStreamingJob(job) {
+  return Boolean(job && job.data && job.data.stream === true);
+}
+
+function terminalPayload(result, data) {
+  return {
+    result: typeof result === 'string' ? result : String(result ?? ''),
+    sources: Array.isArray(data && data.sources) ? data.sources : [],
+    confidence: Number.isFinite(Number(data && data.confidence)) ? Number(data.confidence) : 0
+  };
+}
+
+/**
+ * No-Redis streaming path: keep the inline concurrency gate (default 1) but
+ * run the inference in the background so the HTTP POST can return the job id
+ * immediately and the SSE consumer can attach before tokens start.
+ */
+function runInlineStreamingJob(job, prompt, contextStr) {
+  void (async () => {
+    await acquireInlineSlot();
+    touchQueueDepth();
+    try {
+      if (job._cancelled) return;
+      job._state = 'active';
+      const response = await ollamaService.generateResponseStream(prompt, contextStr, async (chunk) => {
+        if (job._cancelled) return;
+        await streamHub.publishChunk(job.id, chunk);
+      });
+      if (job._cancelled) return;
+      job.returnvalue = response;
+      job._state = 'completed';
+      job._completedAt = Date.now();
+      await streamHub.publishDone(job.id, terminalPayload(response, job.data));
+    } catch (err) {
+      if (job._cancelled) return;
+      sentry.captureException(err);
+      job.failedReason = err && err.message ? err.message : 'Inference failed';
+      job._state = 'failed';
+      job._completedAt = Date.now();
+      await streamHub.publishError(job.id, job.failedReason);
+    } finally {
+      adjustQueueDepth(-1);
+      releaseInlineSlot();
+    }
+  })().catch((err) => {
+    console.error('[QUEUE] Inline streaming job crashed:', err && err.message);
+  });
+}
+
 /**
  * Enqueue an inference job. Returns the BullMQ job (with a working
  * waitUntilFinished()) in production; in no-Redis environments it runs the
  * generation inline and returns a lightweight stand-in with the same shape.
+ * Streaming jobs (metadata.stream === true) are processed in the background
+ * in the inline path and stream tokens through streamHub.
  */
 async function addInferenceJob(prompt, contextStr, metadata = {}) {
   const q = getQueue();
@@ -206,6 +259,25 @@ async function addInferenceJob(prompt, contextStr, metadata = {}) {
     const id = `inline_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     adjustQueueDepth(1);
     ensureInlinePruneTimer();
+    const data = { prompt, contextStr, ...metadata };
+    if (metadata && metadata.stream === true) {
+      const now = Date.now();
+      const job = {
+        id,
+        data,
+        returnvalue: null,
+        failedReason: null,
+        _state: 'waiting',
+        _cancelled: false,
+        _lastAccessedAt: now,
+        waitUntilFinished: async () => job.returnvalue,
+        getState: async () => job._state || 'waiting'
+      };
+      inlineJobs.set(id, job);
+      runInlineStreamingJob(job, prompt, contextStr);
+      return job;
+    }
+
     await acquireInlineSlot();
     touchQueueDepth();
     try {
@@ -213,7 +285,7 @@ async function addInferenceJob(prompt, contextStr, metadata = {}) {
       const now = Date.now();
       const job = {
         id,
-        data: { prompt, contextStr, ...metadata },
+        data,
         returnvalue: response,
         failedReason: null,
         _completedAt: now,
@@ -267,7 +339,14 @@ async function getJob(jobId) {
  */
 async function cancelJob(jobId) {
   if (!jobId) return false;
-  if (inlineJobs.delete(String(jobId))) return true;
+  const inlineJob = inlineJobs.get(String(jobId));
+  if (inlineJob) {
+    // The running generation cannot be interrupted safely, but the background
+    // task checks this flag before publishing further chunks/terminal events.
+    inlineJob._cancelled = true;
+    inlineJobs.delete(String(jobId));
+    return true;
+  }
 
   const job = await getJob(jobId);
   if (!job) return false;
@@ -291,6 +370,12 @@ async function cancelJob(jobId) {
  * is never overwhelmed by parallel 128K-context RAG queries.
  */
 function startWorker() {
+  // Multi-replica deployments run the queue worker in a dedicated pod so
+  // GPU concurrency 1 is global, not per web replica.
+  if (String(process.env.QUEUE_WORKER_ENABLED || 'true').toLowerCase() === 'false') {
+    console.log('[QUEUE] Worker disabled (QUEUE_WORKER_ENABLED=false)');
+    return;
+  }
   const conn = getConnection();
   if (!conn || worker) return;
   if (workerStartPromise) return workerStartPromise;
@@ -302,7 +387,17 @@ function startWorker() {
         console.log(`[QUEUE] Processing inference job: ${job.id}`);
         const { prompt, contextStr } = job.data;
         try {
-          const response = await ollamaService.generateResponse(prompt, contextStr);
+          if (!isStreamingJob(job)) {
+            return await ollamaService.generateResponse(prompt, contextStr);
+          }
+          const response = await ollamaService.generateResponseStream(
+            prompt,
+            contextStr,
+            async (chunk) => {
+              await streamHub.publishChunk(job.id, chunk);
+            }
+          );
+          await streamHub.publishDone(job.id, terminalPayload(response, job.data));
           return response;
         } catch (err) {
           console.error(`[QUEUE] Job ${job.id} failed:`, err);
@@ -334,7 +429,16 @@ function startWorker() {
       const made = job && Number.isFinite(Number(job.attemptsMade))
         ? Number(job.attemptsMade)
         : attempts;
-      if (made >= attempts) adjustQueueDepth(-1);
+      if (made >= attempts) {
+        adjustQueueDepth(-1);
+        sentry.captureException(err);
+        // Only signal the SSE consumer once no retry will follow, so a
+        // transient attempt does not terminate a stream the next attempt
+        // could still complete.
+        if (isStreamingJob(job)) {
+          void streamHub.publishError(job.id, err && err.message);
+        }
+      }
       console.error(`[QUEUE] Job ${job ? job.id : '?'} failed with error ${err.message}`);
     });
     console.log(
@@ -400,6 +504,7 @@ async function closeQueue() {
   try { if (worker) await worker.close(); } catch (_e) { /* ignore */ }
   try { if (queue) await queue.close(); } catch (_e) { /* ignore */ }
   try { if (queueEvents) await queueEvents.close(); } catch (_e) { /* ignore */ }
+  try { await streamHub.close(); } catch (_e) { /* ignore */ }
   try {
     if (connection) {
       connection.disconnect();

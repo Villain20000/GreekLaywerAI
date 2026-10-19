@@ -1453,3 +1453,38 @@ button.secondary .spinner,
   }
   .nl-lang-btn { min-width: 30px; font-size: 0.74rem; }
 }
+
+/* ── 22. Global error banner (unhandled errors) ─────────────────────── */
+.nl-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nl-space-3);
+  padding: var(--nl-space-2) var(--nl-space-4);
+  background: var(--nl-danger-bg);
+  border-bottom: 1px solid var(--nl-danger);
+  color: var(--nl-fg);
+  font-size: 0.88rem;
+  text-align: center;
+}
+/* Menu-less routes have no 64px header, so keep the banner clear of the
+   floating EL/EN switcher pinned to the top-right corner. */
+.nl-error-banner--public { margin-top: 3.5rem; }
+.nl-error-banner-text { flex: 1 1 auto; }
+.nl-error-banner-dismiss {
+  flex: 0 0 auto;
+  padding: var(--nl-space-1) var(--nl-space-3);
+  background: transparent;
+  border: 1px solid var(--nl-danger);
+  border-radius: var(--nl-radius-pill);
+  color: var(--nl-fg);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--nl-t-fast);
+}
+.nl-error-banner-dismiss:hover { background: rgba(244, 67, 54, 0.18); }
+.nl-error-banner-dismiss:focus-visible {
+  outline: 2px solid var(--nl-focus);
+  outline-offset: 2px;
+}

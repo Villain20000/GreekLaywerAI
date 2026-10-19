@@ -30,6 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const { getSecret } = require('../config/secrets');
 
 const SANITY_TABLES = Object.freeze([
   'users',
@@ -60,7 +61,7 @@ function getConfig() {
     host: process.env.DB_HOST || 'localhost',
     port: String(process.env.DB_PORT || '5432'),
     user: process.env.DB_USER || 'nomos_admin',
-    password: process.env.DB_PASSWORD || '',
+    password: getSecret('DB_PASSWORD', ''),
     dbName: process.env.DB_NAME || 'nomos_db'
   };
 }
@@ -458,7 +459,7 @@ if (require.main === module) {
     },
     (err) => {
       console.error(
-        `[RESTORE] ${redactSecrets(err.message, [process.env.DB_PASSWORD || ''])}`
+        `[RESTORE] ${redactSecrets(err.message, [getSecret('DB_PASSWORD', '')])}`
       );
       process.exit(1);
     }

@@ -29,6 +29,31 @@ export interface TierPlan {
   recommended?: boolean;
 }
 
+/** Stripe invoice row from GET /api/subscriptions/invoices. */
+export interface Invoice {
+  id: number;
+  stripe_invoice_id: string;
+  stripe_customer_id: string | null;
+  stripe_subscription_id: string | null;
+  amount_due: number | null;
+  amount_paid: number | null;
+  currency: string | null;
+  status: string | null;
+  hosted_invoice_url: string | null;
+  invoice_pdf: string | null;
+  period_start: string | null;
+  period_end: string | null;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface InvoicePage {
+  invoices: Invoice[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -110,6 +135,24 @@ export class BillingService {
     if (!res.ok) throw new Error(`Subscription history failed (HTTP ${res.status})`);
     const data = await res.json();
     return data.subscriptions || [];
+  }
+
+  /** Paginated payment history (GET /api/subscriptions/invoices). */
+  async listInvoices(limit = 10, offset = 0): Promise<InvoicePage> {
+    const res = await apiFetch(
+      `${this.apiUrl}/subscriptions/invoices?limit=${limit}&offset=${offset}`,
+      { headers: this.headers() }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Invoices failed (HTTP ${res.status})`);
+    }
+    return {
+      invoices: data.invoices || [],
+      total: Number(data.total) || 0,
+      limit: Number(data.limit) || limit,
+      offset: Number(data.offset) || 0
+    };
   }
 
   async cancel(): Promise<void> {

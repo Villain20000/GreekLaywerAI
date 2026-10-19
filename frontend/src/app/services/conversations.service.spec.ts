@@ -88,7 +88,41 @@ describe('ConversationsService', () => {
 
     expect(result.conversation.id).toBe(5);
     expect(result.messages.length).toBe(1);
+    expect(result.hasMore).toBeFalse();
+    expect(result.nextCursor).toBeNull();
     expect(String(fetchSpy.calls.mostRecent().args[0])).toBe('/api/conversations/5');
+  });
+
+  it('requests a cursor page and maps hasMore/nextCursor', async () => {
+    fetchSpy.and.returnValue(Promise.resolve(jsonResponse({
+      conversation: conversationStub(5),
+      messages: [{ id: 8, role: 'user', content: 'παλιό', created_at: '2026-01-01' }],
+      hasMore: true,
+      nextCursor: 8
+    })));
+
+    const result = await service.get(5, { messageLimit: 50, before: 12 });
+
+    const url = new URL(String(fetchSpy.calls.mostRecent().args[0]), 'http://localhost');
+    expect(url.pathname).toBe('/api/conversations/5');
+    expect(url.searchParams.get('messageLimit')).toBe('50');
+    expect(url.searchParams.get('before')).toBe('12');
+    expect(result.hasMore).toBeTrue();
+    expect(result.nextCursor).toBe(8);
+    expect(result.messages.length).toBe(1);
+  });
+
+  it('omits pagination params that were not supplied', async () => {
+    fetchSpy.and.returnValue(Promise.resolve(jsonResponse({
+      conversation: conversationStub(5),
+      messages: []
+    })));
+
+    await service.get(5, { messageLimit: 50 });
+
+    const url = new URL(String(fetchSpy.calls.mostRecent().args[0]), 'http://localhost');
+    expect(url.searchParams.get('messageLimit')).toBe('50');
+    expect(url.searchParams.has('before')).toBeFalse();
   });
 
   it('creates, renames and deletes conversations with the expected verbs', async () => {

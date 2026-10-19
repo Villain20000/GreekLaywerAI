@@ -12,8 +12,9 @@
 const jwt = require('jsonwebtoken');
 const db = require('../config/db');
 const { normalizeRole } = require('../middlewares/authMiddleware');
+const { getSecret } = require('../config/secrets');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'nomos-super-secret-key-development';
+const JWT_SECRET = getSecret('JWT_SECRET', 'nomos-super-secret-key-development');
 const DEFAULT_TTL_MIN = 5;
 const MAX_TTL_MIN = 60;
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:4200';

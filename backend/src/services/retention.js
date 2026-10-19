@@ -9,6 +9,8 @@
 // legal_document_chunks; conversations' FK cascades clear messages.
 //
 // Pruning key per table (1-5 decision, documented plainly):
+//   users           → deletion_scheduled_for: deadline-based. Only accounts
+//                     whose grace period has elapsed are purged.
 //   conversations   → updated_at: activity-based. A conversation still in
 //                     use (new message bumps updated_at) is never pruned,
 //                     even if it is older than the window.
@@ -57,6 +59,33 @@ async function cleanupAuditLog(days = AUDIT_LOG_DAYS()) {
 }
 
 /**
+ * Purge accounts whose deletion grace period has elapsed. Returns the
+ * deleted rows' id/email so each purge can be audited after the user row is
+ * gone (audit_log has no FK to users).
+ */
+async function cleanupScheduledDeletions() {
+  const result = await db.query(
+    `DELETE FROM users
+     WHERE deletion_scheduled_for IS NOT NULL
+       AND deletion_scheduled_for <= NOW()
+     RETURNING id, email`
+  );
+  const purged = result.rows || [];
+
+  for (const user of purged) {
+    await logAudit({
+      userId: user.id,
+      action: 'account.deletion_purged',
+      resourceType: 'user',
+      resourceId: user.id,
+      newValue: { email: user.email }
+    });
+  }
+
+  return purged;
+}
+
+/**
  * Run every cleanup and return a summary. Never throws — each leg is
  * isolated so one failing cleanup doesn't block the others. Failures are
  * reported as -1 for that table.
@@ -66,8 +95,11 @@ async function cleanupAuditLog(days = AUDIT_LOG_DAYS()) {
  * logging failure can never break the documented "never throws" contract.
  */
 async function runRetention() {
-  const summary = { conversations: 0, documents: 0, auditLog: 0 };
+  const summary = { accounts: 0, conversations: 0, documents: 0, auditLog: 0 };
   const legs = [
+    // Accounts first so their purge audit rows exist before the audit
+    // cleanup leg runs. The age cutoff still keeps those fresh rows.
+    ['accounts', async () => (await cleanupScheduledDeletions()).length],
     ['conversations', cleanupConversations],
     ['documents', cleanupDocuments],
     ['auditLog', cleanupAuditLog]
@@ -97,6 +129,7 @@ async function runRetention() {
 
 module.exports = {
   runRetention,
+  cleanupScheduledDeletions,
   cleanupConversations,
   cleanupDocuments,
   cleanupAuditLog,

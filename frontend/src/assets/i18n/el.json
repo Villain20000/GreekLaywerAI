@@ -65,7 +65,12 @@
   },
   "landing": {
     "subtitle": "Ο κορυφαίος Έλληνας AI νομικός, με τεχνολογία Gemma 4",
-    "enter": "Είσοδος στην εφαρμογή"
+    "enter": "Είσοδος στην εφαρμογή",
+    "hero": {
+      "variant": {
+        "subtitle": "Το μέλλον της ελληνικής νομικής νοημοσύνης"
+      }
+    }
   },
   "notFound": {
     "title": "Η σελίδα δεν βρέθηκε",
@@ -146,7 +151,10 @@
       "title": "Επαλήθευση…",
       "waiting": "Περιμένετε όσο ενεργοποιούμε τον λογαριασμό σας.",
       "success": "Το email επαληθεύτηκε. Συνδέεστε…",
-      "invalid": "Μη έγκυρος ή ληγμένος σύνδεσμος επαλήθευσης. Ζητήστε νέο."
+      "invalid": "Μη έγκυρος ή ληγμένος σύνδεσμος επαλήθευσης. Ζητήστε νέο.",
+      "changeWaiting": "Περιμένετε όσο επιβεβαιώνουμε τη νέα διεύθυνση email σας.",
+      "changeSuccess": "Το νέο email επιβεβαιώθηκε. Συνδέεστε…",
+      "changeInvalid": "Μη έγκυρος ή ληγμένος σύνδεσμος αλλαγής email. Ζητήστε νέο."
     },
     "magic": {
       "title": "Σύνδεση…",
@@ -188,6 +196,7 @@
     "recentAria": "Πρόσφατες συνομιλίες",
     "noConversations": "Καμία συνομιλία ακόμα.",
     "messagesAria": "Μηνύματα συνομιλίας",
+    "loadOlder": "Φόρτωση παλαιότερων μηνυμάτων",
     "sourcesShow": "Πηγές",
     "sourcesHide": "Απόκρυψη πηγών",
     "confidence": "{{percent}}% βεβαιότητα",
@@ -346,6 +355,20 @@
     "colPeriodEnd": "Περίοδος έως",
     "colCreated": "Ενεργοποιήθηκε",
     "historyEmpty": "Κανένα ιστορικό.",
+    "paymentHistory": "Ιστορικό πληρωμών",
+    "paymentHistoryAria": "Πίνακας ιστορικού πληρωμών",
+    "colInvoiceDate": "Ημερομηνία",
+    "colInvoiceAmount": "Ποσό",
+    "colInvoiceStatus": "Κατάσταση",
+    "colInvoiceLink": "Τιμολόγιο",
+    "paymentHistoryEmpty": "Κανένα τιμολόγιο.",
+    "paymentHistoryLoading": "Φόρτωση πληρωμών…",
+    "paymentHistoryError": "Αποτυχία φόρτωσης πληρωμών",
+    "prevPage": "← Προηγούμενη",
+    "nextPage": "Επόμενη →",
+    "pageOf": "Σελίδα {{page}} από {{pages}}",
+    "viewInvoice": "Προβολή",
+    "downloadPdf": "Λήψη PDF",
     "cancelTitle": "Ακύρωση συνδρομής",
     "cancelMessage": "Ακύρωση της συνδρομής σας;",
     "cancelBack": "Πίσω",
@@ -359,6 +382,18 @@
     "planLabel": "Πλάνο",
     "subscriptionStatus": "Συνδρομή: {{status}}",
     "until": "έως",
+    "emailChangeTitle": "Αλλαγή email",
+    "emailChangeHint": "Θα σταλεί σύνδεσμος επιβεβαίωσης στη νέα διεύθυνση. Η αλλαγή ολοκληρώνεται μετά την επιβεβαίωση.",
+    "emailChangeNewEmail": "Νέο email",
+    "emailChangeEmailPlaceholder": "you@example.com",
+    "emailChangeCurrentPassword": "Τρέχων κωδικός",
+    "emailChangeSubmit": "Αποστολή συνδέσμου",
+    "emailChangeSubmitting": "Αποστολή…",
+    "emailChangeSent": "Στείλαμε σύνδεσμο επιβεβαίωσης στο νέο email. Ελέγξτε τα εισερχόμενά σας.",
+    "emailChangeInvalidEmail": "Εισάγετε μια έγκυρη διεύθυνση email",
+    "emailChangePasswordRequired": "Εισάγετε τον τρέχοντα κωδικό σας",
+    "emailChangeSameEmail": "Το νέο email πρέπει να διαφέρει από το τρέχον",
+    "emailChangeWrongPassword": "Λανθασμένος κωδικός πρόσβασης",
     "gdpr": "Δεδομένα & GDPR",
     "export": "Εξαγωγή δεδομένων",
     "delete": "Διαγραφή λογαριασμού",
@@ -371,6 +406,11 @@
     "loadError": "Αποτυχία φόρτωσης προφίλ",
     "exportError": "Αποτυχία εξαγωγής",
     "deleteError": "Αποτυχία διαγραφής",
+    "deletionScheduledTitle": "Προγραμματισμένη διαγραφή λογαριασμού",
+    "deletionScheduledMessage": "Ο λογαριασμός σας θα διαγραφεί οριστικά στις {{date}}. Μπορείτε να ακυρώσετε τη διαγραφή πριν από την προθεσμία.",
+    "cancelDeletion": "Ακύρωση διαγραφής",
+    "deletionCancelled": "Η προγραμματισμένη διαγραφή ακυρώθηκε.",
+    "cancelDeletionError": "Αποτυχία ακύρωσης διαγραφής",
     "usage": "Χρήση σήμερα",
     "usageAi": "Ερωτήσεις AI",
     "usageDocuments": "Έγγραφα",
@@ -452,6 +492,15 @@
   "adminDocuments": {
     "title": "Διαχείριση εγγράφων",
     "tableAria": "Πίνακας εγγράφων χρηστών",
+    "search": "Αναζήτηση",
+    "clear": "Καθαρισμός",
+    "searchPlaceholder": "Αναζήτηση με αρχείο, τίτλο ή email χρήστη…",
+    "userIdPlaceholder": "ID χρήστη",
+    "userIdAria": "Φιλτράρισμα εγγράφων ανά ID χρήστη",
+    "loading": "Φόρτωση…",
+    "previous": "← Προηγούμενη",
+    "next": "Επόμενη →",
+    "pager": "{{start}}–{{end}} από {{total}}",
     "colFile": "Αρχείο",
     "colUser": "Χρήστης",
     "colType": "Τύπος",
@@ -463,5 +512,8 @@
     "deleteMessage": "Διαγραφή του εγγράφου \"{{filename}}\" του χρήστη {{email}};",
     "loadError": "Αποτυχία φόρτωσης",
     "deleteError": "Αποτυχία διαγραφής"
+  },
+  "errors": {
+    "unexpectedError": "Κάτι πήγε στραβά. Δοκιμάστε ξανά."
   }
 }

@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nomosai-worker
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai-worker
+    app.kubernetes.io/part-of: nomosai
+spec:
+  # Exactly one worker keeps GPU inference concurrency at 1 across all web
+  # replicas. Scale only if the external Ollama deployment has capacity.
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nomosai-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nomosai-worker
+        app.kubernetes.io/part-of: nomosai
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: registry.example.com/nomosai/backend:REPLACE_ME
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/usr/src/app/src/worker.js"]
+          workingDir: /tmp
+          envFrom:
+            - configMapRef:
+                name: nomosai-config
+          env:
+            - name: QUEUE_WORKER_ENABLED
+              value: "true"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: DB_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: JWT_SECRET
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: STRIPE_SECRET_KEY
+            - name: STRIPE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: STRIPE_WEBHOOK_SECRET
+            - name: SMTP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: SMTP_USER
+                  optional: true
+            - name: SMTP_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: SMTP_PASS
+                  optional: true
+            - name: SENTRY_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: nomosai-secrets
+                  key: SENTRY_DSN
+                  optional: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

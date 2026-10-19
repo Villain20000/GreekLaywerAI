@@ -1,6 +1,7 @@
 import { ComponentFixture, TestBed, fakeAsync, tick } from '@angular/core/testing';
 import { By } from '@angular/platform-browser';
 import { ActivatedRoute, Router, convertToParamMap, provideRouter } from '@angular/router';
+import { TranslateService } from '@ngx-translate/core';
 import { VerifyEmailComponent } from './verify-email.component';
 import { AuthService, TokenAuthResult } from '../../services/auth.service';
 import { lookupTranslation, provideTestTranslate } from '../../i18n/testing';
@@ -29,8 +30,9 @@ const VALID_TOKEN = 'a'.repeat(64);
 describe('VerifyEmailComponent', () => {
   let component: VerifyEmailComponent;
   let fixture: ComponentFixture<VerifyEmailComponent>;
-  let mockAuthService: { verifyEmail: jasmine.Spy };
+  let mockAuthService: { verifyEmail: jasmine.Spy; verifyEmailChange: jasmine.Spy };
   let mockRouter: Router;
+  let translate: TranslateService;
   let queryParams: Record<string, string>;
 
   beforeEach(async () => {
@@ -43,6 +45,15 @@ describe('VerifyEmailComponent', () => {
             ok: true,
             token: 'jwt-abc',
             user: { id: 1, email: 'user@nomos.ai', role: 'user', subscription_tier: 'basic' }
+          })
+        ),
+      verifyEmailChange: jasmine
+        .createSpy<(token: string) => Promise<TokenAuthResult>>('verifyEmailChange')
+        .and.returnValue(
+          Promise.resolve({
+            ok: true,
+            token: 'jwt-change',
+            user: { id: 1, email: 'new@nomos.ai', role: 'user', subscription_tier: 'basic' }
           })
         )
     };
@@ -73,6 +84,7 @@ describe('VerifyEmailComponent', () => {
 
     mockRouter = TestBed.inject(Router);
     spyOn(mockRouter, 'navigate');
+    translate = TestBed.inject(TranslateService);
 
     fixture = TestBed.createComponent(VerifyEmailComponent);
     component = fixture.componentInstance;
@@ -192,4 +204,75 @@ describe('VerifyEmailComponent', () => {
 
     expect(mockRouter.navigate).not.toHaveBeenCalled();
   }));
+
+  // ------------------------------------------------------------------
+  // Phase 30: ?type=change routes the token to verifyEmailChange and
+  // switches the success/error copy to the email-change wording.
+  // ------------------------------------------------------------------
+  describe('email change (?type=change)', () => {
+    it('calls verifyEmailChange, never verifyEmail, and shows the change success copy', async () => {
+      queryParams = { token: VALID_TOKEN, type: 'change' };
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+
+      expect(mockAuthService.verifyEmailChange).toHaveBeenCalledWith(VALID_TOKEN);
+      expect(mockAuthService.verifyEmail).not.toHaveBeenCalled();
+      expect(component.isEmailChange).toBeTrue();
+      expect(component.finished).toBeTrue();
+      expect(component.success).toBeTrue();
+
+      const banner = fixture.debugElement.query(By.css('.success-msg'));
+      expect(banner.nativeElement.textContent).toContain(
+        translate.instant('auth.verify.changeSuccess')
+      );
+    });
+
+    it('uses the change-specific invalid-link copy for a missing token', async () => {
+      queryParams = { type: 'change' };
+      fixture.detectChanges();
+      await fixture.whenStable();
+
+      expect(mockAuthService.verifyEmailChange).not.toHaveBeenCalled();
+      expect(mockAuthService.verifyEmail).not.toHaveBeenCalled();
+      expect(component.finished).toBeTrue();
+      expect(component.success).toBeFalse();
+      expect(component.error).toBe(translate.instant('auth.verify.changeInvalid'));
+    });
+
+    it('renders the translated code copy when the change token is rejected', async () => {
+      mockAuthService.verifyEmailChange.and.returnValue(
+        Promise.resolve({
+          ok: false,
+          kind: 'invalid_token',
+          code: 'invalid_token',
+          error: 'Invalid or expired email-change link',
+          status: 400
+        })
+      );
+      queryParams = { token: VALID_TOKEN, type: 'change' };
+
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+
+      expect(component.success).toBeFalse();
+      expect(component.error).toBe(elCopy('auth.errors.invalidToken'));
+      expect(component.error).not.toContain('Invalid or expired email-change link');
+
+      const banner = fixture.debugElement.query(By.css('.error-msg'));
+      expect(banner.nativeElement.textContent).toContain(
+        elCopy('auth.errors.invalidToken')
+      );
+    });
+
+    it('navigates to /chat after a successful change verification', fakeAsync(() => {
+      queryParams = { token: VALID_TOKEN, type: 'change' };
+      fixture.detectChanges();
+      tick();
+      tick(600);
+
+      expect(mockRouter.navigate).toHaveBeenCalledWith(['/chat']);
+    }));
+  });
 });

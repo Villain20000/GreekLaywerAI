@@ -49,6 +49,7 @@ services:
       - SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json
       - STRIPE_SECRET_KEY=sk_test_mock
       - REDIS_URL=redis://redis:6379
+      - QUEUE_WORKER_ENABLED=${QUEUE_WORKER_ENABLED:-true}
       - JWT_SECRET=${JWT_SECRET:-nomos-super-secret-key-development}
       # Dev: no CORS_ORIGINS → backend allows all origins (see src/index.js).
       # Set CORS_ORIGINS (comma-separated) for a locked-down deployment.
@@ -88,12 +89,16 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        SITE_URL: "${SITE_URL:-https://your-domain.gr}"
     ports:
-      - "4200:4200"
+      - "4200:80"
     depends_on:
       - backend
     networks:
       - nomos-network
+    volumes:
+      - ./deploy/cloudflare/real-ip.conf:/etc/nginx/cloudflare/real-ip.conf:ro
 
   # Ollama for Gemma 4 Runtime (with GPU pass-through if available)
   ollama:

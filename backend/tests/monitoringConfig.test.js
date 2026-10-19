@@ -140,8 +140,23 @@ describe('monitoring configuration', () => {
     const backup = read('backend/src/scripts/backupDb.js');
     const envExample = read('backend/.env.example');
 
-    expect(prod).toContain('"80:80"');
-    expect(prod).toContain('./scraped_laws.json:/usr/src/app/scraped_laws.json:ro');
+    // Production ingress is Traefik-only: the frontend container publishes
+    // no host port, and TLS/ACME terminate at the edge.
+    expect(prod).toMatch(/^  traefik:$/m);
+    expect(prod).toContain('traefik:v3.7');
+    expect(prod).toContain('"${HTTP_PORT:-80}:80"');
+    expect(prod).toContain('"${HTTPS_PORT:-443}:443"');
+    expect(prod).toContain('traefik.http.routers.nomos-prod.tls.certresolver=le');
+    expect(prod).toContain('traefik.http.routers.nomos-prod-http.middlewares=nomos-prod-redirect');
+    expect(prod).not.toContain('"4200:4200"');
+    expect(prod).not.toContain('"80:80"');
+
+    // The monitoring profile now also ships Alertmanager + Loki/Promtail.
+    for (const service of ['alertmanager', 'loki', 'promtail']) {
+      expect(prod).toMatch(new RegExp(`^  ${service}:$`, 'm'));
+    }
+
+    expect(prod).toContain('${SCRAPED_LAWS_PATH:-./scraped_laws.json}:/usr/src/app/scraped_laws.json:ro');
     expect(prod).toContain('PROM_TEXTFILE_DIR=/prom-textfile');
     expect(prod).toContain('prom_textfile_prod:/prom-textfile');
     expect(dev).toContain('SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json');

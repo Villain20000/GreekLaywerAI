@@ -1,672 +1,591 @@
 # NomosAI — Greek AI Lawyer
 
-> An interactive SaaS virtual lawyer tailored for the Greek Legal System, built on Gemma, augmented with a pgvector-backed RAG layer over Greek legislation, mediated by a role-based access (RBAC) backend, and fronted by a high-end Angular UI.
+> A Greek legal AI workspace: an Angular 17 SPA, an Express/Node API, local
+> Ollama inference with a pgvector RAG layer over Greek legislation, Stripe
+> subscriptions, GDPR tooling, and a production stack with TLS, observability
+> and backups.
 
 ---
 
-## Table of Contents
+## Contents
 
-1. [Highlights](#highlights)
+1. [Feature set](#feature-set)
 2. [Architecture](#architecture)
-3. [Technology Stack](#technology-stack)
-4. [Quick Start](#quick-start)
-5. [Environment Variables](#environment-variables)
-6. [Database Schema](#database-schema)
-7. [Backend API Reference](#backend-api-reference)
-8. [Frontend Routes & Components](#frontend-routes--components)
-9. [Backend Services & Middlewares](#backend-services--middlewares)
-10. [CLI Scripts](#cli-scripts)
-11. [Greek Law Scraping Pipeline](#greek-law-scraping-pipeline)
-12. [Testing](#testing)
-13. [Security & Privacy](#security--privacy)
-14. [Production Deployment (GPU)](#production-deployment-gpu)
-15. [Project Structure](#project-structure)
-16. [Roadmap](#roadmap)
+3. [Technology stack](#technology-stack)
+4. [Quick start](#quick-start)
+5. [Environment variables](#environment-variables)
+6. [Database schema & migrations](#database-schema--migrations)
+7. [API reference](#api-reference)
+8. [Frontend](#frontend)
+9. [Services & middlewares](#services--middlewares)
+10. [Production operations](#production-operations)
+11. [Testing](#testing)
+12. [Project structure](#project-structure)
+13. [Roadmap](#roadmap)
 
 ---
 
-## Highlights
+## Feature set
 
-- **Local-first inference** — All LLM (Gemma) calls run on the local Ollama runtime; nothing leaves your machine.
-- **RAG over Greek legislation** — A pgvector HNSW index enables fast retrieval of relevant Άρθρα (articles) for every question.
-- **RBAC baked in** — JWT auth with role (`user`, `admin`, `enterprise`) and tier (`basic`, `pro`, `enterprise`) gating at the route level.
-- **Multimodal premium tier** — Admin/enterprise users can ask questions via audio or upload PDFs/images.
-- **Cited legal answers (Phase B)** — Structured legislation/document sources and confidence metadata are persisted with conversation messages and shown in an expandable chat panel.
-- **Answer feedback (Phase C)** — Users can rate assistant answers, replace their existing vote, while admins get aggregate quality summaries without exposing private prompts or document content.
-- **Streaming responses** — Queued inference responses are polled for reliable GPU-safe completion.
-- **BullMQ inference queue (Phase 16, currently inactive)** — A concurrency=1 worker scaffold exists for hardware-aware queueing, but the live `ai` routes call the model directly; flip the require on in `src/index.js` to activate.
-- **Privacy Shield** — GDPR-friendly middleware that sanitizes logging, blocks caching of legal responses, and tags requests as locally processed.
-- **Admin Console** — Promote/demote users and adjust subscription tiers without touching the database.
-- **Auth-route rate limiting (Phase 21)** — Per-IP caps on `/api/auth/register`, `/login`, `/change-password`, `/forgot-password`, `/verify-email`, `/resend-verification`; per-account stacked caps on `/change-password` (5/min + 20/day); per-email caps on the recovery endpoints to defeat enumeration. Redis-backed in production, in-memory in tests.
-- **Token-version session invalidation (Phase 22)** — Every JWT embeds the user's `token_version`. `authMiddleware` re-reads the live value from Postgres on each authenticated request; if a `/change-password`, password reset, or verification bumps the counter, every older JWT is rejected at the *next* request without a global logout. The check is strict equality (not just `<`) so that impersonation by passing a smaller tv is impossible.
-- **Password recovery flow (Phase 23)** — `/forgot-password` issues a SHA-256-hashed token row with 1-hour TTL, mirrored to a single-use partial unique index `(token_hash) WHERE used_at IS NULL`. `/reset-password` consumes the token atomically inside a `BEGIN/SELECT/UPDATE-consume/UPDATE-users/COMMIT` tx, bumps `token_version`, and mints a fresh JWT so the user is auto-signed-in.
-- **Email verification at registration (Phase 24)** — `/register` no longer mints a JWT. A new user row is created with `verified_at = NULL`, a `email_verification_tokens` row is inserted, and the user receives `{ ok: true, requires_verification: true, user: { verified_at: null } }`. `/login` rejects unverified accounts with the canonical *"Email not verified. Check your inbox for the verification link."* message. `/verify-email` sets `verified_at = NOW()` and bumps `token_version` atomically, minting the user's first JWT. `/resend-verification` re-issues a fresh token with anti-enumeration jitter.
+- **Local-first AI** — chat and embeddings run on a local Ollama runtime
+  (`gemma2b-mmap` chat, `bge-m3` embeddings, 1024 dimensions). No prompt or
+  document leaves the deployment.
+- **Grounded RAG** — pgvector HNSW cosine search over Greek legislation;
+  answers carry structured sources and a confidence score.
+- **Real token streaming** — `POST /api/ai/query/live` + SSE
+  `GET /api/ai/query/live/:jobId/events` stream model deltas through Redis
+  pub/sub (with an in-process fallback when Redis is absent). The legacy
+  `/api/ai/query` and `/api/ai/query/stream` polling paths remain.
+- **Active inference queue** — BullMQ (concurrency 1) gates the GPU; without
+  Redis an inline gate serializes work in-process. Started from `src/index.js`.
+- **Multimodal** — audio transcription through a local whisper sidecar;
+  PDF/DOCX analysis; scanned PDFs are page-rasterized and OCRed (up to
+  `OCR_PDF_MAX_PAGES`, encrypted PDFs rejected); image uploads analyzed by an
+  optional Ollama vision model or local Tesseract OCR (`ell+eng`).
+- **Accounts & auth** — JWT with `token_version` invalidation, email
+  verification, password reset, authenticated email change with confirmation
+  to the new address, auth rate limiting, and an opt-in admin magic link.
+  Account deletion is scheduled after a configurable grace period
+  (`ACCOUNT_DELETION_GRACE_HOURS`) and can be cancelled until the deadline.
+- **Stripe billing** — live Checkout + Billing Portal + signature-verified
+  webhooks in production; a built-in mock checkout is available in
+  development/test only (`sk_test_mock`). Invoice history is persisted and
+  exposed per user.
+- **Documents** — upload PDF/DOCX/TXT, store the original bytes for download,
+  chunk + embed for per-user semantic search, preview extracted text.
+- **Admin console** — user role/tier management, audit log, feedback summary,
+  cross-user document search with pagination and deletion.
+- **Resilience & UX** — global error handler with a translated shell banner,
+  optional client-error reporting URL, optional Sentry (backend and frontend),
+  PWA (service worker + manifest), SEO metadata with build-time `SITE_URL`
+  replacement, sitemap/robots, Greek/English i18n, cursor-paginated chat
+  history with a "load older messages" control, and a deterministic,
+  client-side A/B experiment (landing hero).
+- **Production hardening** — Traefik TLS edge with per-IP rate limiting and
+  in-flight request caps, Cloudflare real-IP support in nginx, `*_FILE`
+  secrets, Redis response caching, feature flags, Prometheus/Alertmanager/
+  Grafana/Loki/Promtail, S3 offsite backups, weekly ZAP baseline scan, and a
+  Kubernetes multi-host baseline under `deploy/k8s/`.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────┐      ┌──────────────────────────────────┐
-│  Angular 17 SPA  │─────▶│  Express.js Backend (port 3000)  │
-│  (port 4200)     │      │  Routes: auth, ai, admin, billing│
-│  GSAP / Three.js │      │  ├─ privacyShield (global)       │
-│                  │      │  ├─ authMiddleware + rbac        │
-└──────────────────┘      │  ├─ RAG Service  →  PostgreSQL    │
-                         │  ├─ Ollama Service → Ollama      │
-                         │  └─ BullMQ Worker  → Redis       │
-                         └──────────────────────────────────┘
-                                       │
-              ┌────────────────────────┼───────────────────────┐
-              ▼                        ▼                       ▼
-       ┌─────────────┐        ┌──────────────────┐      ┌─────────────┐
-       │ PostgreSQL  │        │  Ollama + Gemma  │      │   Redis 7   │
-       │  pgvector   │        │   (port 11434)   │      │  (BullMQ)   │
-       │ (port 5432) │        │  Local GPU ready │      │ (port 6379) │
-       └─────────────┘        └──────────────────┘      └─────────────┘
+Browser (same origin)
+   │
+   ▼
+Cloudflare (optional: WAF/CDN/DDoS, account-side)
+   │
+   ▼
+Traefik (prod/staging, TLS, edge rate limits) ──▶ frontend nginx :80
+                                                   ├─ static SPA + PWA
+                                                   └─ /api/ ──▶ backend :3000
+                                                                   ├─ PostgreSQL 16 + pgvector
+                                                                   ├─ Redis 7 (queue, rate limits, cache, SSE)
+                                                                   ├─ Ollama (gemma2b-mmap + bge-m3)
+                                                                   └─ whisper (faster-whisper)
 ```
 
----
+The compose stacks run on one host. `deploy/k8s/` moves the same frontend/
+backend pair onto Kubernetes with external PostgreSQL, Redis and Ollama.
 
-## Technology Stack
-
-| Layer        | Tech                                                                          |
-|--------------|-------------------------------------------------------------------------------|
-| Frontend     | Angular 17 (standalone components) · RxJS · GSAP · Three.js                  |
-| Backend      | Node.js 20 · Express.js · JWT (`jsonwebtoken`) · bcryptjs · multer             |
-| Database     | PostgreSQL + [pgvector](https://github.com/pgvector/pgvector) (HNSW index)    |
-| AI Runtime   | [Ollama](https://ollama.com) running `gemma:2b` (Gemma family)                |
-| Queue        | [BullMQ](https://docs.bullmq.io) on Redis 7 (concurrency=1 for GPU safety)    |
-| Billing      | Stripe SDK (mocked in dev)                                                    |
-| Infra        | Docker Compose (dev + prod), NVIDIA Container Toolkit in prod                 |
-| Scraping     | Python 3.10+ (BeautifulSoup4 / Playwright prototype)                          |
+The SPA always calls `/api/*` on its own origin; the dev server proxies to the
+backend and nginx proxies in production, so no CORS or hostname is baked into
+the bundle.
 
 ---
 
-## Quick Start
+## Technology stack
+
+| Layer | Tech |
+|---|---|
+| Frontend | Angular 17 standalone components, RxJS, ngx-translate (el/en), GSAP, Three.js, Angular Service Worker |
+| Backend | Node.js 20, Express, jsonwebtoken, bcryptjs, multer, helmet, express-rate-limit, pino |
+| Data | PostgreSQL + pgvector (HNSW cosine), Redis 7 |
+| AI | Ollama (`gemma2b-mmap`, `bge-m3`), Tesseract.js OCR, optional Ollama vision model, faster-whisper sidecar |
+| Billing | Stripe SDK (Checkout, Billing Portal, webhooks) with a dev-only mock mode |
+| Infra | Docker Compose (dev/staging/prod), Traefik v3, NVIDIA Container Toolkit in prod |
+| Scraping | Python 3.10+ prototype (`prototype_scraper.py`) |
+
+---
+
+## Quick start
 
 ### Prerequisites
 
 - Docker 24+ and Docker Compose v2
 - *(Optional)* NVIDIA GPU + NVIDIA Container Toolkit for accelerated inference
-- Free ports: `4200` (frontend), `3000` (backend), `5432` (db), `6379` (redis), `11434` (ollama)
+- Free ports: `4200`, `3000`, `5432`, `6379`, `11434`
 
-### One-command dev stack
-
-```bash
-docker-compose up --build
-```
-
-What comes up:
-
-| Container          | Image                       | Port |
-|--------------------|-----------------------------|------|
-| `frontend`         | built from `./frontend`     | 4200 |
-| `backend`          | built from `./backend`      | 3000 |
-| `db`               | `ankane/pgvector:v0.5.1`    | 5432 |
-| `redis`            | `redis:7-alpine`            | 6379 |
-| `ollama`           | `ollama/ollama`             | 11434 |
-
-### Bootstrap the first admin user
-
-The backend auto-creates the schema on first boot. Wait ~10 seconds, then:
+### Development stack
 
 ```bash
-docker exec -it greeklaywerai-backend-1 \
-  node src/scripts/create-admin.js admin@nomos.ai 'ChangeMe123!'
+docker compose up --build
 ```
 
-Log in at `http://localhost:4200/login`.
+| Container | Image | Port |
+|---|---|---|
+| `frontend` | built from `./frontend` | 4200 |
+| `backend` | built from `./backend` | 3000 |
+| `db` | `ankane/pgvector:v0.5.1` | 5432 |
+| `redis` | `redis:7-alpine` | 6379 |
+| `ollama` | `ollama/ollama` | 11434 |
+| `whisper` | `ghcr.io/speaches-ai/speaches:latest-cpu` | internal |
 
-> **Phase 24 gotcha**: `create-admin.js` inserts the admin row with `verified_at = NULL` (same as the UI registration flow). `/login` rejects the admin with *“Email not verified. Check your inbox for the verification link.”* Two dev-friendly workarounds, in order of preference:
-> 1. Read the `[DEV-EMAIL] Email-verification requested for …` line from `docker logs greeklaywerai-backend-1`, copy the `Verify URL`, and paste it into the browser. That hits `/verify-email?token=…`, swaps in the admin's first JWT, and routes to `/chat`.
-> 2. Mark verified directly in Postgres: `docker exec -it greeklaywerai-db-1 psql -U nomos_admin -d nomos_db -c "UPDATE users SET verified_at = NOW() WHERE email='admin@nomos.ai';"`
->
-> Real SMTP integration would replace the dev console transport and let the verification email land in the operator's inbox normally.
-
-### Seed legislation embeddings (optional)
+### First admin
 
 ```bash
-docker exec -it greeklaywerai-backend-1 node src/scripts/ingestLegislation.js
+docker compose exec backend node src/scripts/create-admin.js admin@nomos.ai 'ChangeMe123!'
 ```
 
-This inserts a small mock corpus (Civil Code articles 57 & 288, Penal Code article 299) so RAG retrieval has something to find on day one.
-
-### Apply post-v0.1 migrations on existing deployments
-
-Each migration below is *idempotent* (uses `ADD / CREATE ... IF NOT EXISTS`) so it is safe to run on a database that already has the columns or tables — but you DO need to run them once on a fresh dev DB to bring it forward to current parity with `database/init/schema.sql` (the init script only fires on a brand-new Postgres container).
+`create-admin.js` inserts the row with `verified_at = NULL`. Either open the
+`[DEV-EMAIL] ... Verify URL` line from `docker compose logs backend`, or mark
+the address verified directly:
 
 ```bash
-# Phase 22 — users.token_version (JWT session invalidation counter)
-docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-token-version.js
-
-# Phase 23 — password_reset_tokens table (forgot/reset flow)
-docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-password-reset-tokens.js
-
-# Phase 24 — users.verified_at + email_verification_tokens table
-docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-email-verification.js
-
-# Phase A reliability — document titles + queued-message idempotency
-# Run once on existing databases; safe to re-run.
-docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-phase-a-reliability.js
-
-# Phase B — persisted citation metadata for cited answers
-docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-phase-b-citations.js
-
-# Phase C — answer feedback quality loop
-# MUST succeed before deploying/restarting the backend that joins message_feedback.
-docker exec -it greeklaywerai-backend-1 node src/scripts/migrate-phase-c-feedback.js
+docker compose exec db psql -U nomos_admin -d nomos_db \
+  -c "UPDATE users SET verified_at = NOW() WHERE email='admin@nomos.ai';"
 ```
+
+Production/staging use real SMTP, so the verification email arrives normally.
+
+### Seed legislation
+
+```bash
+docker compose exec backend node src/scripts/ingestLegislation.js
+```
+
+The script reads `scraped_laws.json` (or `SCRAPED_LAWS_PATH`), embeds each row
+with `bge-m3`, and is idempotent. When the corpus is absent it falls back to a
+3-article mock set — **dev only**: production refuses unless
+`ALLOW_MOCK_CORPUS=true`.
+
+### Migrations
+
+`database/init/schema.sql` runs only on a brand-new Postgres volume. Existing
+databases use the idempotent runner:
+
+```bash
+docker compose exec backend npm run migrate
+```
+
+It applies, in order: `migrate-rbac`, `migrate-token-version`,
+`migrate-password-reset-tokens`, `migrate-email-verification`,
+`migrate-phase-29-schema`, **`migrate-invoices`**, **`migrate-email-change`**,
+**`migrate-document-originals`**, `migrate-webhook-events`,
+`migrate-account-deletion`, `migrate-subscriptions-integrity`,
+`migrate-usage-counters`, `migrate-phase-a-reliability`,
+`migrate-phase-b-citations`, `migrate-phase-c-feedback`,
+`migrate-vector-cosine-indexes`, `migrate-legislation-unique-index`.
 
 ---
 
-## Environment Variables
+## Environment variables
 
-### Backend (`backend` service in `docker-compose.yml`)
+### Secrets from files
 
-| Variable          | Default                       | Purpose                                  |
-|-------------------|-------------------------------|------------------------------------------|
-| `PORT`            | `3000`                        | Express port                             |
-| `DB_HOST`         | `db`                          | Postgres host (use `localhost` outside Docker) |
-| `DB_PORT`         | `5432`                        | Postgres port                            |
-| `DB_USER`         | `nomos_admin`                 | Postgres user                            |
-| `DB_PASSWORD`     | `nomos_password`              | Postgres password                        |
-| `DB_NAME`         | `nomos_db`                    | Postgres database                        |
-| `OLLAMA_URL`      | `http://ollama:11434`         | Ollama base URL                          |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text`         | Ollama embedding model used by RAG (Phase 26). Pull it once via `docker exec greeklaywerai-ollama-1 ollama pull nomic-embed-text` — `/api/ai/query` will surface a `Could not reach Ollama` 500 until the model is present. |
-| `OLLAMA_EMBED_DIM` | `768`                        | Vector dimension of `OLLAMA_EMBED_MODEL`. Must match the dim returned by the model AND the `legislation_embeddings.embedding vector(…)` column type. Garbage values (non-numeric, zero, negative) fall back to 768 with no error so misconfig is loud (not silent). |
-| `REDIS_URL`       | `redis://redis:6379`          | Redis for BullMQ                         |
-| `STRIPE_SECRET_KEY` | `sk_test_mock`              | Stripe key (mock returns success)        |
-| `JWT_SECRET`      | `nomos-super-secret-key-development` | Override in prod                 |
-| `NODE_ENV`        | *(unset)*                     | Set to `production` for prod compose     |
-| `ADMIN_MAGIC_LINK_ENABLED` | *(unset)*              | Set to `true` to enable `POST /api/auth/admin-magic-link/redeem` in production. Off-by-default; dev compose leaves `NODE_ENV` unset so the route is enabled automatically. |
+Every supported secret can be supplied as `<NAME>_FILE=/path` instead of the
+plain variable. The file is read as UTF-8, trailing CR/LF is stripped, and the
+file value takes precedence over the environment. A configured-but-unreadable
+file aborts startup. Supported names: `DB_PASSWORD`, `JWT_SECRET`,
+`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SMTP_USER`, `SMTP_PASS`.
+Compose interpolation still requires the plain variables, so keep a
+non-sensitive placeholder when using files.
+
+### Backend
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NODE_ENV` | *(unset)* | `production` enables boot guards and the SMTP requirement |
+| `PORT` | `3000` | Express port |
+| `LOG_LEVEL` | `info` | pino log level |
+| `TRUST_PROXY` | `uniquelocal,loopback` | Proxy hops/CIDRs for `req.ip` |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_NAME` | `localhost` / `5432` / `nomos_admin` / `nomos_db` | PostgreSQL |
+| `DB_PASSWORD` | `nomos_password` | PostgreSQL password (`DB_PASSWORD_FILE` supported) |
+| `REDIS_URL` | `redis://redis:6379` | Queue, rate limits, response cache, SSE |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama base URL |
+| `OLLAMA_CHAT_MODEL` | `gemma2b-mmap` | Chat model |
+| `OLLAMA_EMBED_MODEL` / `OLLAMA_EMBED_DIM` | `bge-m3` / `1024` | Embeddings; dimension must match the vector column |
+| `OLLAMA_TIMEOUT_MS` | `120000` | Per-call chat/embedding timeout |
+| `OLLAMA_VISION_MODEL` | *(empty)* | Optional vision model (e.g. `llava`); empty disables it |
+| `OLLAMA_VISION_TIMEOUT_MS` | `120000` | Vision request timeout |
+| `OCR_LANGUAGES` | `ell+eng` | Tesseract language packs |
+| `OCR_TIMEOUT_MS` | `30000` | OCR deadline (applied to queue + recognition) |
+| `OCR_PDF_MAX_PAGES` / `OCR_PDF_SCALE` / `OCR_PDF_TIMEOUT_MS` | `10` / `2` / `120000` | Scanned-PDF rasterization limits and shared OCR deadline |
+| `WHISPER_URL` | `http://whisper:8000` | Local speech-to-text sidecar; `disabled` turns STT off |
+| `WHISPER_MODEL` | `Systran/faster-whisper-base` | Model preloaded by the sidecar |
+| `WHISPER_TIMEOUT_MS` | `120000` | Transcription timeout |
+| `JWT_SECRET` | dev fallback | Must be overridden in production (`JWT_SECRET_FILE`) |
+| `STRIPE_SECRET_KEY` | `sk_test_mock` | Live key enables Checkout/Portal; `sk_test_mock` = mock mode |
+| `STRIPE_PRICE_ID_BASIC` / `_PRO` / `_ENTERPRISE` | — | Stripe price IDs |
+| `STRIPE_WEBHOOK_SECRET` | — | Webhook signature verification |
+| `APP_BASE_URL` | `http://localhost:4200` | Links in emails and Stripe redirects |
+| `CORS_ORIGINS` | *(empty)* | Comma-separated allow-list; empty mirrors all origins (dev) |
+| `ACCOUNT_DELETION_GRACE_HOURS` | `24` | Delay before a scheduled account deletion is purged (1-168) |
+| `SENTRY_DSN` | *(empty)* | Optional backend Sentry DSN; empty disables the SDK |
+| `SENTRY_ENVIRONMENT` / `SENTRY_TRACES_SAMPLE_RATE` | `NODE_ENV` / `0` | Sentry environment and tracing rate (0..1) |
+| `AB_EXPERIMENTS` | *(empty)* | JSON experiment config; empty uses the landing-hero 50/50 default |
+| `EMAIL_TRANSPORT` | `console` | `smtp` in production; console transport refuses to run there |
+| `EMAIL_FROM` / `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` | — / — / `587` / `false` | SMTP delivery |
+| `SMTP_USER` / `SMTP_PASS` | — | Optional SMTP auth |
+| `AI_QUERY_TIMEOUT_MS` | `120000` | Synchronous query budget (504 afterwards) |
+| `AI_UPLOAD_MAX_BYTES` | `26214400` | Upload cap for AI endpoints (25 MB) |
+| `AI_STREAM_TTL_MS` | `600000` | SSE stream/event retention |
+| `AI_STREAM_MAX_LOG_EVENTS` | `5000` | Max buffered events per stream |
+| `AI_STREAM_PUBLISH_TIMEOUT_MS` / `AI_STREAM_SUBSCRIBE_TIMEOUT_MS` | `2000` / `5000` | Redis pub/sub deadlines |
+| `AI_STREAM_REDIS_COOLDOWN_MS` | `30000` | Fallback-to-local period after a Redis failure |
+| `RAG_CACHE_TTL_SECONDS` | `300` | Legislation retrieval cache TTL |
+| `PLANS_CACHE_TTL_SECONDS` | `3600` | Billing plan catalog cache TTL |
+| `CACHE_PREFIX` | `nomos:cache` | Redis key namespace |
+| `FEATURE_FLAGS` | *(empty)* | `name` enables, `name:false` disables; known: `billing`, `documents`, `audio`, `adminDocuments` |
+| `QUOTA_AI_BASIC` / `_PRO` / `_ENTERPRISE` | `20` / `60` / `120` | Daily AI query caps |
+| `QUOTA_DOCS_BASIC` / `_PRO` / `_ENTERPRISE` | `10` / `50` / `unlimited` | Document caps |
+| `RETENTION_CONVERSATIONS_DAYS` / `_DOCUMENTS_DAYS` / `_AUDIT_LOG_DAYS` | `365` / `365` / `90` | Retention cleanup |
+| `BACKUP_DIR` | `backend/backups` | Local dump directory |
+| `BACKUP_S3_BUCKET` | *(empty)* | Offsite S3-compatible upload |
+| `S3_REGION` / `S3_ENDPOINT` / `S3_FORCE_PATH_STYLE` / `S3_PREFIX` / `S3_SSE` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | `us-east-1` fallback / — / `false` / `nomosai/` / — / — / — | S3 settings; when keys are unset the AWS default chain (`AWS_*`) is used |
+| `GRAFANA_PORT` / `GRAFANA_ADMIN_PASSWORD` | `3001` / — | Loopback-only Grafana (monitoring profile) |
+| `SLACK_WEBHOOK_URL` / `SLACK_CHANNEL` | — | Alertmanager Slack routing |
+| `ALERT_EMAIL_TO` / `ALERT_EMAIL_FROM` / `SMTP_REQUIRE_TLS` | — | Alertmanager email routing |
+| `EDGE_RATE_LIMIT_AVERAGE` / `EDGE_RATE_LIMIT_BURST` | `50` / `100` | Traefik edge requests/second and burst |
+| `EDGE_INFLIGHT_REQ_AMOUNT` | `100` | Traefik concurrent in-flight request cap |
+| `ADMIN_MAGIC_LINK_ENABLED` | `false` | Must be `true` to mint/redeem admin magic links in production |
+| `SCRAPED_LAWS_PATH` | `<repo>/scraped_laws.json` | Scraper output consumed by the ingest script |
+| `ALLOW_MOCK_CORPUS` | `false` | Allow the 3-article fallback corpus in production |
+| `INLINE_JOB_TTL_MS` / `INLINE_JOB_PRUNE_INTERVAL_MS` / `INLINE_QUEUE_CONCURRENCY` | `600000` / `60000` / `1` | No-Redis job retention/concurrency |
+| `INFERENCE_QUEUE_*` | see `.env.example` | Retries, backoff, lock/stall and retention tuning |
 
 ### Frontend
 
-The frontend reads nothing from env at runtime — the API URL is hard-coded as `http://localhost:3000` inside `src/app/services/*.service.ts`. Change those if you deploy behind a different host.
+There are no runtime env vars. `src/environments/environment*.ts` holds
+`apiBaseUrl` (empty = same origin) and `errorReportingUrl` (empty disables
+client-error reporting; set an absolute URL or `/api/client-errors` at build
+time to enable it). `sentryDsn` / `sentryTracesSampleRate` are also build-time
+values; the SDK is a no-op when the DSN is empty.
+
+`SITE_URL` (default `https://your-domain.gr`) is a Docker build arg:
+`npm run build` runs `ng build` followed by `scripts/apply-site-url.js`,
+which rewrites the placeholder origin in the built `index.html`,
+`sitemap.xml` and `robots.txt`. Set it before building each deployment
+(`docker build --build-arg SITE_URL=https://app.example.com ./frontend` or
+`SITE_URL=... docker compose build frontend`).
 
 ---
 
-## Database Schema
+## Database schema & migrations
 
-Initialized automatically by `database/init/schema.sql` on first DB boot. Eight tables + the `vector` extension:
+Tables created by `database/init/schema.sql`:
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
+| Table | Purpose |
+|---|---|
+| `users` | Accounts, role/tier, `token_version`, `verified_at`, `deletion_scheduled_for` |
+| `subscriptions` | Stripe customer/subscription linkage |
+| `invoices` | Persisted invoice/payment history (webhook-populated) |
+| `usage_counters` | Daily AI quota counters |
+| `stripe_webhook_events` | Webhook idempotency |
+| `conversations` / `messages` / `message_feedback` | Chat history, citations, ratings |
+| `legal_documents` | Uploads incl. `original_file BYTEA` + `file_size` |
+| `legal_document_chunks` | Extracted chunks + embeddings |
+| `legislation_embeddings` | Greek legislation chunks, `vector(1024)` |
+| `audit_log` | Security/business audit trail |
+| `password_reset_tokens` / `email_verification_tokens` / `email_change_tokens` | SHA-256-hashed, single-use tokens |
 
-| Table                       | Phase | Purpose                                                    |
-|-----------------------------|-------|------------------------------------------------------------|
-| `users`                     | —     | Accounts; columns: `id`, `email`, `password_hash`, `role`, `subscription_tier`, `token_version` (Phase 22, session-invalidation counter), `verified_at` (Phase 24, NULL until `/verify-email` succeeds) |
-| `subscriptions`             | —     | Stripe customer/subscription linkage                       |
-| `conversations`             | —     | Chat history (linked to `users.id`)                        |
-| `legal_documents`           | —     | User-uploaded evidence/contracts (PDFs, images)            |
-| `legislation_embeddings`    | —     | Greek legislation chunks with 768-dim vectors for RAG      |
-| `password_reset_tokens`     | 23    | One-time `/forgot-password` tokens (1-hour TTL)            |
-| `email_verification_tokens` | 24    | One-time `/register` + `/resend-verification` tokens (24h TTL) |
-
-Indices:
-
-- `HNSW` over `legislation_embeddings.embedding` (L2 distance) — sub-linear RAG retrieval.
-- B-tree on `password_reset_tokens.token_hash` and `email_verification_tokens.token_hash` — fast lookup on the `/reset-password` and `/verify-email` SELECT.
-- **Partial unique** `(token_hash) WHERE used_at IS NULL` on both token tables — DB-level single-use enforcement. Two concurrent `/reset-password` (or `/verify-email`) requests for the same token cannot both succeed even if the app-layer compare-and-set were ever bypassed.
-
-Migrations (run idempotently on existing databases):
-
-- `migrate-rbac.js` — adds `users.role` and backfills from `subscription_tier` (pre-Phase 17).
-- `migrate-token-version.js` — adds `users.token_version INT NOT NULL DEFAULT 1` (Phase 22).
-- `migrate-password-reset-tokens.js` — creates `password_reset_tokens` + indexes + partial-unique (Phase 23).
-- `migrate-email-verification.js` — adds `users.verified_at`, creates `email_verification_tokens` + indexes + partial-unique (Phase 24).
+Indexes include HNSW cosine on `legislation_embeddings.embedding`, B-tree
+lookups on token hashes, and partial unique indexes on unused token hashes.
+Parity between the init schema and every `migrate-*.js` script is pinned by
+`backend/tests/migrationParity.test.js`.
 
 ---
 
-## Backend API Reference
+## API reference
 
-Base URL: `http://localhost:3000`
+Base URL: same origin as the SPA (`/api/...`). Authenticated routes use
+`Authorization: Bearer <JWT>`.
 
-### `GET /health`
-Liveness probe. Returns `{ status: "ok", service: "NomosAI Backend", localPrivacyEnabled: true }`.
+### Health & metrics
 
-### `/api/auth` — Public
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| GET | `/health` | public | DB/Redis/queue/Ollama/Stripe checks; 503 when DB or Redis is down |
+| GET | `/api/ai/health` | public | Ollama warmup status |
+| GET | `/api/config` | public | `{ features: { ... }, experiments: { ... } }` |
+| GET | `/metrics` | public* | Prometheus metrics; keep it internal at the edge |
 
-| Method | Path                   | Body                          | Response                                                            |
-|--------|------------------------|-------------------------------|---------------------------------------------------------------------|
-| POST   | `/register`            | `{ email, password, role? }`  | **{ ok: true, requires_verification: true, user }** (no `token`)    |
-| POST   | `/login`               | `{ email, password }`         | `{ token, user }` OR 400 *“Email not verified…”* if `verified_at IS NULL` |
-| POST   | `/forgot-password`     | `{ email }`                   | Always 200 `{ ok: true }` (anti-enumeration)                        |
-| POST   | `/reset-password`      | `{ token, newPassword }`      | 200 `{ ok, token, user }` on valid token, 400 *“Invalid or expired reset link”* otherwise. Bumps `token_version`. |
-| POST   | `/verify-email`        | `{ token }`                   | 200 `{ ok, token, user }` on valid token, 400 *“Invalid or expired verification link”* otherwise. Sets `verified_at = NOW()` and bumps `token_version`. |
-| POST   | `/resend-verification` | `{ email }`                   | Always 200 `{ ok: true }` (anti-enumeration; only re-issues a token if user exists AND is unverified) |
-| POST   | `/change-password`     | `{ currentPassword, newPassword }` | 200 `{ ok, token, user }` with freshly-bumped-token-version JWT (Phase 22); old JWTs become invalid on the next request |
-| GET    | `/me`                  | —                             | 200 `{ user: { id, email, role, subscription_tier, created_at, token_version } }` |
+\* Prometheus scrapes it over the private compose network.
 
-Notes:
+### Auth (`/api/auth`)
 
-- **Client-supplied `role` is always coerced to `user`.** Any attempt to self-register as `admin` returns **403** even on a malformed body.
-- **Token TTL is 24h.** The `role` claim is normalized through `subscription_tier` for legacy-token compatibility.
-- **`MIN_PASSWORD_LENGTH = 8`** is the single source of truth — server, client (RegisterComponent / ChangePasswordComponent / ResetPasswordComponent all import it from `frontend/src/app/shared/auth.constants.ts`).
-- **Phase 22**: every authenticated request triggers a fresh SELECT in `authMiddleware` for `id / email / role / subscription_tier / created_at / token_version`. The JWT's `tv` claim is compared strict-equality to the live DB value. A mismatch (because `/change-password` or `/reset-password` bumped the counter) returns **401 *“Session invalidated; please log in again.”*** — never a silent acceptance of a stale token.
-- **Phase 23 / Phase 24 token storage**: tokens (reset, verification) are stored as **SHA-256 of the plaintext** — the plaintext is sent only via email. `expires_at` enforced at the SQL `WHERE` clause; `used_at IS NULL` enforces single-use. A DB leak therefore yields hashed values that cannot be replayed.
-- **Phase 23 reset path** does a `BEGIN / SELECT / UPDATE used_at (compare-and-set) / UPDATE users (password_hash + token_version + 1) / COMMIT` so a crash between the two UPDATEs rolls back atomically — there is no state where the token is “consumed” without the password having been rotated.
-- **Phase 24 verify path** is the same pattern with `verified_at = NOW()` instead of `password_hash`.
-- **Phase 21 rate limits**: `register` 5/hr per IP (test ceiling 1000), `login` 10/min per IP, `changePasswordPreAuth` 30/min per IP + `changePasswordPerAccount` 5/min + 20/day per user-id, `forgotPasswordIpMin` 5/min + `forgotPasswordIpHour` 20/hr + `forgotPasswordEmail` 3/hr per email, `resetPasswordIp` 10/min per IP, `verifyEmailIp` 20/min per IP, `resendVerificationIp` 5/min per IP + `resendVerificationEmail` 3/hr per email. Redis-backed in production (`rate-limit-redis` + `ioredis`); in-memory in tests. `passOnStoreError: true` so a Redis blip fails OPEN rather than 500-ing.
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/register` | `{ email, password }` | Creates an unverified user; no JWT until verification |
+| POST | `/login` | `{ email, password }` | `{ token, user }`; unverified accounts are rejected |
+| GET | `/me` | — | Live user row |
+| POST | `/change-password` | `{ currentPassword, newPassword }` | Returns a rotated JWT |
+| POST | `/forgot-password` | `{ email }` | Always 200 (anti-enumeration) |
+| POST | `/reset-password` | `{ token, newPassword }` | Consumes token, bumps `token_version`, returns JWT |
+| POST | `/verify-email` | `{ token }` | Sets `verified_at`, returns JWT |
+| POST | `/change-email` | `{ currentPassword, newEmail }` | Requires JWT; mails a confirmation link to the **new** address |
+| POST | `/verify-email-change` | `{ token }` | Atomic email swap + `token_version` bump, returns JWT |
+| POST | `/resend-verification` | `{ email }` | Always 200 |
+| POST | `/admin-magic-link/redeem` | `{ token }` | Off unless enabled (see `ADMIN_MAGIC_LINK_ENABLED`) |
 
-### `/api/ai` — Auth required (gated per route)
+Token tables store SHA-256 hashes only. Reset/verification/change tokens are
+single-use and expire (1 h reset, 24 h verification/change).
 
-| Method | Path             | Body / Form                        | Allowed roles               |
-|--------|------------------|------------------------------------|-----------------------------|
-| POST   | `/query`         | `{ prompt, useRag?, conversationId?, documentIds? }` | `user`, `admin`, `enterprise` |
-| POST   | `/query/stream`  | `{ prompt, useRag?, conversationId?, documentIds? }` | `user`, `admin`, `enterprise` |
-| POST   | `/audio-query`   | `multipart audio` (max 25 MB)      | `admin`, `enterprise`         |
-| POST   | `/multimodal`    | `multipart file` (max 25 MB)       | `admin`, `enterprise`         |
+### AI (`/api/ai`)
 
-### `/api/billing` — Auth required
+| Method | Path | Roles | Notes |
+|---|---|---|---|
+| POST | `/query` | user, admin, enterprise | Queued synchronous answer |
+| POST | `/query/stream` | user, admin, enterprise | Enqueue; poll the job below |
+| GET | `/query/stream/:jobId` | owner | `{ status, result? , error? }` |
+| DELETE | `/query/stream/:jobId` | owner | Best-effort cancellation of waiting jobs |
+| POST | `/query/live` | user, admin, enterprise | `{ jobId }` for a live SSE job |
+| GET | `/query/live/:jobId/events` | owner | SSE `chunk`, `done`, `error` events |
+| POST | `/audio-query` | admin, enterprise | Multipart audio → whisper → RAG answer |
+| POST | `/multimodal` | admin, enterprise | PDF/DOCX/image; images use vision or OCR |
+| POST | `/messages/:messageId/feedback` | owner | `{ helpful, reason? }`, replaces prior vote |
+| GET | `/models` | auth mount | Resolved chat/embed models |
 
-| Method | Path                       | Allowed roles                 |
-|--------|----------------------------|-------------------------------|
-| POST   | `/create-checkout-session` | `user`, `admin`, `enterprise` |
+Scanned PDFs without a text layer are rasterized (mupdf) and OCRed page by
+page; encrypted/password-protected PDFs are rejected by the OCR path (the
+multimodal endpoint returns 422). Limits: `OCR_PDF_MAX_PAGES`,
+`OCR_PDF_SCALE`, `OCR_PDF_TIMEOUT_MS`. Image uploads are OCR'd/vision-analyzed.
 
-Body: `{ tier: "basic" | "pro" | "enterprise" }`. Currently mocks a Stripe redirect to `http://localhost:4200/chat?mock_payment=success&tier=...`.
+### Billing (`/api/billing`) and subscriptions (`/api/subscriptions`)
 
-### `/api/admin` — Auth + Admin role required
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/billing/plans` | Server-owned plan catalog (cached) |
+| POST | `/billing/create-checkout-session` | `{ tier }` → Stripe Checkout or mock URL |
+| POST | `/billing/portal` | Stripe Billing Portal; live mode only |
+| POST | `/billing/mock-complete` | Dev-only mock completion; 403 in live mode |
+| POST | `/billing/webhook` | Stripe signature-verified; raw body, no auth header |
+| GET | `/subscriptions` | Current subscription |
+| GET | `/subscriptions/history` | Full subscription history |
+| GET | `/subscriptions/invoices?limit=&offset=` | Paginated invoices (`limit` ≤ 100) |
+| GET | `/subscriptions/usage` | Read-only quota usage |
+| POST | `/subscriptions/cancel` / `/reactivate` / `/upgrade` | Cancel, undo cancellation, checkout |
 
-| Method | Path                          | Body                         |
-|--------|-------------------------------|------------------------------|
-| GET    | `/users`                      | —                            |
-| PATCH  | `/users/:id/role`             | `{ role: "user"\|"admin"\|"enterprise" }` |
-| PATCH  | `/users/:id/tier`             | `{ tier: "basic"\|"pro"\|"enterprise" }` |
+Webhook events handled: `checkout.session.completed`,
+`customer.subscription.updated`, `customer.subscription.deleted`,
+`invoice.paid`, `invoice.payment_succeeded`, `invoice.payment_failed`.
+Register the endpoint (and print a new signing secret once) with
+`npm run stripe:webhook`; see
+[`docs/production-hardening.md`](docs/production-hardening.md#stripe-webhook-registration).
 
-The `PATCH role` endpoint refuses to demote yourself (returns 409) so the system never gets locked out of admins.
+### Documents (`/api/documents`)
 
-`GET /feedback-summary?days=30` returns only aggregate helpful/unhelpful counts and rate; it never returns prompts, answers, document names, or free-text feedback reasons.
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/` | Multipart upload (PDF/DOCX/TXT, 25 MB) |
+| GET | `/` | Paginated list |
+| GET | `/:id` | Metadata + chunk count |
+| GET | `/:id/content` | Original file download; `?format=text` returns extracted text |
+| DELETE | `/:id` | Delete document + chunks |
+| POST | `/search` | Semantic search over the user's chunks |
 
----
+### Admin (`/api/admin`, admin only)
 
-## Frontend Routes & Components
+`GET /users`, `PATCH /users/:id/role`, `PATCH /users/:id/tier`,
+`GET /audit-log`, `GET /feedback-summary`, and
+`GET /documents?q=&userId=&limit=&offset=` (filename/title/owner email search,
+pagination), `DELETE /documents/:id`.
 
-| Path                | Component                  | Guard                       | Purpose                                                |
-|---------------------|----------------------------|-----------------------------|--------------------------------------------------------|
-| `/`                 | `LandingComponent`         | —                           | Three.js + GSAP hero splash                            |
-| `/login`            | `LoginComponent`           | —                           | Email/password login (Phase 24: surfaces inline Resend-verification affordance on `kind: 'unverified'`) |
-| `/register`         | `RegisterComponent`        | —                           | Sign-up form (Phase 24: shows “Check your email” panel on success instead of routing to `/chat`) |
-| `/forgot-password`  | `ForgotPasswordComponent`  | —                           | Email-only form → always 200                           |
-| `/reset-password`   | `ResetPasswordComponent`   | —                           | Reads `?token=…` from queryParamMap → resets + auto-signs-in |
-| `/verify-email`     | `VerifyEmailComponent`     | —                           | Reads `?token=…` from queryParamMap → verifies + auto-signs-in (Phase 24) |
-| `/change-password`  | `ChangePasswordComponent`  | `authGuard`                 | Authenticated password rotation (Phase 22: server returns fresh token in response) |
-| `/chat`             | `ChatComponent`            | `authGuard`                 | SSE streaming chat + 🎤 voice input                   |
-| `/admin`            | `AdminComponent`           | `adminGuard` (admin only)   | User & subscription management                         |
-| `**`                | redirects to `/`           |                             |                                                        |
+### Other
 
-### Frontend services
-
-- **`AuthService`** — wraps `/api/auth/*` (Phase 24: `register()` now returns a discriminated `RegisterResult` with `requires_verification`; `login()` returns a discriminated result with `kind: 'invalid_credentials' | 'unverified' | 'network' | 'server'`; new `verifyEmail(token)` and `resendVerification(email)` wrappers). Token + user swap on successful password change / reset / verification is implemented identically so guards pick up the rotated credential instantly. RxJS `token$` and `user$` BehaviorSubjects; hydrates from `localStorage` on cold start.
-- **`AiService`** — `streamQuery(prompt, conversationId, documentIds)` polls queued inference and emits `{ content, messageId, sources, confidence }`; `uploadAudio(blob)` uses the same contract. `submitFeedback(messageId, helpful, reason?)` replaces the signed-in user's existing vote for that answer.
-- **`AdminService`** — `listUsers`, `updateRole`, `updateTier` (auto-logs-out on 401).
-
-### Frontend guards & interceptors
-
-- **`authGuard`** — Redirects to `/login` if no JWT.
-- **`adminGuard`** — Redirects non-admins to `/chat`.
-- **`authInterceptor`** — Attaches `Authorization: Bearer <token>` to all outbound HTTP. **Phase 22**: a global `catchError` calls `AuthService.logout()` on any **401** so other tabs/devices holding the now-stale token after `/change-password` silently fall back to `/login` without showing API errors in the UI.
-
-### Frontend constants
-
-- **`shared/auth.constants.ts`** — single source for `MIN_PASSWORD_LENGTH = 8` (and any future auth-shaped thresholds). Imported by `RegisterComponent`, `ChangePasswordComponent`, `ResetPasswordComponent`, and `VerifyEmailComponent` so the UI floor matches the server's enforced floor byte-for-byte.
-
----
-
-## Backend Services & Middlewares
-
-### `services/emailService.js` (Phase 23 + 24)
-
-Pluggable email transport for the password-recovery and email-verification flows. Currently a *dev* `console` provider that logs the reset / verify URL with a `[DEV-EMAIL]` prefix to stdout — copy it out of `docker logs` to walk through the flow locally. A shared `assertSafeSend()` helper **hard-throws** if `NODE_ENV === 'production'` (the dev transport prints the raw bearer credential) and fails loud if `EMAIL_TRANSPORT` is set to anything other than `console`. Production swap-in is one file change: a nodemailer (or RESEND / Postmark / SendGrid) provider gated on `process.env.EMAIL_TRANSPORT === 'smtp'` + `SMTP_HOST/PORT/USER/PASS/EMAIL_FROM`. Exposed surface (unchanged across transports):
-
-- `sendPasswordReset(toEmail, resetToken)` — `/forgot-password` calls this with the plaintext SHA-256-not-yet'd token.
-- `sendEmailVerification(toEmail, verifyToken)` — `/register` and `/resend-verification` fire this with the plaintext verify token.
-
-### `middlewares/rateLimiters.js` (Phase 21)
-
-`createRateLimiters()` factory that hands back a map of `express-rate-limit@7` middlewares keyed by route (`register`, `login`, `changePasswordPreAuth`, `changePasswordPerAccount`, `changePasswordPerAccountDaily`, `forgotPasswordIpMin`, `forgotPasswordIpHour`, `forgotPasswordEmail`, `resetPasswordIp`, `verifyEmailIp`, `resendVerificationIp`, `resendVerificationEmail`). Honors `NODE_ENV === 'test'` automatically — applies a 1000-iteration `TEST_CEILING` to every limit so a single jest suite can run dozens of requests from `127.0.0.1` without tripping. `passOnStoreError: true` so a Redis outage fails open. Per-IP keys use `req.ip` (configured via `trust proxy` in `index.js` — `'uniquelocal,loopback'` by default); per-account keys split on `req.user.id` (populated by `authMiddleware`); per-email keys lowercase + trim the address before keying so case-variants share a bucket. Comprehensive section listing per-key caps in [Backend API Reference → /api/auth](#apiauth--public).
-
-### `services/ollamaService.js`
-Pure wrapper around the Ollama JS SDK. Exports:
-
-- `generateResponse(prompt, contextStr)` — non-streaming chat.
-- `streamResponse(prompt, contextStr, res)` — SSE writer; sends `data: [DONE]` terminator.
-- `generateEmbedding(text)` — currently returns a mock 768-dim random vector (placeholder for an Ollama embedding model or Gemini Embeddings API).
-
-A canonical system prompt forces the model to act as an elite Greek attorney that answers in formal Greek and refuses to hallucinate articles.
-
-### `services/ragService.js`
-- `retrieveContext(query, limit=3)` — embeds the query, then runs a pgvector similarity search against `legislation_embeddings` ordered by L2 distance.
-- `formatContextForGemma(docs)` — formats hits as `Πηγή — Άρθρο — Τίτλος — Content`.
-
-### `services/inferenceQueue.js` (Phase 16)
-BullMQ-backed queue with concurrency=1 intended to gate GPU access (so a single local GPU isn't overwhelmed by massive 128K-context RAG queries). **Currently not wired in** — `index.js` and `routes/ai.js` call `ollamaService` directly and never `require` this module, so the worker never starts. To activate it: add `require('./services/inferenceQueue')` once during bootstrap (side-effect import) and swap the synchronous call sites in `routes/ai.js` for `inferenceQueue.addInferenceJob(...)`.
-
-### `middlewares/privacyShield.js`
-Mounted globally. Per request it:
-1. Logs *only* the URL + method (no body).
-2. Sets `Cache-Control: no-store, no-cache, must-revalidate, proxy-revalidate` and Pragma/Expires headers to prevent intermediate caches from retaining legal answers.
-3. Stamps `req.isLocallyProcessed = true` (the `/health` endpoint surfaces this).
-
-### `middlewares/authMiddleware.js`
-- `authMiddleware` — parses `Authorization: Bearer <token>`, verifies with the shared JWT secret, attaches a normalized `req.user`.
-- `rbacMiddleware([allowed])` — factory returning a guard that 403s if the user's role isn't in the allowed list.
-- `normalizeRole(role, tier)` — legacy token compatibility: enterprise tier → enterprise role, admin tier → admin role, otherwise user.
+- `/api/conversations` — list/create/read/rename/delete.
+  `GET /api/conversations/:id?messageLimit=30&before=<messageId>` returns the
+  newest message page plus `hasMore` / `nextCursor`; omit `messageLimit` for
+  the legacy full-history response. The chat UI loads older pages on demand.
+- `/api/gdpr/export` — data export.
+- `/api/gdpr/account` — `DELETE` with `{ confirm: true, email }` schedules
+  deletion after `ACCOUNT_DELETION_GRACE_HOURS` (default 24; repeated calls do
+  not extend the deadline).
+- `/api/gdpr/deletion-status` — `{ deletionScheduledFor }` for the current
+  account.
+- `/api/gdpr/cancel-deletion` — clears a pending deadline (409 if none).
+- `/api/auth/*`, `/api/ai/*`, `/api/billing/*`, `/api/subscriptions/*`,
+  `/api/documents/*`, `/api/gdpr/*` are rate-limited; see
+  `middlewares/rateLimiters.js` for exact caps.
 
 ---
 
-## CLI Scripts
+## Frontend
 
-All scripts live in `backend/src/scripts/`.
+Routes: `/`, `/login`, `/register`, `/forgot-password`, `/reset-password`,
+`/verify-email`, `/admin-login`, `/chat`, `/change-password`, `/documents`,
+`/conversations`, `/billing`, `/subscriptions`, `/profile`, `/admin`,
+`/admin/documents`, and a Greek 404 page.
 
-### `create-admin.js`
-
-```bash
-node src/scripts/create-admin.js <email> <password>
-```
-
-Creates the user if absent, otherwise promotes them to `role=admin, subscription_tier=enterprise`. **Phase 24 note**: the inserted row leaves `verified_at = NULL`; the bootstrap operator needs to either hit the `[DEV-EMAIL] Email-verification requested for …` URL in `docker logs` or `UPDATE users SET verified_at = NOW()` directly. A future change could mark verified at creation (recommended for the dev `create-admin` shortcut since the CLI is run with operator-console access, not via the customer email flow).
-
-### `create-admin-magic-link.js` (Phase 25)
-
-```bash
-node src/scripts/create-admin-magic-link.js <email> [ttlMinutes]
-```
-
-Mints a short-lived (default 5 min, max 60) signed JWT and prints a
-`http://localhost:4200/admin-login?token=<jwt>` URL. Paste the URL into a
-browser to land signed in at `/admin` without typing a password.
-
-**Security model:**
-
-- Token is signed with the same `JWT_SECRET` the backend uses to mint
-  session JWTs. A separate `kind: 'admin_magic'` claim makes it safe to
-  use `jwt.verify` here without trading away session-token isolation.
-- TTL is bounded by `expiresIn`. `jwt.verify` throws on expiry; the route
-  returns 400.
-- The redeem endpoint re-reads `users.role` from the LIVE row (Phase 22
-  posture), so demoting an admin between mint and redeem blocks the
-  redemption. Legacy `tier='admin'` rows are accepted here for parity
-  with `authMiddleware`'s `normalizeRole()` rule.
-- On success the redeem bumps `users.token_version`, invalidating any
-  other live session JWTs for that admin; the freshly-signed session
-  JWT below carries the new `tv` and `authMiddleware` accepts it.
-- **Hard gate**: with `NODE_ENV=production`, both the CLI and the route
-  refuse to run unless `ADMIN_MAGIC_LINK_ENABLED=true` is set. The dev
-  compose leaves `NODE_ENV` unset → enabled automatically.
-- **Within the TTL window, the same bearer can be redeemed more than
-  once.** Each replay mints a new session JWT and bumps `tv` again — no
-  DB-backed jti dedupe. This is a deliberate trade-off for a dev shortcut;
-  shorten the TTL or add dedupe if operating in a higher-trust regime.
-- The URL is a bearer credential. Anyone who reads the URL before the
-  TTL elapses can log in — treat it like a password. Forwarding via
-  email / Slack leaks it. Browser history and the `Referer` header also
-  leak it. Use TLS in any non-localhost deployment.
-
-### `migrate-rbac.js`
-
-```bash
-node src/scripts/migrate-rbac.js
-```
-
-Idempotent migration: adds `users.role` (NOT NULL, CHECK constraint) and backfills from `subscription_tier`. Safe to re-run.
-
-### `migrate-token-version.js` (Phase 22)
-
-```bash
-node src/scripts/migrate-token-version.js
-```
-
-`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INT NOT NULL DEFAULT 1`. Existing rows backfill atomically to 1. Safe to re-run.
-
-### `migrate-password-reset-tokens.js` (Phase 23)
-
-```bash
-node src/scripts/migrate-password-reset-tokens.js
-```
-
-`CREATE TABLE IF NOT EXISTS password_reset_tokens (...)` + indexes + the partial unique `(token_hash) WHERE used_at IS NULL`. Safe to re-run.
-
-### `migrate-email-verification.js` (Phase 24)
-
-```bash
-node src/scripts/migrate-email-verification.js
-```
-
-`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ` + `CREATE TABLE IF NOT EXISTS email_verification_tokens (...)` + indexes + partial unique. Safe to re-run.
-
-### `ingestLegislation.js` (Phase 26: scrape → RAG wiring)
-
-```bash
-node src/scripts/ingestLegislation.js
-```
-
-Bridges the Python scraper (`prototype_scraper.py`) into the live RAG layer so the LLM has real Greek-law context for every user question:
-
-1. **Reads** `<repo-root>/scraped_laws.json` if present (override via the `SCRAPED_LAWS_PATH` env var). Schema mapping: scraper `source/law_number/law_title/full_text → source_type/article_number/title/content`.
-2. **Drops** scraped rows with missing critical fields (`full_text` empty or `law_number` blank).
-3. **Merges** the scraped corpus with 3 hardcoded fallback mock articles (Civil Code Άρθρα 57 & 288; Penal Code Άρθρο 299) so a brand-new env — even before the Python scraper has run — still has something for RAG to surface.
-4. **Embeds** each row via the live Ollama embed model (`nomic-embed-text` by default, configurable via `OLLAMA_EMBED_MODEL`). Failures here surface as `[ingest] Failed to ingest <condition>` per row, AND a non-zero process exit code.
-5. **Idempotent re-runs**: a SELECT-then-INSERT guard on `(source_type, article_number)` skips already-ingested rows. Safe to rerun after every scrape refresh.
-
-**Operator setup (one-time):**
-
-```bash
-docker exec greeklaywerai-ollama-1 ollama pull nomic-embed-text
-```
-
-Without that pull, the script (and `/api/ai/query`) will fail loudly with a clear error rather than silently returning noise vectors (the pre-Phase-26 bug class).
-
-**Pipelining workflow after each scrape refresh:**
-
-```bash
-# (a) Refresh scraped_laws.json at the repo root
-python3 prototype_scraper.py
-
-# (b) Push it into the backend container so ingest sees it
-docker cp scraped_laws.json greeklaywerai-backend-1:/tmp/scraped_laws.json
-SCRAPED_LAWS_PATH=/tmp/scraped_laws.json docker exec -i greeklaywerai-backend-1 \
-  node src/scripts/ingestLegislation.js
-```
-
-(For a permanent setup, mount the repo into the backend container via `docker-compose.yml` so the script auto-picks up `<repo-root>/scraped_laws.json` with no `SCRAPED_LAWS_PATH` override.)
-
-**Why exit 1 on any failure:** operators running this from a CI cron would otherwise silently accumulate a partial ingest that skews pgvector similarity scores. The per-row `[ingest] Failed to ingest …` log line enumerates each failure for triage.
-
-### `legalBenchmarks.js` (Phase 19)
-
-```bash
-node src/scripts/legalBenchmarks.js
-```
-
-Runs ~7 legal Q&A scenarios through RAG → Gemma and reports response lengths/latencies. Foundation for a future harness using GPT-4-as-judge.
+- **i18n** — Greek default + English; dictionaries must stay key-identical
+  (pinned by `i18n.spec.ts`).
+- **PWA** — `manifest.webmanifest`, 192/512 icons, Angular service worker
+  generated only in production. nginx serves the manifest as
+  `application/manifest+json` and never caches `ngsw-worker.js`, `ngsw.json`
+  or `index.html`.
+- **SEO** — canonical/OG/Twitter metadata in `index.html`, `robots.txt` and
+  `sitemap.xml` at the origin root, content-hashed assets cached immutable.
+- **Resilience** — `GlobalErrorHandler` shows a translated banner and can POST
+  errors to `environment.errorReportingUrl`; the service worker is registered
+  after stabilization.
+- **Security headers** — nginx adds `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: strict-origin-when-cross-origin` and a
+  `Permissions-Policy`; the API adds CSP/HSTS-family headers via helmet.
+- **A/B experiments** — `GET /api/config` returns validated weighted variants
+  from `AB_EXPERIMENTS` (JSON). `ExperimentService` hashes a persistent client
+  id for deterministic assignment; the shipped experiment is
+  `landing-hero` (`control` / `variant`, 50/50 by default). No exposure
+  analytics are emitted; assignment is client-side only.
 
 ---
 
-## Greek Law Scraping Pipeline
+## Services & middlewares
 
-Documented in detail in [`scraping_architecture.md`](scraping_architecture.md) and demonstrated by [`prototype_scraper.py`](prototype_scraper.py).
+- **`inferenceQueue.js`** — BullMQ queue + concurrency-1 worker; inline
+  fallback without Redis. Streaming jobs publish deltas to `streamHub`.
+- **`streamHub.js`** — Redis pub/sub channels with buffering/replay, TTL,
+  capped event logs and a local fallback after Redis failures.
+- **`ollamaService.js`** — chat, token streaming, embeddings, warmup, shared
+  abort timeout; canonical Greek legal system prompt.
+- **`ragService.js`** — real `bge-m3` embeddings, pgvector cosine search,
+  Redis-cached retrieval, context/source formatting.
+- **`ocrService.js` / `pdfRasterService.js` / `visionService.js`** — serialized
+  Tesseract OCR, scanned-PDF page rasterization with typed errors, and optional
+  Ollama vision (`OLLAMA_VISION_MODEL`), with vision→OCR fallback.
+- **`stripeService.js`** — mock/live checkout, portal, plan catalog,
+  subscription upserts, invoice persistence, webhook handling.
+  `scripts/configure-stripe-webhook.js` registers the endpoint idempotently.
+- **`config/sentry.js`** — optional backend Sentry init; no-op without a DSN.
+- **`experiment.service.ts`** — fetches `/api/config` experiments and assigns
+  variants deterministically from a hashed client id; no exposure events.
+- **`emailService.js`** — console transport for dev, SMTP for
+  production/staging; password-reset, verification and email-change messages.
+- **`cacheService.js`** — namespaced, fail-open Redis JSON cache.
+- **`secrets.js`** — `*_FILE` resolution with plain-variable fallback.
+- **Middlewares** — `authMiddleware` (token_version check), RBAC, privacy
+  shield, rate limiters, quotas, Prometheus metrics, request logging, global
+  error handler.
 
-- **Targets**: Hellenic Parliament, Official Gazette (FEK), N-Lex, ECOLEX, FAOLEX, NATLEX, WIPO Lex.
-- **Output schema**: unified JSON with `id`, `source`, `law_title`, `law_number`, `fek_reference`, `publication_date`, `source_url`, `pdf_url`, `full_text`, `status`, `metadata`, `scraped_at`.
-- **Phases**: bulk historical scrape → daily incremental scrape with dedupe.
-- **Ethics**: rate-limited, rotating user-agents, exponential backoff, robots.txt compliant.
+---
 
-### End-to-end flow (Phase 26)
+## Production operations
 
-```
-prototype_scraper.py  →  scraped_laws.json  →  ingestLegislation.js  →  legislation_embeddings  →  /api/ai/query RAG retrieval
-   (Python 3.10+)         (unified JSON)        (Node CLI, idempotent)         (pgvector HNSW)            (real Greek legal context)
-```
-
-`ingestLegislation.js` reads `scraped_laws.json` from the repo root (or `SCRAPED_LAWS_PATH`), normalizes each law's schema fields into the DB row shape, vectorizes via `nomic-embed-text`, and INSERTs with a SELECT-then-INSERT guard so re-runs are idempotent. After every scrape refresh, operators rerun the ingest and the chat UI's `/api/ai/query` endpoint surfaces relevant Άρθρα in the LLM context for every user question.
+- **Compose / TLS** — `docker-compose.prod.yml` runs Traefik v3.7 as the only
+  public edge (`HTTP_PORT`/`HTTPS_PORT`, Let's Encrypt production ACME);
+  nginx serves the SPA and proxies `/api/`. Staging mirrors this with the
+  Let's Encrypt staging CA by default. See
+  [`docs/production-hardening.md`](docs/production-hardening.md) and
+  [`docs/staging-deployment.md`](docs/staging-deployment.md).
+- **Edge protection** — Traefik adds configurable per-IP rate limiting
+  (`EDGE_RATE_LIMIT_AVERAGE`/`_BURST`) and an in-flight request cap. Cloudflare
+  real-IP ranges are mounted into nginx from `deploy/cloudflare/real-ip.conf`;
+  WAF/CDN/cache/DDoS are account-side controls documented in
+  [`deploy/cloudflare/README.md`](deploy/cloudflare/README.md).
+- **Kubernetes** — [`deploy/k8s/`](deploy/k8s/README.md) provides 2+ replica
+  backend/frontend Deployments, a dedicated single-replica BullMQ worker
+  (web pods set `QUEUE_WORKER_ENABLED=false` so GPU concurrency stays at 1),
+  Services, an HPA, probes, resource limits and an Ingress against external
+  PostgreSQL/Redis/Ollama. Compose remains the single-host default.
+- **Sentry (optional)** — backend DSN/rates via env, frontend DSN at build
+  time; both are inert without a DSN. See
+  [`docs/observability.md`](docs/observability.md).
+- **Secrets** — `.env.production` / `.env.staging` (mode `0600`, both ignored
+  by git) plus optional Docker secret files via `*_FILE`.
+- **Observability** — optional `--profile monitoring` adds Prometheus,
+  Alertmanager (Slack/email), Grafana (loopback only), Loki and Promtail.
+  Alerts cover backend down, 5xx rate, queue depth, Redis, disk space and
+  backup freshness. See [`docs/observability.md`](docs/observability.md).
+- **Backups** — daily `pg_dump` into a named volume, optional S3-compatible
+  upload, freshness metric, restore CLI and drill. See
+  [`docs/backup-restore.md`](docs/backup-restore.md).
+- **DAST** — `.github/workflows/zap.yml` runs a weekly ZAP baseline scan
+  against `STAGING_BASE_URL`.
+- **Feature flags** — `FEATURE_FLAGS` controls SPA features through
+  `GET /api/config`; flags default to enabled.
+- **Caching** — RAG retrieval and the plan catalog are cached in Redis with
+  configurable TTLs; every cache path fails open.
 
 ---
 
 ## Testing
 
-### Backend (Jest + Supertest)
+### Backend
 
 ```bash
 cd backend
-npm install
-npm test
+npm test -- --runInBand
 ```
 
-`backend/tests/api.test.js` exercises:
+Jest + Supertest covers auth/verification/email-change, AI routes and live
+streaming, queue hardening, multimodal OCR/vision, RAG cache, billing/invoices,
+webhooks, document originals, admin search, quotas, rate limits, migrations,
+compose/monitoring configuration and backup/restore.
 
-- `POST /api/auth/register` — forced `user` role, blocked admin self-registration (403), duplicate handling, login flow, **Phase 24 register envelope** (`requires_verification: true`, no JWT in response) and unverified-login rejection.
-- `POST /api/ai/query` — auth (401), RBAC across `user`/`enterprise`, premium endpoint 403 for `user`.
-- `POST /api/ai/audio-query`, `/multimodal` — RBAC matrix.
-- `POST /api/billing/create-checkout-session` — RBAC matrix and mocked Stripe success URL.
-- `GET /api/admin/users`, `PATCH /api/admin/users/:id/role` — RBAC + invalid role rejection.
-
-`backend/tests/forgotReset.test.js` (Phase 23): 12 cases — happy `inserts a token row`, malformed email does NOT insert, unknown email still returns 200 (anti-enumeration), happy `consumes a reset token and auto-logs in`, malformed token on `/reset-password`, expired token, already-used token, body-too-long DoS clamp, missing fields, rate-limit keys honored. Uses an inline express+limiter build via `makeApp()` so each test scopes its own `db` / `emailService` mocks.
-
-`backend/tests/emailVerification.test.js` (Phase 24): 9 cases — register happy-path does NOT mint a JWT (and the response envelope has `requires_verification: true`); register-when-email-taken returns the conflict error **without** minting a token; `/login` rejects unverified; `/verify-email` happy-path on a fresh token (sets `verified_at`, bumps `token_version`); `/verify-email` rejects missing/invalid/expired/used token; `/verify-email` rejects non-hex token (defends against odd-keyed Redis rate-limit entries); `/resend-verification` is always 200 for existing AND unknown AND malformed emails (anti-enumeration) but only re-issues a token when the user exists AND is unverified.
-
-### Frontend (Karma + Jasmine)
+### Frontend
 
 ```bash
 cd frontend
-npm install
-npm test
+npx tsc -p tsconfig.spec.json --noEmit
+npx ngc -p tsconfig.app.json --noEmit
+npm test          # Karma + Jasmine; needs a Chrome/Chromium binary
+npm run build     # production build incl. service worker
 ```
 
-Coverage includes `AuthService`, `AdminService`, `AiService`, `authGuard`, `adminGuard`, `LoginComponent`, `AdminComponent`, and `AppComponent`.
+Karma is memory-hungry in constrained environments; the type-checks above are
+the fast, deterministic gate.
 
 ---
 
-## Security & Privacy
-
-- **Password storage**: bcryptjs with cost factor ≥ 12 at registration, 10 in the bootstrap admin script.
-- **JWT auth**: stateless, 24h TTL, secret overridable via env. **Phase 22** adds `token_version` as a JWT claim; `authMiddleware` re-reads the live value from Postgres on every authenticated request and strict-equality-checks it. `tv` mismatch returns 401 *“Session invalidated”*. This is *not* an upper-bound check — passing a smaller tv is treated the same as a missing/garbled one.
-- **Session invalidation surface area** (Phase 22): `/change-password`, `/reset-password`, and `/verify-email` all atomically bump `token_version = token_version + 1` in the same UPDATE that performs their primary write. So a stolen JWT can’t outlive: a voluntary rotation, a forgotten-password recovery, or a successful email verification. The bump is hard-baked into the route handler — there's no admin-side “bump-all” button because individual users self-serve invalidation through their own recovery flow.
-- **Auth-route rate limiting** (Phase 21): stacked per-IP caps protect the public auth surface from credential stuffing and bulk account creation; per-account caps on `/change-password` (5/min + 20/day) defend against a stolen-JWT-driven brute force; per-email caps on `/forgot-password` and `/resend-verification` (3/hr) block address-spam enumeration. All caps are env-overridable and honored by tests via `1000-iteration TEST_CEILING`. Redis-backed in production; `passOnStoreError: true` so a Redis blip fails open rather than 500-ing the world.
-- **Email verification at registration** (Phase 24): `verified_at IS NULL` rows can never receive a JWT, even with a correct password. Verification tokens are SHA-256-hashed at rest with a 24-hour TTL and a partial unique index on `(token_hash) WHERE used_at IS NULL` for DB-level single-use. The signup flow never sends account-bearing data until `/verify-email` consumes a row, so a leaked DB dump cannot impersonate as-yet-unverified accounts.
-- **Password reset tokens**: SHA-256-hashed at rest with 1-hour TTL and the same partial unique index shape. `/reset-password`'s `BEGIN / SELECT / UPDATE used_at (compare-and-set) / UPDATE users (password_hash + token_version + 1) / COMMIT` is atomic — a crash between the two UPDATEs rolls back, so an admin query for “consumed tokens without a password change” always returns zero rows.
-- **Anti-enumeration on recovery endpoints**: `/forgot-password` and `/resend-verification` ALWAYS return 200 with the same generic `{ ok: true }` body, regardless of whether the email exists. A 50–200 ms random jitter smooths response-time differences between “user exists” and “user does not exist” so a high-resolution timer can't distinguish the two paths. **`/resend-verification` re-issues only when the user exists AND is unverified** so already-active accounts don't get pointless re-sends.
-- **Capped email body length**: 320-char clamp on every email-shaped request body (RFC 5321's 254-char theoretical limit + headroom). Without this clamp, an attacker could submit a multi-MB email string that flows straight into a per-email Redis rate-limit key.
-- **Role-based access control**: enforced twice — first at the route level by `rbacMiddleware`, then again at the query layer where sensitive updates (e.g. admin role changes) are blocked server-side.
-- **Self-demotion guard**: admins cannot demote themselves via the API (409) or the UI (disabled control + client-side check).
-- **Privacy Shield** (GDPR): logs scrubbed of PII, responses flagged `no-store`, requests stamped as locally processed so the `/health` endpoint can advertise it.
-- **File uploads**: capped at 25 MB by `multer` to mitigate trivial DoS on `/api/ai/*`.
-- **Strict input validation**: numeric IDs parsed with `Number.isInteger`, role/tier values checked against allow-lists before any DB write.
-
----
-
-## Production Deployment (GPU)
-
-`docker-compose.prod.yml` extends the dev stack with:
-
-- `NODE_ENV=production` baked into the backend.
-- `restart: always` on every service.
-- **NVIDIA GPU pass-through** enabled for the Ollama container (`driver: nvidia`, `count: 1`, `capabilities: [gpu]`). Requires the host to have the NVIDIA Container Toolkit installed.
-- Frontend re-mapped from 4200 → **port 80** for production ingress.
-- Secrets sourced from environment variables (`${DB_PASSWORD}`, `${STRIPE_SECRET_KEY}`) instead of baked defaults.
-
-Spin up:
-
-```bash
-DB_PASSWORD=$(openssl rand -hex 32) \
-STRIPE_SECRET_KEY=sk_live_... \
-docker-compose -f docker-compose.prod.yml up -d --build
-```
-
-Verify GPU acceleration is working inside the Ollama container:
-
-```bash
-docker exec greeklaywerai-ollama-1 nvidia-smi
-```
-
----
-
-## Project Structure
+## Project structure
 
 ```
-.
-├── backend/
-│   ├── Dockerfile
-│   ├── package.json
-│   ├── src/
-│   │   ├── index.js                      # Express bootstrap
-│   │   ├── config/db.js                  # pg pool
-│   │   ├── routes/{auth,ai,admin,billing}.js
-│   │   ├── services/{ollamaService,ragService,inferenceQueue,emailService}.js
-│   │   ├── middlewares/{authMiddleware,privacyShield,rateLimiters}.js
-│   │   └── scripts/
-│   │       ├── create-admin.js
-│   │       ├── migrate-rbac.js
-│   │       ├── migrate-token-version.js          # Phase 22
-│   │       ├── migrate-password-reset-tokens.js  # Phase 23
-│   │       ├── migrate-email-verification.js     # Phase 24
-│   │       ├── ingestLegislation.js
-│   │       └── legalBenchmarks.js
-│   └── tests/
-│       ├── app.js                                # Express app under test
-│       ├── api.test.js                           # Core auth/AI/billing/admin
-│       ├── forgotReset.test.js                   # Phase 23 — forgot/reset flow
-│       └── emailVerification.test.js            # Phase 24 — verify/resend flow
-│
-├── frontend/
-│   ├── Dockerfile
-│   ├── package.json
-│   ├── angular.json
-│   └── src/app/
-│       ├── app.{component,config,routes}.ts
-│       ├── components/
-│       │   ├── landing/landing.component.ts
-│       │   ├── login/    {login.component.ts, login.component.html}
-│       │   ├── register/ {register.component.ts, register.component.html}
-│       │   ├── forgot-password/{forgot-password.component.ts, .html}
-│       │   ├── reset-password/ {reset-password.component.ts, .html}
-│       │   ├── change-password/{change-password.component.ts, .html}
-│       │   ├── verify-email/   {verify-email.component.ts, .html}
-│       │   ├── chat/    chat.component.ts
-│       │   └── admin/   admin.component.ts
-│       ├── services/{auth,ai,admin}.service.ts
-│       ├── shared/auth.constants.ts              # MIN_PASSWORD_LENGTH etc.
-│       ├── guards/{auth,admin}.guard.ts
-│       └── interceptors/auth.interceptor.ts
-│
-├── database/
-│   └── init/schema.sql                   # pgvector schema, run on first DB boot
-│
-├── scraped_laws.json                     # Sample output of prototype_scraper.py
-├── prototype_scraper.py                  # Python scraping prototype
-├── scraping_architecture.md              # Detailed scraping plan
-├── docker-compose.yml                    # Dev stack
-├── docker-compose.prod.yml               # Production stack (GPU)
-└── README.md                             # ← you are here
+backend/
+  src/
+    config/{db,secrets}.js
+    routes/{auth,ai,aiStream,billing,subscriptions,documents,admin,conversations,gdpr,webhook,config}.js
+    services/{ollamaService,ragService,inferenceQueue,streamHub,ocrService,visionService,
+              documentService,stripeService,emailService,cacheService,quotaService,auditLog}.js
+    middlewares/{authMiddleware,rateLimiters,quotaMiddleware,privacyShield,security,metrics,requestLogger}.js
+    scripts/{migrate-all,migrate-invoices,migrate-email-change,migrate-document-originals,
+             backupDb,restoreDb,retentionCleanup,ingestLegislation,...}.js
+  tests/
+frontend/
+  src/app/{components,services,guards,i18n}/
+  src/assets/{i18n,icons,sitemap.xml,robots.txt}
+  scripts/apply-site-url.js, nginx.conf, ngsw-config.json
+database/init/schema.sql
+deploy/traefik/{traefik.yml,traefik.prod.yml}
+deploy/cloudflare/{README.md,real-ip.conf}
+deploy/k8s/{README.md,namespace,configmap,secret.example,backend,frontend,ingress}.yaml
+monitoring/{prometheus,alertmanager,grafana,loki,promtail}
+docs/{production-hardening,observability,backup-restore,staging-deployment}.md
+docker-compose.yml, docker-compose.staging.yml, docker-compose.prod.yml
 ```
 
 ---
 
 ## Roadmap
 
-Tracked roughly by phases in the git commit history:
+Implemented already: local bge-m3 embeddings, legislation ETL, active
+inference queue, live SSE token streaming, live Stripe billing + invoices,
+email change, original document storage, OCR/vision images, scanned-PDF OCR,
+message pagination, scheduled account deletion, PWA/SEO with build-time
+`SITE_URL`, caching, feature flags, A/B experiments, optional Sentry,
+observability, S3 backups, ZAP, edge rate limiting with Cloudflare real-IP
+support, Kubernetes manifests and Stripe webhook registration.
 
-- **Phase 1–6**: Initial scaffolding → auth + RBAC → chat UI with SSE.
-- **Phase 7**: Audio query for premium users.
-- **Phase 14**: Stripe billing (mock).
-- **Phase 15**: Privacy Shield + GDPR header hardening.
-- **Phase 16**: BullMQ inference queue (hardware-aware concurrency).
-- **Phase 17–18**: Admin UI, RBAC migration, admin-creator script.
-- **Phase 19**: Legal accuracy benchmark suite.
-- **Phase 20**: Production compose with NVIDIA GPU pass-through.
-- **Phase 21**: Auth-route rate limiting (per-IP + per-account + per-email) and Redis-backed `express-rate-limit@7`.
-- **Phase 22**: Token-version session invalidation. `/change-password` and `/reset-password` bump `token_version` atomically; `authMiddleware` does strict-equality checking on every authenticated request.
-- **Phase 23**: Password recovery flow — `/forgot-password` + `/reset-password` with SHA-256-hashed, single-use, 1h-TTL tokens.
-- **Phase 24**: Email verification at registration — `/register` no longer mints a JWT, `/verify-email` and `/resend-verification` complete the flow with SHA-256-hashed, single-use, 24h-TTL tokens.
+Genuinely remaining / external:
 
-Next likely steps (open issues):
-
-- Real embeddings: swap `generateEmbedding` mock for `ollama.embeddings()` or Gemini Embeddings API.
-- Real Greek legislation ETL: load `scraped_laws.json` into `legislation_embeddings` via an ingestion worker.
-- Replace mock Stripe with the real Checkout SDK + webhook handler.
-- Tighten the benchmark harness with regex assertions + GPT-4-as-judge for hallucination detection.
+- **Cloudflare account configuration** — WAF managed rules, account-side
+  rate-limiting/cache rules, bot management and DDoS settings. The repository
+  ships the origin-side rate limits and real-IP include only; the account
+  controls cannot be configured in-repo.
+- **Hosted Sentry DSN** — the SDKs are wired and no-op without a DSN; a
+  hosted project/DSN is optional and external.
+- **Vault/OpenBao** — file-based secrets and Kubernetes Secrets are supported;
+  a secrets-manager integration is not shipped.
 
 ---
 

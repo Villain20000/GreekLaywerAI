@@ -77,6 +77,39 @@ async function generateResponse(prompt, context = '') {
   }
 }
 
+/**
+ * Token-streaming variant of generateResponse. Yields each Ollama delta to
+ * `onChunk` (awaited, so Redis publish order matches token order) and
+ * resolves with the concatenated final text. No synthetic tokens are ever
+ * produced: the callback only fires for deltas Ollama actually returned.
+ */
+async function generateResponseStream(prompt, context = '', onChunk) {
+  const fullPrompt = context ? `Σχετική νομοθεσία (Context):\n${context}\n\nΕρώτημα πελάτη (Question):\n${prompt}` : prompt;
+  let fullText = '';
+  try {
+    const stream = await ollama.chat({
+      model: MODEL_NAME,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: fullPrompt }
+      ],
+      stream: true
+    });
+
+    for await (const part of stream) {
+      const delta = part && part.message && part.message.content;
+      if (typeof delta === 'string' && delta.length > 0) {
+        fullText += delta;
+        if (typeof onChunk === 'function') await onChunk(delta);
+      }
+    }
+    return fullText;
+  } catch (error) {
+    console.error('Ollama streaming generation error:', error);
+    throw error;
+  }
+}
+
 // Generate embeddings via the local Ollama embedding model. This is the
 // real vectorizer for the RAG pipeline — it replaced a Math.random()-based
 // 768-dim placeholder because random vectors produced irrelevant
@@ -243,6 +276,7 @@ async function generateEmbedding(text) {
 
 module.exports = {
   generateResponse,
+  generateResponseStream,
   generateEmbedding,
   warmup,
   getWarmupStatus

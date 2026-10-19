@@ -14,10 +14,15 @@
 // passwords; a crashing deploy is strictly better than a silent one.
 
 const nodemailer = require('nodemailer');
+const { getSecret } = require('../config/secrets');
 
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:4200';
 const EMAIL_TRANSPORT = (process.env.EMAIL_TRANSPORT || 'console').toLowerCase();
 const EMAIL_FROM = process.env.EMAIL_FROM || 'NomosAI <no-reply@nomos.ai>';
+// SMTP credentials may be supplied as SMTP_USER/SMTP_PASS or as mounted
+// files via SMTP_USER_FILE/SMTP_PASS_FILE (see config/secrets.js).
+const SMTP_USER = getSecret('SMTP_USER', '');
+const SMTP_PASS = getSecret('SMTP_PASS', '');
 
 if (process.env.NODE_ENV === 'production') {
   const problems = [];
@@ -42,8 +47,8 @@ function getTransporter() {
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
       secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-      auth: process.env.SMTP_USER
-        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      auth: SMTP_USER
+        ? { user: SMTP_USER, pass: SMTP_PASS }
         : undefined
     });
   }
@@ -149,8 +154,76 @@ async function sendEmailVerification(toEmail, verifyToken) {
   );
 }
 
+/**
+ * Send the verification link for an email-address change to the NEW address.
+ * The address is not written to users.email until the token is consumed.
+ * @param {string} newEmail  The requested new address (recipient).
+ * @param {string} changeToken Plaintext 32-byte hex token; caller SHA256-hashed it for DB.
+ * @returns {Promise<void>}
+ */
+async function sendEmailChangeVerification(newEmail, changeToken) {
+  const changeUrl =
+    `${APP_BASE_URL}/verify-email?type=change&token=${encodeURIComponent(changeToken)}`;
+
+  if (EMAIL_TRANSPORT === 'smtp') {
+    await sendMail({
+      to: newEmail,
+      subject: 'NomosAI — Επιβεβαίωση αλλαγής email',
+      text:
+        'Ζητήσατε αλλαγή της διεύθυνσης email του λογαριασμού σας στο NomosAI.\n\n' +
+        `Επιβεβαιώστε τη νέα διεύθυνση από τον παρακάτω σύνδεσμο (ισχύει 24 ώρες):\n${changeUrl}\n\n` +
+        'Αν δεν υποβάλατε εσείς αυτό το αίτημα, αγνοήστε αυτό το email — η διεύθυνση δεν θα αλλάξει.'
+    });
+    return;
+  }
+
+  assertConsoleSafe();
+  console.log(
+    `[DEV-EMAIL] Email-change verification requested for ${newEmail}.\n` +
+    `             Change URL: ${changeUrl}\n` +
+    `             (Dev console transport; never run with NODE_ENV=production.)`
+  );
+}
+
+/**
+ * Notify a user that their account is scheduled for deletion after a grace
+ * period, and where to cancel it.
+ * @param {string} toEmail Recipient.
+ * @param {string|Date} scheduledFor Deletion deadline (ISO string or Date).
+ * @returns {Promise<void>}
+ */
+async function sendAccountDeletionScheduled(toEmail, scheduledFor) {
+  const deadline = new Date(scheduledFor);
+  const deadlineText = Number.isNaN(deadline.getTime())
+    ? String(scheduledFor)
+    : deadline.toISOString();
+  const cancelUrl = `${APP_BASE_URL}/profile`;
+
+  if (EMAIL_TRANSPORT === 'smtp') {
+    await sendMail({
+      to: toEmail,
+      subject: 'NomosAI — Προγραμματισμένη διαγραφή λογαριασμού',
+      text:
+        'Ζητήσατε τη διαγραφή του λογαριασμού σας στο NomosAI.\n\n' +
+        `Ο λογαριασμός θα διαγραφεί οριστικά στις ${deadlineText} (UTC).\n` +
+        `Μπορείτε να ακυρώσετε τη διαγραφή πριν από την προθεσμία από το προφίλ σας:\n${cancelUrl}\n\n` +
+        'Αν δεν υποβάλατε εσείς αυτό το αίτημα, ακυρώστε τη διαγραφή και αλλάξτε τον κωδικό σας.'
+    });
+    return;
+  }
+
+  assertConsoleSafe();
+  console.log(
+    `[DEV-EMAIL] Account deletion scheduled for ${toEmail} at ${deadlineText}.\n` +
+    `             Cancel URL: ${cancelUrl}\n` +
+    `             (Dev console transport; never run with NODE_ENV=production.)`
+  );
+}
+
 module.exports = {
   sendPasswordReset,
   sendEmailVerification,
+  sendEmailChangeVerification,
+  sendAccountDeletionScheduled,
   APP_BASE_URL
 };

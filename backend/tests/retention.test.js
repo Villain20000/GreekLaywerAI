@@ -17,9 +17,18 @@ jest.mock('../src/config/db', () => ({
  * Route mock rowCounts by statement so a full runRetention() sweep (three
  * DELETEs + the audit_log INSERT) can be exercised. Defaults to zero rows.
  */
-function mockRowCounts({ conversations = 0, documents = 0, auditLog = 0 } = {}) {
+function mockRowCounts({ accounts = 0, conversations = 0, documents = 0, auditLog = 0 } = {}) {
   db.query.mockImplementation(async (sql) => {
     const s = String(sql);
+    if (/DELETE FROM users/.test(s)) {
+      return {
+        rows: Array.from({ length: accounts }, (_, i) => ({
+          id: i + 1,
+          email: `user${i + 1}@nomos.ai`
+        })),
+        rowCount: accounts
+      };
+    }
     if (/DELETE FROM conversations/.test(s)) return { rows: [], rowCount: conversations };
     if (/DELETE FROM legal_documents\b/.test(s)) return { rows: [], rowCount: documents };
     if (/DELETE FROM audit_log/.test(s)) return { rows: [], rowCount: auditLog };
@@ -42,29 +51,34 @@ describe('retention service (1-5)', () => {
   });
 
   it('prunes conversations by updated_at and documents/audit_log by created_at', async () => {
-    mockRowCounts({ conversations: 5, documents: 3, auditLog: 7 });
+    mockRowCounts({ accounts: 2, conversations: 5, documents: 3, auditLog: 7 });
 
     const summary = await retention.runRetention();
 
-    expect(summary).toEqual({ conversations: 5, documents: 3, auditLog: 7 });
+    expect(summary).toEqual({ accounts: 2, conversations: 5, documents: 3, auditLog: 7 });
 
     const calls = deleteCalls();
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(4);
 
-    const conversationsSql = String(calls[0][0]);
+    const accountsSql = String(calls[0][0]);
+    expect(accountsSql).toMatch(/DELETE FROM users/);
+    expect(accountsSql).toMatch(/deletion_scheduled_for <= NOW\(\)/);
+    expect(accountsSql).toMatch(/RETURNING id, email/);
+
+    const conversationsSql = String(calls[1][0]);
     expect(conversationsSql).toMatch(/DELETE FROM conversations/);
     expect(conversationsSql).toMatch(/updated_at < NOW\(\)/);
-    expect(calls[0][1]).toEqual([365]);
-
-    const documentsSql = String(calls[1][0]);
-    expect(documentsSql).toMatch(/DELETE FROM legal_documents/);
-    expect(documentsSql).toMatch(/created_at < NOW\(\)/);
     expect(calls[1][1]).toEqual([365]);
 
-    const auditSql = String(calls[2][0]);
+    const documentsSql = String(calls[2][0]);
+    expect(documentsSql).toMatch(/DELETE FROM legal_documents/);
+    expect(documentsSql).toMatch(/created_at < NOW\(\)/);
+    expect(calls[2][1]).toEqual([365]);
+
+    const auditSql = String(calls[3][0]);
     expect(auditSql).toMatch(/DELETE FROM audit_log/);
     expect(auditSql).toMatch(/created_at < NOW\(\)/);
-    expect(calls[2][1]).toEqual([90]);
+    expect(calls[3][1]).toEqual([90]);
   });
 
   it('records the per-table summary in the audit log', async () => {
@@ -77,7 +91,12 @@ describe('retention service (1-5)', () => {
     const params = inserts[0][1];
     expect(params[1]).toBe('retention.cleanup');
     expect(params[2]).toBe('system');
-    expect(JSON.parse(params[5])).toEqual({ conversations: 5, documents: 3, auditLog: 7 });
+    expect(JSON.parse(params[5])).toEqual({
+      accounts: 0,
+      conversations: 5,
+      documents: 3,
+      auditLog: 7
+    });
   });
 
   it('returns all-zero counts for an empty sweep and still audits', async () => {
@@ -85,7 +104,7 @@ describe('retention service (1-5)', () => {
 
     const summary = await retention.runRetention();
 
-    expect(summary).toEqual({ conversations: 0, documents: 0, auditLog: 0 });
+    expect(summary).toEqual({ accounts: 0, conversations: 0, documents: 0, auditLog: 0 });
     expect(auditInsertCalls()).toHaveLength(1);
   });
 
@@ -102,7 +121,7 @@ describe('retention service (1-5)', () => {
 
     const summary = await retention.runRetention();
 
-    expect(summary).toEqual({ conversations: -1, documents: 2, auditLog: 1 });
+    expect(summary).toEqual({ accounts: 0, conversations: -1, documents: 2, auditLog: 1 });
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining('conversations cleanup failed'),
       'db down'
@@ -123,7 +142,7 @@ describe('retention service (1-5)', () => {
 
     const summary = await retention.runRetention();
 
-    expect(summary).toEqual({ conversations: 0, documents: 0, auditLog: 0 });
+    expect(summary).toEqual({ accounts: 0, conversations: 0, documents: 0, auditLog: 0 });
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining('logAudit failed'),
       'audit unavailable'
@@ -168,7 +187,7 @@ describe('retentionCleanup CLI (1-5)', () => {
 
     const summary = await main();
 
-    expect(summary).toEqual({ conversations: 0, documents: 0, auditLog: 0 });
+    expect(summary).toEqual({ accounts: 0, conversations: 0, documents: 0, auditLog: 0 });
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining('conversations=0 documents=0 audit_log=0')
     );
@@ -179,7 +198,7 @@ describe('retentionCleanup CLI (1-5)', () => {
 
     const summary = await main();
 
-    expect(summary).toEqual({ conversations: 5, documents: 3, auditLog: 7 });
+    expect(summary).toEqual({ accounts: 0, conversations: 5, documents: 3, auditLog: 7 });
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining('conversations=5 documents=3 audit_log=7')
     );

@@ -6,8 +6,26 @@
   <base href="/">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="An elite Greek AI lawyer powered by Gemma, grounded in real Greek legislation via pgvector RAG.">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://your-domain.gr/">
   <meta name="theme-color" content="#0a0a0a">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="assets/icons/icon-192.png">
+  <!-- Social cards. Replace https://your-domain.gr at deploy time (same
+       placeholder as docker-compose.prod.yml / robots.txt / sitemap.xml). -->
+  <meta property="og:title" content="NomosAI — Greek AI Lawyer">
+  <meta property="og:description" content="An elite Greek AI lawyer powered by Gemma, grounded in real Greek legislation via pgvector RAG.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://your-domain.gr/">
+  <meta property="og:site_name" content="NomosAI">
+  <meta property="og:locale" content="el_GR">
+  <meta property="og:locale:alternate" content="en_US">
+  <meta property="og:image" content="https://your-domain.gr/assets/icons/icon-512.png">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NomosAI — Greek AI Lawyer">
+  <meta name="twitter:description" content="An elite Greek AI lawyer powered by Gemma, grounded in real Greek legislation via pgvector RAG.">
+  <meta name="twitter:image" content="https://your-domain.gr/assets/icons/icon-512.png">
   <!--
     Phase 27: typography + theme bootstrap, both applied BEFORE the Angular
     bundle even evaluates — so no flash-of-wrong-font and no flash-of-wrong-
@@ -49,6 +67,23 @@
         // <html data-theme> stays unset so :root defaults to dark.
       }
     })();
+  </script>
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "NomosAI",
+      "url": "https://your-domain.gr/",
+      "description": "An elite Greek AI lawyer powered by Gemma, grounded in real Greek legislation via pgvector RAG.",
+      "applicationCategory": "LegalService",
+      "operatingSystem": "Web",
+      "inLanguage": ["el", "en"],
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "EUR"
+      }
+    }
   </script>
 </head>
 <body>

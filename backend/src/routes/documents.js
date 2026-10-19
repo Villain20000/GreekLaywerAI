@@ -37,6 +37,27 @@ function parsePositiveInt(raw) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+// Download filenames must not be able to break or inject headers: strip
+// CR/LF, control chars and path separators before using them.
+function sanitizeDownloadFilename(raw, fallback) {
+  const cleaned = String(raw || '')
+    .replace(/[\r\n]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\/]/g, '_')
+    .trim();
+  return cleaned || fallback;
+}
+
+// ASCII fallback for legacy clients + RFC 5987 filename* so Greek
+// filenames survive intact.
+function attachmentDisposition(filename) {
+  const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'download';
+  const encoded = encodeURIComponent(filename).replace(/['()*]/g, (c) =>
+    `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
 // POST /api/documents — upload + process (extract → chunk → embed)
 router.post(
   '/',
@@ -67,7 +88,7 @@ router.get('/', async (req, res) => {
     const limit = Math.min(Number.parseInt(req.query.limit, 10) || 20, 100);
     const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
     const result = await db.query(
-      `SELECT id, filename, title, content_type, metadata, created_at
+      `SELECT id, filename, title, content_type, metadata, file_size, created_at
        FROM legal_documents
        WHERE user_id = $1
        ORDER BY created_at DESC, id DESC
@@ -87,7 +108,7 @@ router.get('/:id', async (req, res) => {
     if (id === null) return res.status(400).json({ error: 'Invalid document id' });
 
     const result = await db.query(
-      `SELECT d.id, d.filename, d.title, d.content_type, d.metadata, d.created_at,
+      `SELECT d.id, d.filename, d.title, d.content_type, d.metadata, d.file_size, d.created_at,
               (SELECT COUNT(*) FROM legal_document_chunks c WHERE c.document_id = d.id) AS chunk_count
        FROM legal_documents d
        WHERE d.id = $1 AND d.user_id = $2`,
@@ -102,14 +123,17 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// GET /api/documents/:id/content — download/view original text
+// GET /api/documents/:id/content — original file, or extracted text
+// (?format=text). Legacy rows without original_file fall back to text.
 router.get('/:id/content', async (req, res) => {
   try {
     const id = parsePositiveInt(req.params.id);
     if (id === null) return res.status(400).json({ error: 'Invalid document id' });
 
+    // Text previews must not pull a 25 MB BYTEA into memory.
+    const withOriginal = req.query.format !== 'text';
     const result = await db.query(
-      `SELECT id, filename, content_type, parsed_text
+      `SELECT id, filename, content_type, parsed_text${withOriginal ? ', original_file' : ''}
        FROM legal_documents
        WHERE id = $1 AND user_id = $2`,
       [id, req.user.id]
@@ -118,12 +142,23 @@ router.get('/:id/content', async (req, res) => {
       return res.status(404).json({ error: 'Document not found' });
     }
     const doc = result.rows[0];
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="doc-${doc.id}.txt"`
-    );
-    res.send(doc.parsed_text || '');
+    res.setHeader('Cache-Control', 'no-store');
+
+    // Explicit text preview, or a legacy row uploaded before original bytes
+    // were persisted: keep the historical .txt attachment behavior.
+    if (req.query.format === 'text' || doc.original_file == null) {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="doc-${doc.id}.txt"`
+      );
+      return res.send(doc.parsed_text || '');
+    }
+
+    const filename = sanitizeDownloadFilename(doc.filename, `document-${doc.id}`);
+    res.setHeader('Content-Type', doc.content_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', attachmentDisposition(filename));
+    return res.send(doc.original_file);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

@@ -1,0 +1,80 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nomosai-config
+  namespace: nomosai
+  labels:
+    app.kubernetes.io/name: nomosai
+    app.kubernetes.io/part-of: nomosai
+data:
+  NODE_ENV: "production"
+  PORT: "3000"
+  LOG_LEVEL: "info"
+  TRUST_PROXY: "uniquelocal,loopback"
+
+  # External/managed services. Replace these with private endpoints reachable
+  # from the cluster (VPC peering, PrivateLink, Cloud SQL proxy, ...).
+  DB_HOST: "postgres.example.internal"
+  DB_PORT: "5432"
+  DB_USER: "nomos_admin"
+  DB_NAME: "nomos_db"
+  REDIS_URL: "redis://redis.example.internal:6379"
+  OLLAMA_URL: "http://ollama.example.internal:11434"
+  OLLAMA_EMBED_MODEL: "bge-m3"
+  OLLAMA_EMBED_DIM: "1024"
+  OLLAMA_CHAT_MODEL: "gemma2b-mmap"
+  OLLAMA_TIMEOUT_MS: "120000"
+  WHISPER_URL: "http://whisper.example.internal:8000"
+  WHISPER_MODEL: "Systran/faster-whisper-base"
+  WHISPER_TIMEOUT_MS: "120000"
+
+  APP_BASE_URL: "https://app.example.com"
+  CORS_ORIGINS: "https://app.example.com"
+  EMAIL_TRANSPORT: "smtp"
+  EMAIL_FROM: "NomosAI <no-reply@example.com>"
+  SMTP_HOST: "smtp.example.com"
+  SMTP_PORT: "587"
+  SMTP_SECURE: "false"
+
+  STRIPE_PRICE_ID_BASIC: "price_REPLACE_ME_BASIC"
+  STRIPE_PRICE_ID_PRO: "price_REPLACE_ME_PRO"
+  STRIPE_PRICE_ID_ENTERPRISE: "price_REPLACE_ME_ENTERPRISE"
+
+  FEATURE_FLAGS: ""
+  AB_EXPERIMENTS: "{\"landing-hero\":{\"variants\":{\"control\":50,\"variant\":50}}}"
+  SENTRY_ENVIRONMENT: "production"
+  SENTRY_TRACES_SAMPLE_RATE: "0"
+
+  RETENTION_CONVERSATIONS_DAYS: "365"
+  RETENTION_DOCUMENTS_DAYS: "365"
+  RETENTION_AUDIT_LOG_DAYS: "90"
+  ACCOUNT_DELETION_GRACE_HOURS: "24"
+
+  QUOTA_AI_BASIC: "20"
+  QUOTA_AI_PRO: "60"
+  QUOTA_AI_ENTERPRISE: "120"
+  QUOTA_DOCS_BASIC: "10"
+  QUOTA_DOCS_PRO: "50"
+  QUOTA_DOCS_ENTERPRISE: "unlimited"
+
+  RAG_CACHE_TTL_SECONDS: "300"
+  PLANS_CACHE_TTL_SECONDS: "3600"
+  CACHE_PREFIX: "nomos:cache"
+  AI_QUERY_TIMEOUT_MS: "120000"
+  AI_UPLOAD_MAX_BYTES: "26214400"
+  AI_STREAM_TTL_MS: "600000"
+  AI_STREAM_MAX_LOG_EVENTS: "5000"
+  AI_STREAM_PUBLISH_TIMEOUT_MS: "2000"
+  AI_STREAM_SUBSCRIBE_TIMEOUT_MS: "5000"
+  AI_STREAM_REDIS_COOLDOWN_MS: "30000"
+
+  OCR_LANGUAGES: "ell+eng"
+  OCR_TIMEOUT_MS: "30000"
+  OCR_PDF_MAX_PAGES: "10"
+  OCR_PDF_SCALE: "2"
+  OCR_PDF_TIMEOUT_MS: "120000"
+  OLLAMA_VISION_MODEL: ""
+  OLLAMA_VISION_TIMEOUT_MS: "120000"
+
+  ADMIN_MAGIC_LINK_ENABLED: "false"
+  ALLOW_MOCK_CORPUS: "false"

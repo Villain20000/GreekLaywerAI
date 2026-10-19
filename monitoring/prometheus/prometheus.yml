@@ -11,6 +11,11 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
 scrape_configs:
   # Backend exposes prom-client metrics at /metrics (no auth, internal only).
   - job_name: backend
@@ -28,3 +33,9 @@ scrape_configs:
   - job_name: node
     static_configs:
       - targets: ['node_exporter:9100']
+
+  # Alertmanager self-monitoring: feeds the AlertmanagerDown rule below so a
+  # broken notification path is visible in Grafana even when Slack is silent.
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']

@@ -11,6 +11,15 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   } as unknown as Response;
 }
 
+function downloadResponse(disposition: string | null, blob: Blob): Response {
+  return {
+    ok: true,
+    status: 200,
+    blob: () => Promise.resolve(blob),
+    headers: new Headers(disposition ? { 'Content-Disposition': disposition } : {})
+  } as unknown as Response;
+}
+
 class FakeXhr {
   static instances: FakeXhr[] = [];
   static autoComplete = true;
@@ -116,7 +125,7 @@ describe('DocumentService', () => {
     expect(String(fetchSpy.calls.mostRecent().args[0])).toBe('/api/documents/5');
   });
 
-  it('fetches extracted content from GET /api/documents/:id/content', async () => {
+  it('fetches extracted content from GET /api/documents/:id/content?format=text', async () => {
     fetchSpy.and.returnValue(Promise.resolve({
       ok: true,
       status: 200,
@@ -126,7 +135,49 @@ describe('DocumentService', () => {
     const content = await service.getContent(5);
 
     expect(content).toBe('Περιεχόμενο εγγράφου');
-    expect(String(fetchSpy.calls.mostRecent().args[0])).toBe('/api/documents/5/content');
+    expect(String(fetchSpy.calls.mostRecent().args[0])).toBe('/api/documents/5/content?format=text');
+  });
+
+  it('downloads the original and prefers the UTF-8 Content-Disposition filename', async () => {
+    const blob = new Blob(['%PDF-1.4'], { type: 'application/pdf' });
+    const encoded = encodeURIComponent('Σύμβαση.pdf');
+    fetchSpy.and.returnValue(Promise.resolve(downloadResponse(
+      `attachment; filename="______.pdf"; filename*=UTF-8''${encoded}`,
+      blob
+    )));
+
+    const result = await service.downloadOriginal(9);
+
+    expect(result.blob).toBe(blob);
+    expect(result.filename).toBe('Σύμβαση.pdf');
+    const [url, init] = fetchSpy.calls.mostRecent().args;
+    expect(String(url)).toBe('/api/documents/9/content?download=1');
+    expect(new Headers((init as RequestInit).headers).get('Authorization')).toBe('Bearer test-token');
+  });
+
+  it('falls back to the plain Content-Disposition filename', async () => {
+    fetchSpy.and.returnValue(Promise.resolve(downloadResponse(
+      'attachment; filename="contract.pdf"',
+      new Blob(['x'])
+    )));
+
+    const result = await service.downloadOriginal(9);
+
+    expect(result.filename).toBe('contract.pdf');
+  });
+
+  it('returns a null filename when Content-Disposition is missing', async () => {
+    fetchSpy.and.returnValue(Promise.resolve(downloadResponse(null, new Blob(['x']))));
+
+    const result = await service.downloadOriginal(9);
+
+    expect(result.filename).toBeNull();
+  });
+
+  it('rejects original downloads with the server error message', async () => {
+    fetchSpy.and.returnValue(Promise.resolve(jsonResponse({ error: 'Document not found' }, 404)));
+
+    await expectAsync(service.downloadOriginal(9)).toBeRejectedWithError('Document not found');
   });
 
   it('uploads via XHR with auth header and progress callbacks', async () => {

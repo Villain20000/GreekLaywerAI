@@ -8,9 +8,11 @@ import {
   ActivatedRoute
 } from '@angular/router';
 import { filter, map, startWith } from 'rxjs/operators';
+import { TranslateModule } from '@ngx-translate/core';
 import { MenuComponent } from './components/menu/menu.component';
 import { ConfirmDialogComponent } from './components/confirm-dialog/confirm-dialog.component';
 import { LanguageSwitcherComponent } from './i18n/language-switcher.component';
+import { ErrorNotifierService } from './services/error-notifier.service';
 
 /**
  * Phase 27 — AppComponent shell.
@@ -30,7 +32,14 @@ import { LanguageSwitcherComponent } from './i18n/language-switcher.component';
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, RouterOutlet, MenuComponent, ConfirmDialogComponent, LanguageSwitcherComponent],
+  imports: [
+    CommonModule,
+    RouterOutlet,
+    TranslateModule,
+    MenuComponent,
+    ConfirmDialogComponent,
+    LanguageSwitcherComponent
+  ],
   template: `
     <app-menu *ngIf="(showMenu$ | async)"></app-menu>
     <!-- 2-8: menu-less public routes still need the EL/EN toggle. -->
@@ -42,6 +51,23 @@ import { LanguageSwitcherComponent } from './i18n/language-switcher.component';
       class="nl-app-main"
       [class.has-menu]="(showMenu$ | async)"
     >
+      <!-- Global unhandled-error banner: stays until dismissed, never reroutes. -->
+      <div
+        class="nl-error-banner"
+        [class.nl-error-banner--public]="!(showMenu$ | async)"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+        *ngIf="error$ | async"
+      >
+        <span class="nl-error-banner-text">{{ 'errors.unexpectedError' | translate }}</span>
+        <button
+          type="button"
+          class="nl-error-banner-dismiss"
+          (click)="dismissError()"
+          [attr.aria-label]="'common.close' | translate"
+        >{{ 'common.close' | translate }}</button>
+      </div>
       <router-outlet></router-outlet>
     </main>
     <app-confirm-dialog></app-confirm-dialog>
@@ -61,6 +87,9 @@ export class AppComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly activatedRoute = inject(ActivatedRoute);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorNotifier = inject(ErrorNotifierService);
+
+  public readonly error$ = this.errorNotifier.error$;
 
   /**
    * Live boolean stream: `true` iff the currently active deep child of the
@@ -84,6 +113,10 @@ export class AppComponent implements OnInit {
     // itself up to Router events at field-init time, so we just kick the
     // pipeline into evaluating on first render.)
     this.showMenu$.pipe(takeUntilDestroyed(this.destroyRef)).subscribe();
+  }
+
+  dismissError(): void {
+    this.errorNotifier.dismiss();
   }
 
   /**

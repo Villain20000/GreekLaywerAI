@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { Observable } from 'rxjs';
+import { Observable, Subscription } from 'rxjs';
 import { environment } from '../../environments/environment';
 import { apiFetch } from './api-client';
 import { parseQuotaError, QuotaExceededError } from './quota.service';
@@ -26,6 +26,12 @@ export interface AiAnswer {
    * appending `content`.
    */
   pending?: boolean;
+  /**
+   * True for a token chunk from the live SSE stream. `content` is a delta:
+   * consumers must append it. The final emission has no `partial` flag and
+   * carries the authoritative content plus metadata.
+   */
+  partial?: boolean;
 }
 
 export interface AnswerFeedback {
@@ -75,6 +81,293 @@ export class AiService {
     });
   }
 
+  /**
+   * Live token streaming over SSE.
+   *
+   * The POST is a normal authenticated fetch (EventSource cannot attach the
+   * Authorization header), and the events endpoint is consumed with a
+   * ReadableStream so partial chunks arrive as the model produces them.
+   *
+   * Fallbacks keep the chat usable during a rolling deploy or a flaky
+   * connection:
+   *   - live enqueue unavailable (non-quota failure) → existing polling pair
+   *     (`/query/stream` + GET poll) is used instead;
+   *   - events connection fails before any content arrives → the already
+   *     enqueued job is polled through the existing GET endpoint.
+   * Once content has been emitted a broken stream surfaces an error, so the
+   * final answer is never silently duplicated by a second delivery path.
+   */
+  streamQueryLive(
+    prompt: string,
+    conversationId?: number,
+    documentIds: number[] = []
+  ): Observable<AiAnswer> {
+    const body = {
+      prompt,
+      useRag: true,
+      ...(conversationId ? { conversationId } : {}),
+      ...(documentIds.length ? { documentIds } : {})
+    };
+
+    return new Observable<AiAnswer>(observer => {
+      let cancelled = false;
+      let settled = false;
+      let jobId: string | undefined;
+      let receivedContent = false;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+      let fallbackSub: Subscription | null = null;
+      let pollingStarted = false;
+      let slowTimer: ReturnType<typeof setTimeout> | undefined;
+      const controller = new AbortController();
+
+      const clearSlowTimer = () => {
+        if (slowTimer) {
+          clearTimeout(slowTimer);
+          slowTimer = undefined;
+        }
+      };
+
+      const releaseReader = () => {
+        const current = reader;
+        reader = null;
+        if (current) void current.cancel().catch(() => undefined);
+      };
+
+      const stopFallback = () => {
+        fallbackSub?.unsubscribe();
+        fallbackSub = null;
+      };
+
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearSlowTimer();
+        stopFallback();
+        releaseReader();
+        if (error !== undefined) observer.error(error);
+        else observer.complete();
+      };
+
+      const failWithStage = (error: unknown, stage: 'enqueue' | 'poll') => {
+        if (error instanceof Error) (error as InferenceRequestError).stage = stage;
+        finish(error);
+      };
+
+      const emit = (answer: AiAnswer) => {
+        if (cancelled || settled) return;
+        if (answer.content) {
+          receivedContent = true;
+          clearSlowTimer();
+        }
+        observer.next(answer);
+      };
+
+      const pollExistingJob = () => {
+        if (cancelled || settled || !jobId || pollingStarted) return;
+        pollingStarted = true;
+        releaseReader();
+        const id = jobId;
+        fallbackSub = this.pollJob(id).subscribe({
+          next: answer => emit(answer),
+          error: err => finish(err),
+          complete: () => finish()
+        });
+      };
+
+      const fallBackToPollingPipeline = () => {
+        if (cancelled || settled) return;
+        fallbackSub = this.streamQuery(prompt, conversationId, documentIds).subscribe({
+          next: answer => emit(answer),
+          error: err => finish(err),
+          complete: () => finish()
+        });
+      };
+
+      const applyEvent = (eventName: string, rawData: string) => {
+        let payload: Record<string, unknown>;
+        try {
+          payload = JSON.parse(rawData) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        if (eventName === 'chunk') {
+          const content = typeof payload['content'] === 'string' ? payload['content'] : '';
+          if (!content) return;
+          emit({ content, messageId: null, sources: [], confidence: 0, partial: true });
+          return;
+        }
+        if (eventName === 'done') {
+          emit({
+            content: typeof payload['result'] === 'string' ? payload['result'] : '',
+            messageId: Number.isInteger(Number(payload['messageId']))
+              ? Number(payload['messageId'])
+              : null,
+            sources: Array.isArray(payload['sources']) ? payload['sources'] as AnswerSource[] : [],
+            confidence: Number.isFinite(Number(payload['confidence']))
+              ? Number(payload['confidence'])
+              : 0
+          });
+          finish();
+          return;
+        }
+        if (eventName === 'error') {
+          // Before any content the polling endpoint is authoritative on the
+          // job's real state (a failed job still fails there). This also
+          // recovers when only the live fan-out is broken.
+          if (!receivedContent && jobId) {
+            pollExistingJob();
+            return;
+          }
+          failWithStage(
+            new Error(typeof payload['error'] === 'string' ? payload['error'] : 'Stream failed'),
+            'poll'
+          );
+        }
+      };
+
+      // SSE frames are separated by a blank line. `data:` may appear on
+      // multiple lines (joined with \n), and comment/heartbeat frames carry
+      // no data at all.
+      const parseBlock = (block: string): { eventName: string; data: string } | null => {
+        let eventName = 'message';
+        const dataLines: string[] = [];
+        for (const line of block.split(/\r?\n/)) {
+          if (!line || line.startsWith(':')) continue;
+          const separator = line.indexOf(':');
+          const field = separator === -1 ? line : line.slice(0, separator);
+          let value = separator === -1 ? '' : line.slice(separator + 1);
+          if (value.startsWith(' ')) value = value.slice(1);
+          if (field === 'event') eventName = value;
+          else if (field === 'data') dataLines.push(value);
+        }
+        if (dataLines.length === 0) return null;
+        return { eventName, data: dataLines.join('\n') };
+      };
+
+      const consume = async (response: Response): Promise<void> => {
+        if (!response.body) {
+          pollExistingJob();
+          return;
+        }
+        const streamReader = response.body.getReader();
+        reader = streamReader;
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (!cancelled && !settled) {
+          const { value, done } = await streamReader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split(/\r?\n\r?\n/);
+          buffer = blocks.pop() ?? '';
+          for (const block of blocks) {
+            const parsed = parseBlock(block);
+            if (parsed) applyEvent(parsed.eventName, parsed.data);
+            if (cancelled || settled) break;
+          }
+        }
+
+        if (reader === streamReader) reader = null;
+        if (cancelled || settled) return;
+        if (receivedContent) {
+          failWithStage(new Error('Stream ended before completion'), 'poll');
+        } else {
+          pollExistingJob();
+        }
+      };
+
+      slowTimer = setTimeout(() => {
+        if (cancelled || settled || receivedContent) return;
+        observer.next({ content: '', messageId: null, sources: [], confidence: 0, pending: true });
+      }, this.slowAfterMs);
+
+      const connect = async (): Promise<void> => {
+        let enqueueResponse: Response;
+        try {
+          enqueueResponse = await apiFetch(`${this.apiUrl}/query/live`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal
+          });
+        } catch {
+          if (!cancelled) fallBackToPollingPipeline();
+          return;
+        }
+        if (cancelled) return;
+
+        if (!enqueueResponse.ok) {
+          const quotaError = await this.readQuotaError(enqueueResponse, 'ai');
+          if (cancelled) return;
+          if (quotaError) {
+            failWithStage(quotaError, 'enqueue');
+            return;
+          }
+          if (enqueueResponse.status === 429) {
+            // Plain rate-limit rejection: same wording as the legacy path,
+            // and retrying through it would only burn the limiter further.
+            failWithStage(new Error('Enqueue failed (HTTP 429)'), 'enqueue');
+            return;
+          }
+          // Live endpoint missing/failing (e.g. a backend that predates the
+          // route): use the legacy enqueue + poll pair.
+          fallBackToPollingPipeline();
+          return;
+        }
+
+        let data: { jobId?: string } = {};
+        try {
+          data = (await enqueueResponse.json()) as { jobId?: string };
+        } catch {
+          data = {};
+        }
+        if (cancelled) return;
+        if (!data.jobId) {
+          fallBackToPollingPipeline();
+          return;
+        }
+        jobId = data.jobId;
+
+        let eventsResponse: Response;
+        try {
+          eventsResponse = await apiFetch(
+            `${this.apiUrl}/query/live/${encodeURIComponent(jobId)}/events`,
+            {
+              headers: { Accept: 'text/event-stream' },
+              signal: controller.signal
+            }
+          );
+        } catch {
+          if (!cancelled) pollExistingJob();
+          return;
+        }
+        if (cancelled) return;
+        if (!eventsResponse.ok) {
+          pollExistingJob();
+          return;
+        }
+        await consume(eventsResponse);
+      };
+
+      void connect().catch(error => {
+        if (cancelled || settled) return;
+        if (receivedContent || !jobId) failWithStage(error, 'poll');
+        else pollExistingJob();
+      });
+
+      return () => {
+        cancelled = true;
+        clearSlowTimer();
+        controller.abort();
+        releaseReader();
+        stopFallback();
+        if (jobId && !settled) {
+          void this.cancelJob(jobId).catch(() => undefined);
+        }
+      };
+    });
+  }
+
   uploadAudio(audioBlob: Blob, conversationId?: number): Observable<AiAnswer> {
     const formData = new FormData();
     formData.append('audio', audioBlob, 'recording.webm');
@@ -118,11 +411,14 @@ export class AiService {
     return parseQuotaError(body, kind);
   }
 
-  private enqueueThenPoll(path: string, body: BodyInit | Record<string, unknown>): Observable<AiAnswer> {
-    return new Observable(observer => {
+  /**
+   * Poll an already-enqueued job through the unchanged GET endpoint. Shared
+   * by the legacy enqueue+poll path and the live-stream fallback.
+   */
+  private pollJob(jobId: string): Observable<AiAnswer> {
+    return new Observable<AiAnswer>(observer => {
       let cancelled = false;
       let settled = false;
-      let jobId: string | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let attempts = 0;
       let slowNotified = false;
@@ -136,18 +432,18 @@ export class AiService {
         }
       };
 
-      const fail = (error: unknown, stage: 'enqueue' | 'poll' = 'poll') => {
+      const fail = (error: unknown) => {
         if (cancelled || settled) return;
         settled = true;
         stop();
-        if (error instanceof Error) (error as InferenceRequestError).stage = stage;
+        if (error instanceof Error) (error as InferenceRequestError).stage = 'poll';
         observer.error(error);
       };
 
       const scheduleNext = () => {
         if (cancelled || settled) return;
         if (attempts >= this.pollMaxAttempts || Date.now() - startedAt >= this.pollTimeoutMs) {
-          fail(new Error(RESPONSE_TIMEOUT_NOTICE), 'poll');
+          fail(new Error(RESPONSE_TIMEOUT_NOTICE));
           return;
         }
         if (!slowNotified && Date.now() - startedAt >= this.slowAfterMs) {
@@ -164,11 +460,13 @@ export class AiService {
       const poll = () => {
         if (cancelled || settled) return;
         if (attempts >= this.pollMaxAttempts || Date.now() - startedAt >= this.pollTimeoutMs) {
-          fail(new Error(RESPONSE_TIMEOUT_NOTICE), 'poll');
+          fail(new Error(RESPONSE_TIMEOUT_NOTICE));
           return;
         }
         attempts += 1;
-        apiFetch(`${this.apiUrl}/query/stream/${jobId}`, { signal: controller.signal })
+        apiFetch(`${this.apiUrl}/query/stream/${encodeURIComponent(jobId)}`, {
+          signal: controller.signal
+        })
           .then(async pollResponse => {
             if (!pollResponse.ok) {
               // The poll route (GET /api/ai/query/stream/:jobId) has NO
@@ -200,7 +498,32 @@ export class AiService {
               scheduleNext();
             }
           })
-          .catch(error => fail(error, 'poll'));
+          .catch(error => fail(error));
+      };
+
+      poll();
+
+      return () => {
+        cancelled = true;
+        stop();
+        controller.abort();
+      };
+    });
+  }
+
+  private enqueueThenPoll(path: string, body: BodyInit | Record<string, unknown>): Observable<AiAnswer> {
+    return new Observable(observer => {
+      let cancelled = false;
+      let settled = false;
+      let jobId: string | undefined;
+      let pollSub: Subscription | null = null;
+      const controller = new AbortController();
+
+      const fail = (error: unknown, stage: 'enqueue' | 'poll' = 'enqueue') => {
+        if (cancelled || settled) return;
+        settled = true;
+        if (error instanceof Error) (error as InferenceRequestError).stage = stage;
+        observer.error(error);
       };
 
       const isForm = body instanceof FormData;
@@ -224,9 +547,19 @@ export class AiService {
           return data.jobId as string;
         })
         .then(id => {
-          if (cancelled) return;
+          if (cancelled || settled) return;
           jobId = id;
-          poll();
+          pollSub = this.pollJob(id).subscribe({
+            next: answer => {
+              if (!cancelled && !settled) observer.next(answer);
+            },
+            error: error => fail(error, 'poll'),
+            complete: () => {
+              if (cancelled || settled) return;
+              settled = true;
+              observer.complete();
+            }
+          });
         })
         .catch(error => fail(error, 'enqueue'));
 
@@ -235,8 +568,9 @@ export class AiService {
       // chat's stop button through Subscription.unsubscribe().
       return () => {
         cancelled = true;
-        stop();
         controller.abort();
+        pollSub?.unsubscribe();
+        pollSub = null;
         if (jobId && !settled) {
           void this.cancelJob(jobId).catch(() => undefined);
         }

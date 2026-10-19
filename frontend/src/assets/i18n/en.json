@@ -65,7 +65,12 @@
   },
   "landing": {
     "subtitle": "The Elite Greek AI Lawyer powered by Gemma 4",
-    "enter": "Enter Application"
+    "enter": "Enter Application",
+    "hero": {
+      "variant": {
+        "subtitle": "The future of Greek legal intelligence"
+      }
+    }
   },
   "notFound": {
     "title": "Page not found",
@@ -146,7 +151,10 @@
       "title": "Verifying…",
       "waiting": "Hang on while we activate your account.",
       "success": "Email verified. Signing you in…",
-      "invalid": "Invalid or expired verification link. Please request a new one."
+      "invalid": "Invalid or expired verification link. Please request a new one.",
+      "changeWaiting": "Hang on while we confirm your new email address.",
+      "changeSuccess": "New email confirmed. Signing you in…",
+      "changeInvalid": "Invalid or expired email-change link. Please request a new one."
     },
     "magic": {
       "title": "Signing you in…",
@@ -188,6 +196,7 @@
     "recentAria": "Recent conversations",
     "noConversations": "No conversations yet.",
     "messagesAria": "Conversation messages",
+    "loadOlder": "Load older messages",
     "sourcesShow": "Sources",
     "sourcesHide": "Hide sources",
     "confidence": "{{percent}}% confidence",
@@ -346,6 +355,20 @@
     "colPeriodEnd": "Period end",
     "colCreated": "Created",
     "historyEmpty": "No history.",
+    "paymentHistory": "Payment history",
+    "paymentHistoryAria": "Payment history table",
+    "colInvoiceDate": "Date",
+    "colInvoiceAmount": "Amount",
+    "colInvoiceStatus": "Status",
+    "colInvoiceLink": "Invoice",
+    "paymentHistoryEmpty": "No invoices.",
+    "paymentHistoryLoading": "Loading payments…",
+    "paymentHistoryError": "Failed to load payment history",
+    "prevPage": "← Previous",
+    "nextPage": "Next →",
+    "pageOf": "Page {{page}} of {{pages}}",
+    "viewInvoice": "View",
+    "downloadPdf": "Download PDF",
     "cancelTitle": "Cancel subscription",
     "cancelMessage": "Cancel your subscription?",
     "cancelBack": "Back",
@@ -359,6 +382,18 @@
     "planLabel": "Plan",
     "subscriptionStatus": "Subscription: {{status}}",
     "until": "until",
+    "emailChangeTitle": "Change email",
+    "emailChangeHint": "A confirmation link will be sent to the new address. The change completes after verification.",
+    "emailChangeNewEmail": "New email",
+    "emailChangeEmailPlaceholder": "you@example.com",
+    "emailChangeCurrentPassword": "Current password",
+    "emailChangeSubmit": "Send confirmation link",
+    "emailChangeSubmitting": "Sending…",
+    "emailChangeSent": "We sent a confirmation link to the new email. Check your inbox.",
+    "emailChangeInvalidEmail": "Please enter a valid email address",
+    "emailChangePasswordRequired": "Enter your current password",
+    "emailChangeSameEmail": "The new email must differ from your current one",
+    "emailChangeWrongPassword": "Incorrect password",
     "gdpr": "Data & GDPR",
     "export": "Export data",
     "delete": "Delete account",
@@ -371,6 +406,11 @@
     "loadError": "Failed to load profile",
     "exportError": "Export failed",
     "deleteError": "Delete failed",
+    "deletionScheduledTitle": "Account deletion scheduled",
+    "deletionScheduledMessage": "Your account will be permanently deleted on {{date}}. You can cancel the deletion before the deadline.",
+    "cancelDeletion": "Cancel deletion",
+    "deletionCancelled": "The scheduled account deletion was cancelled.",
+    "cancelDeletionError": "Failed to cancel the deletion",
     "usage": "Usage today",
     "usageAi": "AI queries",
     "usageDocuments": "Documents",
@@ -452,6 +492,15 @@
   "adminDocuments": {
     "title": "Admin documents",
     "tableAria": "User documents table",
+    "search": "Search",
+    "clear": "Clear",
+    "searchPlaceholder": "Search by file, title or user email…",
+    "userIdPlaceholder": "User ID",
+    "userIdAria": "Filter documents by user ID",
+    "loading": "Loading…",
+    "previous": "← Previous",
+    "next": "Next →",
+    "pager": "{{start}}–{{end}} of {{total}}",
     "colFile": "File",
     "colUser": "User",
     "colType": "Type",
@@ -463,5 +512,8 @@
     "deleteMessage": "Delete document \"{{filename}}\" of user {{email}}?",
     "loadError": "Failed to load",
     "deleteError": "Delete failed"
+  },
+  "errors": {
+    "unexpectedError": "Something went wrong. Please try again."
   }
 }

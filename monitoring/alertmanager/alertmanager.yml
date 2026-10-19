@@ -1,0 +1,79 @@
+# NomosAI Alertmanager routing (3-1 observability).
+#
+# Every ${VAR} below is rendered from the container environment by the compose
+# entrypoint (Alertmanager v0.27 has no native expand-env flag), which also
+# supplies safe defaults. The file therefore stays loadable with no webhook and
+# no mailbox: notifications then fail per-send (logged) instead of preventing
+# startup.
+#
+# Slack:   set SLACK_WEBHOOK_URL (and optionally SLACK_CHANNEL).
+# Email:   set ALERT_EMAIL_TO and ALERT_EMAIL_FROM plus SMTP_HOST/SMTP_PORT/
+#          SMTP_USER/SMTP_PASS. Alertmanager supports STARTTLS (587); a
+#          provider that only offers implicit TLS (465) must use Slack instead.
+#
+# This file is referenced by both staging and production compose stacks.
+
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: '${SMTP_HOST}:${SMTP_PORT}'
+  smtp_from: '${ALERT_EMAIL_FROM}'
+  smtp_auth_username: '${SMTP_USER}'
+  smtp_auth_password: '${SMTP_PASS}'
+  smtp_require_tls: ${SMTP_REQUIRE_TLS}
+
+route:
+  receiver: nomos-alerts
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: nomos-critical
+      repeat_interval: 1h
+    - matchers: ['severity="warning"']
+      receiver: nomos-alerts
+      repeat_interval: 4h
+
+receivers:
+  - name: nomos-alerts
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '${SLACK_CHANNEL}'
+        send_resolved: true
+        title: '{{ if eq .Status "firing" }}[FIRING]{{ else }}[RESOLVED]{{ end }} NomosAI {{ .CommonLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}{{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+    email_configs:
+      - to: '${ALERT_EMAIL_TO}'
+        from: '${ALERT_EMAIL_FROM}'
+        send_resolved: true
+        headers:
+          Subject: '{{ if eq .Status "firing" }}[FIRING]{{ else }}[RESOLVED]{{ end }} NomosAI {{ .CommonLabels.alertname }}'
+
+  - name: nomos-critical
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '${SLACK_CHANNEL}'
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+        title: '{{ if eq .Status "firing" }}[CRITICAL]{{ else }}[RESOLVED]{{ end }} NomosAI {{ .CommonLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}{{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+    email_configs:
+      - to: '${ALERT_EMAIL_TO}'
+        from: '${ALERT_EMAIL_FROM}'
+        send_resolved: true
+        headers:
+          Subject: '{{ if eq .Status "firing" }}[CRITICAL]{{ else }}[RESOLVED]{{ end }} NomosAI {{ .CommonLabels.alertname }}'
+
+# A firing critical alert on the same alertname/instance suppresses the
+# matching warning notification, so an incident produces one page, not two.
+inhibit_rules:
+  - source_matchers: ['severity="critical"']
+    target_matchers: ['severity="warning"']
+    equal: ['alertname', 'instance']

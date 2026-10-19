@@ -324,7 +324,7 @@ describe('staging stack configuration (3-2)', () => {
       '.env.staging',
       'chmod 600',
       'Docker secrets',
-      'not implement',
+      'Vault/OpenBao',
       '_FILE',
       'Rotation',
       'JWT_SECRET',
@@ -348,9 +348,12 @@ describe('staging stack configuration (3-2)', () => {
     // The rate-limit caveat must explicitly say the staging CA is the default.
     expect(docs).toMatch(/staging CA/i);
     expect(docs).toMatch(/not trusted/i);
-    // Honest Docker-secret documentation: env-only backend, no `_FILE` support.
-    expect(docs).toMatch(/does\s+\*{0,2}not\*{0,2}\s+implement/i);
-    expect(docs).toMatch(/_FILE/);
+    // Docker-secret documentation now reflects the implemented `*_FILE`
+    // resolution (file precedence, supported secret list).
+    expect(docs).toMatch(/\*_FILE|`_FILE`/);
+    expect(docs).toMatch(/takes precedence/i);
+    expect(docs).toMatch(/JWT_SECRET_FILE/);
+    expect(docs).not.toMatch(/does\s+\*{0,2}not\*{0,2}\s+implement/i);
     // The runbook must link the backup/restore procedure.
     expect(docs).toMatch(/\[.*\]\(backup-restore\.md\)/);
   });

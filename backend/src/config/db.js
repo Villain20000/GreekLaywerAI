@@ -1,11 +1,12 @@
 const { Pool } = require('pg');
 const { recordDbQueryDuration } = require('../middlewares/metrics');
+const { getSecret } = require('./secrets');
 
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 5432,
   user: process.env.DB_USER || 'nomos_admin',
-  password: process.env.DB_PASSWORD || 'nomos_password',
+  password: getSecret('DB_PASSWORD', 'nomos_password'),
   database: process.env.DB_NAME || 'nomos_db'
 });
 

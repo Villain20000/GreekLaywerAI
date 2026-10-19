@@ -101,7 +101,7 @@ const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
               <tr *ngFor="let doc of documents">
                 <td>{{ doc.title || doc.filename }}</td>
                 <td>{{ doc.content_type }}</td>
-                <td>{{ formatSize(doc.metadata['size_bytes']) }}</td>
+                <td>{{ formatSize(doc.file_size ?? doc.metadata['size_bytes']) }}</td>
                 <td>{{ doc.created_at | date: 'short' }}</td>
                 <td class="nl-document-actions">
                   <button class="nl-btn-secondary" (click)="previewDocument(doc)">{{ 'documents.preview' | translate }}</button>
@@ -326,12 +326,11 @@ export class DocumentsComponent implements OnInit {
 
   async downloadDocument(doc: LegalDocument): Promise<void> {
     try {
-      const content = await this.documentService.getContent(doc.id);
-      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const { blob, filename } = await this.documentService.downloadOriginal(doc.id);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
-      anchor.download = `${doc.title || doc.filename}.txt`;
+      anchor.download = filename || doc.filename;
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);

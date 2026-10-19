@@ -28,6 +28,20 @@ export interface ConversationPage {
   total: number;
 }
 
+export interface MessagePageOptions {
+  messageLimit?: number;
+  before?: number;
+}
+
+export interface ConversationMessagesPage {
+  conversation: Conversation;
+  messages: Message[];
+  /** True when at least one message older than this page exists. */
+  hasMore: boolean;
+  /** Oldest message id in this page; pass it as `before` for the next page. */
+  nextCursor: number | null;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -70,10 +84,36 @@ export class ConversationsService {
     return data.conversation;
   }
 
-  async get(id: number): Promise<{ conversation: Conversation; messages: Message[] }> {
-    const res = await apiFetch(`${this.apiUrl}/${id}`, { headers: this.headers() });
+  /**
+   * Fetch a conversation with its newest messages.
+   *
+   * Without options the response keeps the legacy "all messages" shape.
+   * With `messageLimit` the backend returns a cursor page; `before` asks
+   * for the page older than that message id.
+   */
+  async get(id: number, options: MessagePageOptions = {}): Promise<ConversationMessagesPage> {
+    const params = new URLSearchParams();
+    if (options.messageLimit !== undefined) {
+      params.set('messageLimit', String(options.messageLimit));
+    }
+    if (options.before !== undefined) {
+      params.set('before', String(options.before));
+    }
+    const query = params.toString();
+    const res = await apiFetch(`${this.apiUrl}/${id}${query ? `?${query}` : ''}`, {
+      headers: this.headers()
+    });
     if (!res.ok) throw new Error(`Get conversation failed (HTTP ${res.status})`);
-    return res.json();
+    const data = await res.json();
+    const cursor = Number(data.nextCursor);
+    return {
+      conversation: data.conversation,
+      messages: data.messages || [],
+      hasMore: data.hasMore === true,
+      nextCursor: data.nextCursor !== null && data.nextCursor !== undefined && Number.isFinite(cursor)
+        ? cursor
+        : null
+    };
   }
 
   async rename(id: number, title: string): Promise<Conversation> {

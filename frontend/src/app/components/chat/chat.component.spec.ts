@@ -5,7 +5,7 @@ import { ChatComponent } from './chat.component';
 import { AuthService, AuthUser } from '../../services/auth.service';
 import { AiService, AiAnswer, RESPONSE_TIMEOUT_NOTICE } from '../../services/ai.service';
 import { BillingService } from '../../services/billing.service';
-import { Conversation, ConversationsService } from '../../services/conversations.service';
+import { Conversation, ConversationsService, Message as StoredMessage } from '../../services/conversations.service';
 import { DocumentService } from '../../services/document.service';
 import { QuotaExceededError } from '../../services/quota.service';
 import { ActivatedRoute, Router } from '@angular/router';
@@ -20,6 +20,7 @@ import { lookupTranslation, provideTestTranslate } from '../../i18n/testing';
 function buildAiStub(): Partial<AiService> {
   return {
     streamQuery: jasmine.createSpy('streamQuery').and.returnValue(of({ content: 'απάντηση', messageId: 42, sources: [], confidence: 0 })),
+    streamQueryLive: jasmine.createSpy('streamQueryLive').and.returnValue(of({ content: 'απάντηση', messageId: 42, sources: [], confidence: 0 })),
     uploadAudio: jasmine.createSpy('uploadAudio').and.returnValue(of({ content: 'ήχος', messageId: 43, sources: [], confidence: 0 })),
     submitFeedback: jasmine.createSpy('submitFeedback').and.resolveTo({ id: 1, message_id: 42, user_id: 7, helpful: true, reason: null, created_at: '2026-01-01', updated_at: '2026-01-01' })
   };
@@ -27,6 +28,16 @@ function buildAiStub(): Partial<AiService> {
 
 function conversationStub(id: number, title: string): Conversation {
   return { id, title, created_at: '2026-01-01', updated_at: '2026-01-01' };
+}
+
+function storedMessage(id: number, role: StoredMessage['role'] = 'user'): StoredMessage {
+  return {
+    id,
+    role,
+    content: `μήνυμα ${id}`,
+    citation_metadata: {},
+    created_at: '2026-01-01'
+  };
 }
 
 describe('ChatComponent (message rendering + input handling)', () => {
@@ -67,7 +78,9 @@ describe('ChatComponent (message rendering + input handling)', () => {
       }),
       get: jasmine.createSpy('get').and.callFake((id: number) => Promise.resolve({
         conversation: conversationStub(id, 'Υπάρχουσα συνομιλία'),
-        messages: []
+        messages: [] as StoredMessage[],
+        hasMore: false,
+        nextCursor: null
       })),
       remove: jasmine.createSpy('remove').and.resolveTo(undefined),
       list: jasmine.createSpy('list').and.resolveTo([])
@@ -135,7 +148,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
     component.sendMessage();
     fixture.detectChanges();
     expect(component.messages.length).toBe(0);
-    expect(mockAi.streamQuery).not.toHaveBeenCalled();
+    expect(mockAi.streamQueryLive).not.toHaveBeenCalled();
     expect(mockConversations.create).not.toHaveBeenCalled();
   });
 
@@ -156,7 +169,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
     await fixture.whenStable();
 
     expect(mockConversations.create).toHaveBeenCalledWith('ερώτηση');
-    expect(mockAi.streamQuery).toHaveBeenCalledWith('ερώτηση', 7, []);
+    expect(mockAi.streamQueryLive).toHaveBeenCalledWith('ερώτηση', 7, []);
   });
 
   it('loads a conversation referenced by the query string', async () => {
@@ -166,7 +179,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
     await secondFixture.componentInstance.ngOnInit();
     await secondFixture.whenStable();
 
-    expect(mockConversations.get).toHaveBeenCalledWith(7);
+    expect(mockConversations.get).toHaveBeenCalledWith(7, { messageLimit: 50 });
     expect(secondFixture.componentInstance.conversationId).toBe(7);
   });
 
@@ -177,7 +190,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
     queryParamSubject.next(convertToParamMap({ conversation: '9' }));
     await fixture.whenStable();
 
-    expect(mockConversations.get).toHaveBeenCalledWith(9);
+    expect(mockConversations.get).toHaveBeenCalledWith(9, { messageLimit: 50 });
     expect(fixture.componentInstance.conversationId).toBe(9);
   });
 
@@ -213,7 +226,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
   });
 
   it('renders structured sources with an expandable source panel', async () => {
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(of({
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(of({
       content: 'τεκμηριωμένη απάντηση',
       messageId: 44,
       confidence: 0.87,
@@ -290,7 +303,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
   it('renders assistant markdown sanitized (no scripts or event handlers)', async () => {
     const component = fixture.componentInstance;
     component.currentInput = 'ερώτηση';
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(of({
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(of({
       content: '**Έντονο** <script>alert(1)</script> <img src="x" onerror="alert(2)">',
       messageId: 50,
       sources: [],
@@ -336,7 +349,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
 
   it('stops generation when the stop button is clicked', async () => {
     const stream = new Subject<AiAnswer>();
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(stream.asObservable());
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(stream.asObservable());
     fixture.detectChanges();
 
     const component = fixture.componentInstance;
@@ -357,7 +370,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
 
   it('shows the slow-response hint while a job keeps polling', async () => {
     const stream = new Subject<AiAnswer>();
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(stream.asObservable());
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(stream.asObservable());
     fixture.detectChanges();
 
     const component = fixture.componentInstance;
@@ -396,8 +409,8 @@ describe('ChatComponent (message rendering + input handling)', () => {
     await component.regenerate(component.messages[1]);
     await fixture.whenStable();
 
-    expect((mockAi.streamQuery as jasmine.Spy).calls.count()).toBe(2);
-    expect((mockAi.streamQuery as jasmine.Spy).calls.mostRecent().args).toEqual(['ερώτηση', 7, []]);
+    expect((mockAi.streamQueryLive as jasmine.Spy).calls.count()).toBe(2);
+    expect((mockAi.streamQueryLive as jasmine.Spy).calls.mostRecent().args).toEqual(['ερώτηση', 7, []]);
     expect(component.messages.length).toBe(2);
     expect(component.messages[1].content).toBe('απάντηση');
   });
@@ -445,7 +458,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
 
   it('marks the streaming answer busy and announces completion politely', async () => {
     const stream = new Subject<AiAnswer>();
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(stream.asObservable());
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(stream.asObservable());
     fixture.detectChanges();
 
     const component = fixture.componentInstance;
@@ -473,7 +486,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
 
   it('announces a cancelled generation politely', async () => {
     const stream = new Subject<AiAnswer>();
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(stream.asObservable());
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(stream.asObservable());
     fixture.detectChanges();
 
     const component = fixture.componentInstance;
@@ -516,7 +529,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
       resetAt: '2026-01-02T00:00:00.000Z',
       serverError: 'Daily AI query limit reached for your plan'
     });
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(throwError(() => quotaError));
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(throwError(() => quotaError));
 
     const component = fixture.componentInstance;
     component.currentInput = 'ερώτηση';
@@ -543,7 +556,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
       resetAt: '2026-01-02T00:00:00.000Z',
       serverError: 'Daily AI query limit reached for your plan'
     });
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(throwError(() => quotaError));
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(throwError(() => quotaError));
 
     const component = fixture.componentInstance;
     component.currentInput = 'ερώτηση';
@@ -568,7 +581,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
       resetAt: null,
       serverError: 'Daily AI query limit reached for your plan'
     });
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(throwError(() => quotaError));
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(throwError(() => quotaError));
 
     const component = fixture.componentInstance;
     component.currentInput = 'ερώτηση';
@@ -581,7 +594,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
   });
 
   it('still renders the generic model error for a non-quota failure', async () => {
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(
       throwError(() => new Error('Enqueue failed (HTTP 500)'))
     );
 
@@ -607,7 +620,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
       resetAt: '2026-01-02T00:00:00.000Z',
       serverError: 'Daily AI query limit reached for your plan'
     });
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(throwError(() => quotaError));
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(throwError(() => quotaError));
 
     const component = fixture.componentInstance;
     component.currentInput = 'ερώτηση';
@@ -628,7 +641,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
       resetAt: '2026-01-02T00:00:00.000Z',
       serverError: 'Daily AI query limit reached for your plan'
     });
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(throwError(() => quotaError));
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(throwError(() => quotaError));
 
     const component = fixture.componentInstance;
     component.currentInput = 'ερώτηση';
@@ -641,7 +654,7 @@ describe('ChatComponent (message rendering + input handling)', () => {
   });
 
   it('renders the translated timeout notice for the service timeout sentinel', async () => {
-    (mockAi.streamQuery as jasmine.Spy).and.returnValue(
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(
       throwError(() => new Error(RESPONSE_TIMEOUT_NOTICE))
     );
 
@@ -654,5 +667,230 @@ describe('ChatComponent (message rendering + input handling)', () => {
     expect(bubble.textContent).toContain(lookupTranslation('el', 'chat.notices.timeout')!);
     // The language-neutral sentinel itself never reaches the user.
     expect(bubble.textContent).not.toContain(RESPONSE_TIMEOUT_NOTICE);
+  });
+
+  // ------------------------------------------------------------------
+  // Live token streaming.
+  // ------------------------------------------------------------------
+
+  it('appends token chunks and applies sources/messageId only on completion', async () => {
+    const stream = new Subject<AiAnswer>();
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(stream.asObservable());
+    fixture.detectChanges();
+
+    const component = fixture.componentInstance;
+    component.currentInput = 'ερώτηση';
+    await component.sendMessage();
+    fixture.detectChanges();
+
+    stream.next({ content: 'Μία ', messageId: null, sources: [], confidence: 0, partial: true });
+    stream.next({ content: 'απάντηση', messageId: null, sources: [], confidence: 0, partial: true });
+    fixture.detectChanges();
+
+    expect(component.messages[1].content).toBe('Μία απάντηση');
+    expect(component.messages[1].messageId).toBeNull();
+    expect(component.messages[1].sources.length).toBe(0);
+    expect(component.isLoading).toBeTrue();
+
+    stream.next({
+      content: 'Μία απάντηση',
+      messageId: 77,
+      sources: [{ type: 'legislation', id: 3, title: 'ΑΚ 57' }],
+      confidence: 0.9
+    });
+    stream.complete();
+    fixture.detectChanges();
+
+    // The final text must not be appended on top of the streamed chunks.
+    expect(component.messages[1].content).toBe('Μία απάντηση');
+    expect(component.messages[1].messageId).toBe(77);
+    expect(component.messages[1].sources.length).toBe(1);
+    expect(component.messages[1].confidence).toBe(0.9);
+    expect(component.isLoading).toBeFalse();
+    const live = fixture.nativeElement.querySelector('.nl-sr-only[role="status"]') as HTMLElement;
+    expect(live.textContent).toContain('ολοκληρώθηκε');
+  });
+
+  it('keeps partial content when generation is stopped mid-stream', async () => {
+    const stream = new Subject<AiAnswer>();
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(stream.asObservable());
+    fixture.detectChanges();
+
+    const component = fixture.componentInstance;
+    component.currentInput = 'ερώτηση';
+    await component.sendMessage();
+    stream.next({ content: 'Μερική απάντηση', messageId: null, sources: [], confidence: 0, partial: true });
+    fixture.detectChanges();
+
+    component.stopGeneration();
+    fixture.detectChanges();
+
+    expect(stream.observed).toBeFalse();
+    expect(component.messages[1].content).toBe('Μερική απάντηση');
+    expect(component.isLoading).toBeFalse();
+  });
+
+  it('renders a final-only answer delivered by the polling fallback', async () => {
+    // The service falls back to the legacy poll path before any chunk
+    // arrives; the chat then receives exactly one non-partial emission.
+    (mockAi.streamQueryLive as jasmine.Spy).and.returnValue(of({
+      content: 'απάντηση από polling',
+      messageId: 88,
+      sources: [],
+      confidence: 0.2
+    }));
+    fixture.detectChanges();
+
+    const component = fixture.componentInstance;
+    component.currentInput = 'ερώτηση';
+    await component.sendMessage();
+    fixture.detectChanges();
+
+    const bubble = fixture.nativeElement.querySelectorAll('.nl-chat-bubble')[1] as HTMLElement;
+    expect(bubble.textContent).toContain('απάντηση από polling');
+    expect(component.messages[1].messageId).toBe(88);
+    expect(component.isLoading).toBeFalse();
+  });
+
+  // ------------------------------------------------------------------
+  // Cursor-paginated history ("load older messages").
+  // ------------------------------------------------------------------
+
+  it('loads the newest 50 messages and exposes the older-messages cursor', async () => {
+    const getSpy = mockConversations.get as jasmine.Spy;
+    getSpy.and.callFake((id: number) => Promise.resolve({
+      conversation: conversationStub(id, 'Μεγάλη συνομιλία'),
+      messages: [storedMessage(10), storedMessage(11, 'assistant')],
+      hasMore: true,
+      nextCursor: 10
+    }));
+    routeGetSpy.and.callFake((key: string) => (key === 'conversation' ? '7' : null));
+
+    const newFixture = TestBed.createComponent(ChatComponent);
+    const component = newFixture.componentInstance;
+    await component.ngOnInit();
+    newFixture.detectChanges();
+
+    expect(getSpy).toHaveBeenCalledWith(7, { messageLimit: 50 });
+    expect(component.messages.map(message => message.messageId)).toEqual([10, 11]);
+    expect(component.hasMoreMessages).toBeTrue();
+    expect(component.olderMessagesCursor).toBe(10);
+    expect(newFixture.nativeElement.querySelector('.nl-load-older')).not.toBeNull();
+  });
+
+  it('prepends older messages without duplicates and advances the cursor', async () => {
+    const getSpy = mockConversations.get as jasmine.Spy;
+    getSpy.and.returnValues(
+      Promise.resolve({
+        conversation: conversationStub(7, 'Μεγάλη συνομιλία'),
+        messages: [storedMessage(9), storedMessage(10, 'assistant')],
+        hasMore: true,
+        nextCursor: 9
+      }),
+      Promise.resolve({
+        conversation: conversationStub(7, 'Μεγάλη συνομιλία'),
+        // The last row overlaps the already-rendered page on purpose.
+        messages: [storedMessage(7), storedMessage(8, 'assistant'), storedMessage(9)],
+        hasMore: false,
+        nextCursor: 7
+      })
+    );
+    routeGetSpy.and.callFake((key: string) => (key === 'conversation' ? '7' : null));
+
+    const newFixture = TestBed.createComponent(ChatComponent);
+    const component = newFixture.componentInstance;
+    await component.ngOnInit();
+    newFixture.detectChanges();
+
+    await component.loadOlderMessages();
+    newFixture.detectChanges();
+
+    expect(getSpy.calls.mostRecent().args).toEqual([7, { messageLimit: 50, before: 9 }]);
+    expect(component.messages.map(message => message.messageId)).toEqual([7, 8, 9, 10]);
+    expect(component.hasMoreMessages).toBeFalse();
+    expect(component.olderMessagesCursor).toBe(7);
+    expect(newFixture.nativeElement.querySelector('.nl-load-older')).toBeNull();
+  });
+
+  it('compensates the scroll offset after prepending older messages', async () => {
+    const getSpy = mockConversations.get as jasmine.Spy;
+    getSpy.and.callFake((_id: number, options?: { before?: number }) => Promise.resolve({
+      conversation: conversationStub(7, 'Μεγάλη συνομιλία'),
+      messages: options?.before ? [storedMessage(1)] : [storedMessage(2), storedMessage(3, 'assistant')],
+      hasMore: !options?.before,
+      nextCursor: options?.before ? 1 : 2
+    }));
+    routeGetSpy.and.callFake((key: string) => (key === 'conversation' ? '7' : null));
+
+    const newFixture = TestBed.createComponent(ChatComponent);
+    const component = newFixture.componentInstance;
+    // Keep the initial scroll-to-bottom timer out of this test.
+    (component as unknown as { scrollToBottom: () => void }).scrollToBottom = () => {};
+    await component.ngOnInit();
+    newFixture.detectChanges();
+
+    const container = newFixture.nativeElement.querySelector('.nl-chat-messages') as HTMLElement;
+    let scrollHeight = 100;
+    let scrollTop = 20;
+    Object.defineProperty(container, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeight
+    });
+    Object.defineProperty(container, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value; }
+    });
+
+    await component.loadOlderMessages();
+    scrollHeight = 260;
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(scrollTop).toBe(180);
+  });
+
+  it('resets pagination state when switching conversations or starting a new chat', async () => {
+    const getSpy = mockConversations.get as jasmine.Spy;
+    getSpy.and.callFake((id: number) => Promise.resolve({
+      conversation: conversationStub(id, 'Συνομιλία'),
+      messages: [storedMessage(id * 10), storedMessage(id * 10 + 1, 'assistant')],
+      hasMore: true,
+      nextCursor: id * 10
+    }));
+    routeGetSpy.and.callFake((key: string) => (key === 'conversation' ? '7' : null));
+
+    const newFixture = TestBed.createComponent(ChatComponent);
+    const component = newFixture.componentInstance;
+    await component.ngOnInit();
+    newFixture.detectChanges();
+    expect(component.hasMoreMessages).toBeTrue();
+
+    let resolveSwitch!: (value: {
+      conversation: Conversation;
+      messages: StoredMessage[];
+      hasMore: boolean;
+      nextCursor: number | null;
+    }) => void;
+    getSpy.and.returnValue(new Promise(resolve => { resolveSwitch = resolve; }));
+    queryParamSubject.next(convertToParamMap({ conversation: '9' }));
+
+    // State is cleared synchronously when the switch begins.
+    expect(component.hasMoreMessages).toBeFalse();
+    expect(component.olderMessagesCursor).toBeNull();
+
+    resolveSwitch({
+      conversation: conversationStub(9, 'Άλλη συνομιλία'),
+      messages: [storedMessage(20), storedMessage(21, 'assistant')],
+      hasMore: true,
+      nextCursor: 20
+    });
+    await newFixture.whenStable();
+    expect(component.olderMessagesCursor).toBe(20);
+
+    await component.startNewChat();
+    newFixture.detectChanges();
+    expect(component.hasMoreMessages).toBeFalse();
+    expect(component.olderMessagesCursor).toBeNull();
+    expect(newFixture.nativeElement.querySelector('.nl-load-older')).toBeNull();
   });
 });

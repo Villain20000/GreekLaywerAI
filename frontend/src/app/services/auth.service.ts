@@ -258,6 +258,19 @@ export type TokenAuthResult =
  *  /forgot-password, /change-password). */
 export type SimpleAuthResult = { ok: true } | AuthFailure;
 
+/** Result of scheduling account deletion (grace period). */
+export interface AccountDeletionSchedule {
+  ok: true;
+  deletionScheduledFor: string | null;
+  graceHours: number;
+  alreadyScheduled?: boolean;
+}
+
+/** Pending-deletion state for the signed-in account. */
+export interface AccountDeletionStatus {
+  deletionScheduledFor: string | null;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -634,6 +647,98 @@ export class AuthService {
   }
 
   /**
+   * Phase 30: request a change of the account email.
+   *
+   * Requires the current password (like /change-password) so a stolen
+   * session alone cannot redirect the account. The server does NOT touch
+   * users.email yet — it sends a confirmation link to the NEW address and
+   * answers `{ ok: true, requires_verification: true }`.
+   */
+  async changeEmail(
+    newEmail: string,
+    currentPassword: string
+  ): Promise<SimpleAuthResult> {
+    try {
+      const response = await apiFetch(`${this.apiUrl}/change-email`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.tokenValue
+            ? { Authorization: `Bearer ${this.tokenValue}` }
+            : {})
+        },
+        body: JSON.stringify({ newEmail, currentPassword })
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (response.ok) {
+        return { ok: true };
+      }
+
+      return this.failure(
+        data,
+        response.status,
+        `Change-email failed (HTTP ${response.status})`
+      );
+    } catch (error: unknown) {
+      console.error('Change-email error', error);
+      const message = error instanceof Error ? error.message : 'Network error';
+      return {
+        ok: false,
+        kind: 'network',
+        code: null,
+        error: message,
+        status: 0
+      };
+    }
+  }
+
+  /**
+   * Phase 30: consume an email-change token.
+   *
+   * Same contract as verifyEmail(): the server swaps users.email, bumps
+   * token_version and returns a freshly-minted JWT + user. We store both
+   * exactly like verifyEmail() so the header/guards reflect the new
+   * address without a refresh.
+   */
+  async verifyEmailChange(token: string): Promise<TokenAuthResult> {
+    try {
+      const response = await apiFetch(`${this.apiUrl}/verify-email-change`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token })
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (response.ok && data && data.token) {
+        localStorage.setItem('nomos_token', data.token);
+        this.tokenSubject.next(data.token);
+        if (data.user) {
+          localStorage.setItem('nomos_user', JSON.stringify(data.user));
+          this.userSubject.next(data.user);
+        }
+        return { ok: true, token: data.token, user: data.user };
+      }
+
+      return this.failure(
+        data,
+        response.status,
+        `Verify-email-change failed (HTTP ${response.status})`
+      );
+    } catch (error: unknown) {
+      console.error('Verify-email-change error', error);
+      const message = error instanceof Error ? error.message : 'Network error';
+      return {
+        ok: false,
+        kind: 'network',
+        code: null,
+        error: message,
+        status: 0
+      };
+    }
+  }
+
+  /**
    * Phase 25 (admin bypass): redeem an admin-magic-link token.
    *
    * The token comes from a URL printed by the
@@ -924,12 +1029,11 @@ export class AuthService {
   }
 
   /**
-   * Phase 26: GDPR account deletion. Irreversibly wipes the account and
-   * all associated data. The backend requires a double opt-out body
-   * ({ confirm: true, email }) matching the signed-in account. Clears
-   * local auth state on success.
+   * GDPR account deletion: schedules the deletion after the backend's grace
+   * period. The session stays valid (and the page stays usable) so the user
+   * can cancel before the deadline.
    */
-  async deleteAccount(email: string): Promise<void> {
+  async deleteAccount(email: string): Promise<AccountDeletionSchedule> {
     const response = await apiFetch(`${this.gdprUrl}/account`, {
       method: 'DELETE',
       headers: {
@@ -942,7 +1046,41 @@ export class AuthService {
     if (!response.ok) {
       throw new Error(data?.error || `Delete account failed (HTTP ${response.status})`);
     }
-    this.logout();
+    return data as AccountDeletionSchedule;
+  }
+
+  /** Read the signed-in account's pending deletion deadline, if any. */
+  async getDeletionStatus(): Promise<AccountDeletionStatus> {
+    const response = await apiFetch(`${this.gdprUrl}/deletion-status`, {
+      method: 'GET',
+      headers: this.tokenValue
+        ? { Authorization: `Bearer ${this.tokenValue}` }
+        : {}
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data?.error || `Deletion status failed (HTTP ${response.status})`);
+    }
+    return {
+      deletionScheduledFor:
+        typeof data?.deletionScheduledFor === 'string' ? data.deletionScheduledFor : null
+    };
+  }
+
+  /** Cancel a pending account deletion. Throws when none is scheduled (409). */
+  async cancelAccountDeletion(): Promise<void> {
+    const response = await apiFetch(`${this.gdprUrl}/cancel-deletion`, {
+      method: 'POST',
+      headers: this.tokenValue
+        ? { Authorization: `Bearer ${this.tokenValue}` }
+        : {}
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        data?.error || `Cancel account deletion failed (HTTP ${response.status})`
+      );
+    }
   }
 
   // ========================================================================

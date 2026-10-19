@@ -178,6 +178,25 @@ function createRateLimiters(options = {}) {
       store: createStore('cp_user_day')
     }),
 
+    // Change-email mirrors /change-password's two-layer posture: a per-IP
+    // ceiling before authMiddleware (forged-token spam) and a 5/min
+    // per-account cap after it (a stolen JWT cannot mass-mail a victim's
+    // new address).
+    changeEmailPreAuth: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.changeEmailIpMax, 20),                           // 20/min per IP
+      keyGenerator: (req) => `change_email_ip:${req.ip}`,
+      store: createStore('change_email_ip')
+    }),
+    changeEmailPerAccount: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.changeEmailAccountMax, 5),                       // 5/min per user id
+      keyGenerator: (req) => userKey(req, 'change_email'),
+      store: createStore('change_email_account')
+    }),
+
     // Phase 23: forgot-password is split into two stacked limiters so that
     // an enumeration spammer can't bypass the per-IP cap by distributing
     // probes across IPs (per-email cap) — simultaneously, the per-IP cap
@@ -231,6 +250,16 @@ function createRateLimiters(options = {}) {
       max: resolveCap(options.verifyEmailIpMax, 20),                           // 20/min per IP
       keyGenerator: (req) => `verify_email_ip:${req.ip}`,
       store: createStore('verify_email_ip')
+    }),
+    // Email-change verification is token-bearer only (public route), so the
+    // per-IP bucket is the sole boundary. 10/min is enough for legitimate
+    // retries while bounding hash-probing.
+    verifyEmailChangeIp: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.verifyEmailChangeIpMax, 10),                     // 10/min per IP
+      keyGenerator: (req) => `verify_email_change_ip:${req.ip}`,
+      store: createStore('verify_email_change_ip')
     }),
     resendVerificationIp: rateLimit({
       ...STANDARD_OPTIONS,

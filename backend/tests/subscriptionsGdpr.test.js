@@ -216,9 +216,13 @@ describe('GDPR API (/api/gdpr)', () => {
     expect(res.statusCode).toEqual(400);
   });
 
-  it('should delete the user account (cascades handled by FKs)', async () => {
+  it('should schedule account deletion instead of deleting the user', async () => {
     queueAuth({ id: 2 });
-    db.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+    db.query.mockResolvedValueOnce({ rows: [{ deletion_scheduled_for: null }], rowCount: 0 });
+    db.query.mockResolvedValueOnce({
+      rows: [{ deletion_scheduled_for: new Date('2026-10-20T12:00:00.000Z') }],
+      rowCount: 1
+    });
 
     const res = await request(app)
       .delete('/api/gdpr/account')
@@ -226,7 +230,9 @@ describe('GDPR API (/api/gdpr)', () => {
       .send({ confirm: true, email: 'user@nomos.ai' });
 
     expect(res.statusCode).toEqual(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.deletionScheduledFor).toBe('2026-10-20T12:00:00.000Z');
     const deleteCall = db.query.mock.calls.find(([sql]) => /DELETE FROM users WHERE id = \$1/.test(sql));
-    expect(deleteCall).toBeDefined();
+    expect(deleteCall).toBeUndefined();
   });
 });

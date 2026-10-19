@@ -10,6 +10,7 @@ export interface LegalDocument {
   content_type: string;
   metadata: Record<string, unknown>;
   created_at: string;
+  file_size?: number | null;
   chunk_count?: number;
 }
 
@@ -62,14 +63,50 @@ export class DocumentService {
     return data.document;
   }
 
-  /** Extracted plain-text content (GET /api/documents/:id/content). */
+  /** Extracted plain-text content (GET /api/documents/:id/content?format=text). */
   async getContent(id: number): Promise<string> {
-    const res = await apiFetch(`${this.apiUrl}/${id}/content`, { headers: this.headers() });
+    const res = await apiFetch(`${this.apiUrl}/${id}/content?format=text`, { headers: this.headers() });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || `Get document content failed (HTTP ${res.status})`);
     }
     return res.text();
+  }
+
+  /**
+   * Downloads the original uploaded file. The server always sends an
+   * attachment; its Content-Disposition filename (UTF-8 aware) wins over the
+   * stored filename when present.
+   */
+  async downloadOriginal(id: number): Promise<{ blob: Blob; filename: string | null }> {
+    const res = await apiFetch(`${this.apiUrl}/${id}/content?download=1`, { headers: this.headers() });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `Download document failed (HTTP ${res.status})`);
+    }
+    return {
+      blob: await res.blob(),
+      filename: this.filenameFromContentDisposition(res.headers.get('Content-Disposition'))
+    };
+  }
+
+  /** Prefer RFC 5987 `filename*=UTF-8''...`, then the quoted ASCII fallback. */
+  private filenameFromContentDisposition(header: string | null): string | null {
+    if (!header) return null;
+
+    const extended = /filename\*\s*=\s*[^']*''([^;]+)/i.exec(header);
+    const rawExtended = extended && extended[1].trim().replace(/^"|"$/g, '');
+    if (rawExtended) {
+      try {
+        return decodeURIComponent(rawExtended);
+      } catch {
+        return rawExtended;
+      }
+    }
+
+    const plain = /filename\s*=\s*"([^"]+)"/i.exec(header)
+      || /filename\s*=\s*([^;]+)/i.exec(header);
+    return plain ? plain[1].trim() : null;
   }
 
   /**
