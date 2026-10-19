@@ -15,7 +15,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1153.0",
     "@sentry/node": "^11.8.0",
-    "bcryptjs": "^2.4.3",
+    "bcryptjs": "^3.0.3",
     "bullmq": "^5.7.8",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
