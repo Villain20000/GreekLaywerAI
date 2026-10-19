@@ -8,12 +8,23 @@
 // per-test counter state is isolated. The DB and emailService mocks are
 // reset in beforeEach.
 
+// Pin NODE_ENV='test' BEFORE the first require of application source.
+// This suite builds its own express app (makeApp) instead of using
+// tests/app.js, so it cannot rely on that harness's pin. Without it the
+// ambient environment decides the outcome: `../src/routes/auth` pulls in
+// authMiddleware (which refuses to load when NODE_ENV=production and
+// JWT_SECRET is unset/default) and emailService (which hard-throws in
+// production without a full SMTP configuration), so the whole suite dies
+// at import time. Same idiom as the ~30 sibling suites.
+process.env.NODE_ENV = 'test';
+
 const express = require('express');
 const request = require('supertest');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const db = require('../src/config/db');
 const { buildAuthRouter } = require('../src/routes/auth');
+const { AUTH_ERROR_CODES } = require('../src/constants/authErrors');
 const { createRateLimiters } = require('../src/middlewares/rateLimiters');
 const emailService = require('../src/services/emailService');
 
@@ -152,6 +163,7 @@ describe('Phase 24: email verification', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('User already exists');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.EMAIL_TAKEN);
       // No second INSERT, no email sent, no token row.
       expect(emailService.sendEmailVerification).not.toHaveBeenCalled();
       const insertCalls = db.query.mock.calls.filter(
@@ -221,6 +233,7 @@ describe('Phase 24: email verification', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired verification link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
     });
 
     it('returns 400 for a non-hex token without touching the DB', async () => {
@@ -231,6 +244,7 @@ describe('Phase 24: email verification', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired verification link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
       expect(db.connect).not.toHaveBeenCalled();
     });
 
@@ -242,6 +256,7 @@ describe('Phase 24: email verification', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired verification link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
     });
   });
 
@@ -262,7 +277,10 @@ describe('Phase 24: email verification', () => {
         .send({ email: 'real@nomos.ai' });
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
 
       const insertCall = db.query.mock.calls.find(
         ([sql]) => typeof sql === 'string' &&
@@ -284,7 +302,10 @@ describe('Phase 24: email verification', () => {
         .send({ email: 'noone@nomos.ai' });
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
 
       expect(emailService.sendEmailVerification).not.toHaveBeenCalled();
       const insertCalls = db.query.mock.calls.filter(
@@ -305,7 +326,10 @@ describe('Phase 24: email verification', () => {
         .send({ email: 'already@nomos.ai' });
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
 
       expect(emailService.sendEmailVerification).not.toHaveBeenCalled();
       const insertCalls = db.query.mock.calls.filter(
@@ -322,8 +346,53 @@ describe('Phase 24: email verification', () => {
         .send({});
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
       expect(db.query).not.toHaveBeenCalled();
+    });
+
+    it('returns a byte-identical body AND code for known vs unknown emails (anti-enumeration)', async () => {
+      // /resend-verification must not reveal whether an address has an
+      // account. The machine-readable `code` therefore has to be the SAME
+      // generic value on every path — a per-outcome code (e.g.
+      // 'email_exists' vs 'email_unknown') would be an enumeration oracle.
+      const app = makeApp();
+
+      // Known + unverified address → token row minted, email sent.
+      db.query.mockResolvedValueOnce({ rows: [{ id: 4, verified_at: null }] });
+      db.query.mockResolvedValueOnce({ rows: [] });
+      const known = await request(app)
+        .post('/api/auth/resend-verification')
+        .send({ email: 'real@nomos.ai' });
+
+      // Unknown address → no row, no email.
+      db.query.mockResolvedValueOnce({ rows: [] });
+      const unknown = await request(app)
+        .post('/api/auth/resend-verification')
+        .send({ email: 'noone@nomos.ai' });
+
+      expect(known.statusCode).toEqual(unknown.statusCode);
+      expect(known.body).toEqual(unknown.body);
+      expect(known.body.code).toBe('request_accepted');
+      expect(unknown.body.code).toBe('request_accepted');
+      expect(known.body.code).toBe(AUTH_ERROR_CODES.REQUEST_ACCEPTED);
+    });
+
+    it('returns the same generic code for an already-verified address as for an unknown one', async () => {
+      // Third outcome, same generic answer.
+      const app = makeApp();
+      db.query.mockResolvedValueOnce({
+        rows: [{ id: 4, verified_at: new Date('2026-01-01') }]
+      });
+
+      const res = await request(app)
+        .post('/api/auth/resend-verification')
+        .send({ email: 'already@nomos.ai' });
+
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.REQUEST_ACCEPTED);
     });
   });
 });

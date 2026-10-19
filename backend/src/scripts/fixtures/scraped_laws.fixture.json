@@ -1,0 +1,39 @@
+[
+  {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "source": "Fixture Gazette (FEK)",
+    "law_title": "Fixture law on environmental permits",
+    "law_number": "1000/2026",
+    "fek_reference": "A' 1",
+    "publication_date": "2026-01-10",
+    "source_url": "https://example.invalid/laws/1000-2026",
+    "pdf_url": "https://example.invalid/laws/1000-2026.pdf",
+    "full_text": "Fixture law body: permits for renewable energy installations are issued within sixty days.",
+    "status": "Active",
+    "scraped_at": "2026-01-10T00:00:00+00:00"
+  },
+  {
+    "id": "22222222-2222-4222-8222-222222222222",
+    "source": "Fixture Gazette (FEK)",
+    "law_title": "Fixture law on maritime labour",
+    "law_number": "1001/2026",
+    "fek_reference": "A' 2",
+    "publication_date": "2026-01-11",
+    "source_url": "https://example.invalid/laws/1001-2026",
+    "pdf_url": null,
+    "full_text": "Fixture law body: seafarers' rest periods are regulated per the annexed directive.",
+    "status": "Active",
+    "scraped_at": "2026-01-11T00:00:00+00:00"
+  },
+  {
+    "id": "33333333-3333-4333-8333-333333333333",
+    "source": "Fixture Gazette (FEK)",
+    "law_title": "Incomplete fixture row (no full_text — must be dropped)",
+    "law_number": "1002/2026",
+    "fek_reference": "A' 3",
+    "publication_date": "2026-01-12",
+    "full_text": "",
+    "status": "Active",
+    "scraped_at": "2026-01-12T00:00:00+00:00"
+  }
+]

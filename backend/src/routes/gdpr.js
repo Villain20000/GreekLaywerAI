@@ -10,9 +10,13 @@ const db = require('../config/db');
 const { validate } = require('../middlewares/validation');
 const { check } = require('express-validator');
 const { logAudit, deleteAuditLogsForUser } = require('../services/auditLog');
+const { createApiRateLimiters } = require('../middlewares/rateLimiters');
+
+// 1-3: per-user caps — export dumps every table; deletion is irreversible.
+const limiters = createApiRateLimiters();
 
 // GET /api/gdpr/export — all user data as JSON
-router.get('/export', async (req, res) => {
+router.get('/export', limiters.gdprExport, async (req, res) => {
   try {
     const userId = req.user.id;
 
@@ -70,6 +74,7 @@ router.get('/export', async (req, res) => {
 // Double opt-out: the caller must confirm with the account email.
 router.delete(
   '/account',
+  limiters.gdprDelete,
   validate([
     check('confirm').isBoolean().withMessage('confirm must be true'),
     check('email').isEmail().withMessage('email is required')

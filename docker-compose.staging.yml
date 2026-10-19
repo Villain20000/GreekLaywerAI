@@ -1,0 +1,410 @@
+# NomosAI staging stack (plan item 3-2).
+#
+# Production-like, single-host staging deployment. Traefik v3 terminates TLS
+# (Let's Encrypt ACME, staging CA by default) and is the ONLY service that
+# publishes host ports. The frontend nginx serves the SPA and proxies /api/
+# to the backend, so the backend, database and Redis are never exposed.
+#
+# Usage:
+#   cp .env.staging.example .env.staging
+#   chmod 600 .env.staging
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging config -q
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging exec backend npm run migrate
+#
+# Full runbook (DNS, ACME, secrets, rotation, rollback, smoke tests):
+#   docs/staging-deployment.md
+#
+# Optional observability stack (same configuration as production):
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging \
+#     --profile monitoring up -d
+
+name: nomosai-staging
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ── Data stores ────────────────────────────────────────────────────────
+  db:
+    image: ankane/pgvector:v0.5.1
+    environment:
+      POSTGRES_USER: nomos_admin
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD must be set in .env.staging}"
+      POSTGRES_DB: nomos_db
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nomos_admin -d nomos_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata_staging:/data
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # ── Local AI sidecars (no cloud calls, no published ports) ─────────────
+  ollama:
+    image: ollama/ollama
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "ollama serve & sleep 5 && ollama pull bge-m3 && ollama pull gemma:2b && printf 'FROM gemma:2b\nPARAMETER use_mmap true\n' > /tmp/gemma-mmap.Modelfile && ollama create gemma2b-mmap -f /tmp/gemma-mmap.Modelfile && wait"
+    volumes:
+      - ollama_models_staging:/root/.ollama
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q bge-m3 && ollama list | grep -q gemma2b-mmap"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    # Staging defaults to CPU. On a GPU host, uncomment the reservation
+    # (requires the NVIDIA Container Toolkit on the Docker host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    environment:
+      - WHISPER__INFERENCE_DEVICE=cpu
+      - WHISPER__COMPUTE_TYPE=int8
+      - "PRELOAD_MODELS=[\"${WHISPER_MODEL:-Systran/faster-whisper-base}\"]"
+    volumes:
+      - whisper_cache_staging:/home/ubuntu/.cache/huggingface/hub
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Application ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    # Override with a registry tag for reproducible deploys/rollbacks:
+    #   STAGING_BACKEND_IMAGE=registry.example.com/nomosai/backend:2026-10-19
+    image: ${STAGING_BACKEND_IMAGE:-nomosai-staging-backend:local}
+    environment:
+      # NODE_ENV=production keeps the SMTP boot guard and JWT_SECRET guard
+      # active. Staging is meant to catch exactly those configuration bugs.
+      - "NODE_ENV=production"
+      - "PORT=3000"
+      - "DB_HOST=db"
+      - "DB_PORT=5432"
+      - "DB_USER=nomos_admin"
+      - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.staging}"
+      - "DB_NAME=nomos_db"
+      - "REDIS_URL=redis://redis:6379"
+      - "OLLAMA_URL=http://ollama:11434"
+      - "OLLAMA_EMBED_MODEL=bge-m3"
+      - "OLLAMA_EMBED_DIM=1024"
+      - "OLLAMA_CHAT_MODEL=gemma2b-mmap"
+      - "WHISPER_URL=http://whisper:8000"
+      - "WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}"
+      - "WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}"
+      # Use Stripe *test* keys in staging (sk_test_...), or sk_test_mock to
+      # exercise the mock checkout without any Stripe account. Webhooks need
+      # a public HTTPS URL; see docs/staging-deployment.md.
+      - "STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY must be set (test key or sk_test_mock)}"
+      - "STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}"
+      - "STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}"
+      - "STRIPE_PRICE_ID_ENTERPRISE=${STRIPE_PRICE_ID_ENTERPRISE:-}"
+      - "STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}"
+      - "JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set in .env.staging}"
+      - "CORS_ORIGINS=https://${STAGING_DOMAIN}"
+      - "APP_BASE_URL=https://${STAGING_DOMAIN}"
+      # Backend production boot guard: EMAIL_TRANSPORT=smtp + SMTP_HOST +
+      # EMAIL_FROM are mandatory. Point SMTP at a sandbox (Mailtrap, Mailpit,
+      # MailHog, …) so staging can never email real users by accident.
+      - "EMAIL_TRANSPORT=smtp"
+      - "EMAIL_FROM=${EMAIL_FROM:?EMAIL_FROM must be set in .env.staging}"
+      - "SMTP_HOST=${SMTP_HOST:?SMTP_HOST must be set in .env.staging}"
+      - "SMTP_PORT=${SMTP_PORT:-587}"
+      - "SMTP_SECURE=${SMTP_SECURE:-false}"
+      - "SMTP_USER=${SMTP_USER:-}"
+      - "SMTP_PASS=${SMTP_PASS:-}"
+      # Traefik -> frontend nginx -> backend; both hops are private Docker
+      # networks, so trust uniquelocal/loopback for rate-limit client IPs.
+      - "TRUST_PROXY=uniquelocal,loopback"
+      - "RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}"
+      - "RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}"
+      - "RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}"
+      - "ADMIN_MAGIC_LINK_ENABLED=${ADMIN_MAGIC_LINK_ENABLED:-false}"
+      - "LOG_LEVEL=${LOG_LEVEL:-info}"
+      # Phase 1-8: scraper output consumed by the ingest script. The file is
+      # bind-mounted read-only below; ensure it exists on the host (or
+      # comment the mount out if staging does not need legislation ingest).
+      - "SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json"
+    volumes:
+      - "${SCRAPED_LAWS_PATH:-./scraped_laws.json}:/usr/src/app/scraped_laws.json:ro"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      whisper:
+        condition: service_started
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      # /health returns 503 only when DB or Redis is down; Ollama warmup is
+      # reported but does not fail the probe. Node 20 ships global fetch.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  frontend:
+    build:
+      context: ./frontend
+    image: ${STAGING_FRONTEND_IMAGE:-nomosai-staging-frontend:local}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      # Traefik Docker provider: this label set is the only public route.
+      - "traefik.enable=true"
+      - "traefik.docker.network=nomos-staging-network"
+      - "traefik.http.routers.nomos-staging.rule=Host(`${STAGING_DOMAIN:?STAGING_DOMAIN must be set in .env.staging}`)"
+      - "traefik.http.routers.nomos-staging.entrypoints=websecure"
+      - "traefik.http.routers.nomos-staging.tls=true"
+      # Local/self-signed fallback: set STAGING_DOMAIN=localhost, comment out
+      # this certresolver label, and Traefik serves its generated self-signed
+      # certificate (browser warning expected). Full steps and an mkcert
+      # variant: docs/staging-deployment.md → "Self-signed / localhost fallback".
+      - "traefik.http.routers.nomos-staging.tls.certresolver=le"
+      - "traefik.http.routers.nomos-staging.service=nomos-staging"
+      - "traefik.http.services.nomos-staging.loadbalancer.server.port=80"
+      # HSTS is intentionally NOT enabled until the certificate path is
+      # validated (a mis-issued staging cert would otherwise pin browsers to
+      # an untrusted origin). After validation, uncomment these three labels
+      # and add the middleware to the router:
+      # - "traefik.http.middlewares.nomos-staging-hsts.headers.stsSeconds=31536000"
+      # - "traefik.http.middlewares.nomos-staging-hsts.headers.stsIncludeSubdomains=true"
+      # - "traefik.http.middlewares.nomos-staging-hsts.headers.stsPreload=true"
+      # - "traefik.http.routers.nomos-staging.middlewares=nomos-staging-hsts"
+
+  # ── TLS reverse proxy ──────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.7
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+      # Certificates are issued through the HTTP-01 challenge on :80. The CA
+      # defaults to Let's Encrypt STAGING so experiments cannot burn the
+      # production rate limit; set STAGING_ACME_CA to the production
+      # directory only after the staging domain is stable.
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:?ACME_EMAIL must be set in .env.staging}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.caserver=${STAGING_ACME_CA:-https://acme-staging-v02.api.letsencrypt.org/directory}"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+    ports:
+      # ONLY Traefik publishes host ports. Override the host side when 80/443
+      # are already occupied (e.g. STAGING_HTTP_PORT=8080).
+      - "${STAGING_HTTP_PORT:-80}:80"
+      - "${STAGING_HTTPS_PORT:-443}:443"
+    volumes:
+      # Read-only Docker socket is required for the Docker provider. On hosts
+      # with a hardened Docker API, replace it with a socket proxy.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - traefik_certs:/letsencrypt
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Scheduled jobs (mirror production) ────────────────────────────────
+  backup:
+    image: node:20-alpine
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./database:/app/database:ro
+      - backups_staging:/backups
+      - prom_textfile_staging:/prom-textfile
+    environment:
+      - "DB_HOST=db"
+      - "DB_PORT=5432"
+      - "DB_USER=nomos_admin"
+      - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.staging}"
+      - "DB_NAME=nomos_db"
+      - "BACKUP_DIR=/backups"
+      - "PROM_TEXTFILE_DIR=/prom-textfile"
+    entrypoint: >
+      /bin/sh -c "apk add --no-cache postgresql-client > /dev/null 2>&1
+      && echo '0 2 * * * cd /app/backend && node src/scripts/backupDb.js' > /etc/crontabs/root
+      && crond -f"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  retention:
+    image: node:20-alpine
+    volumes:
+      - ./backend:/app/backend:ro
+    environment:
+      - "DB_HOST=db"
+      - "DB_PORT=5432"
+      - "DB_USER=nomos_admin"
+      - "DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in .env.staging}"
+      - "DB_NAME=nomos_db"
+      - "RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}"
+      - "RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}"
+      - "RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}"
+    entrypoint: >
+      /bin/sh -c "echo '0 3 * * * cd /app/backend && node src/scripts/retentionCleanup.js' > /etc/crontabs/root
+      && crond -f"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── Optional observability (reuses monitoring/, profile-gated) ────────
+  # Enable with `--profile monitoring`. Prometheus/exporters stay internal;
+  # Grafana binds to loopback only, reach it through an SSH tunnel.
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v2.54.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data_staging:/prometheus
+    depends_on:
+      - backend
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:11.2.0
+    environment:
+      - "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set when using the monitoring profile}"
+      - "GF_USERS_ALLOW_SIGN_UP=false"
+      - "GF_AUTH_ANONYMOUS_ENABLED=false"
+    volumes:
+      - grafana_data_staging:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  redis_exporter:
+    profiles: ["monitoring"]
+    image: oliver006/redis_exporter:v1.66.0
+    environment:
+      - "REDIS_ADDR=redis://redis:6379"
+    depends_on:
+      - redis
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  node_exporter:
+    profiles: ["monitoring"]
+    image: prom/node-exporter:v1.8.2
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.textfile.directory=/prom-textfile"
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      - prom_textfile_staging:/prom-textfile:ro
+    networks:
+      - nomos-staging-network
+    restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  pgdata_staging:
+  redisdata_staging:
+  ollama_models_staging:
+  whisper_cache_staging:
+  traefik_certs:
+  backups_staging:
+  prometheus_data_staging:
+  grafana_data_staging:
+  prom_textfile_staging:
+
+networks:
+  nomos-staging-network:
+    name: nomos-staging-network
+    driver: bridge

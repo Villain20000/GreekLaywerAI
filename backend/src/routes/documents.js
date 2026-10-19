@@ -18,8 +18,14 @@ const documentService = require('../services/documentService');
 const { validate, validateUploadedFile } = require('../middlewares/validation');
 const { check } = require('express-validator');
 const { logAudit } = require('../services/auditLog');
+const { createApiRateLimiters } = require('../middlewares/rateLimiters');
+const { enforceDocumentCap } = require('../middlewares/quotaMiddleware');
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB, matches plan
+
+// 1-3: per-user caps. documentUpload sits BEFORE multer so a throttled
+// caller never gets its 25MB body buffered into memory.
+const limiters = createApiRateLimiters();
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -34,6 +40,8 @@ function parsePositiveInt(raw) {
 // POST /api/documents — upload + process (extract → chunk → embed)
 router.post(
   '/',
+  limiters.documentUpload,
+  enforceDocumentCap,
   upload.single('file'),
   validate([check('title').optional({ values: 'null' }).isString().isLength({ max: 255 })]),
   validateUploadedFile('document'),
@@ -150,6 +158,7 @@ router.delete('/:id', async (req, res) => {
 // POST /api/documents/search — vector similarity search across user's docs
 router.post(
   '/search',
+  limiters.documentSearch,
   validate([
     check('query').isString().trim().notEmpty().withMessage('query is required').isLength({ max: 5000 }),
     check('limit').optional().isInt({ min: 1, max: 50 })

@@ -37,6 +37,16 @@ services:
       - OLLAMA_EMBED_MODEL=bge-m3
       - OLLAMA_EMBED_DIM=1024
       - OLLAMA_CHAT_MODEL=gemma2b-mmap
+      # Phase 1-6: local speech-to-text sidecar (see `whisper` below). Audio
+      # is transcribed by faster-whisper inside the compose network — no
+      # cloud STT call. WHISPER_MODEL must match the sidecar's PRELOAD_MODELS.
+      - WHISPER_URL=http://whisper:8000
+      - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}
+      - WHISPER_TIMEOUT_MS=120000
+      # Phase 1-8: canonical path for the scraper output consumed by
+      # `node src/scripts/ingestLegislation.js`. Bind-mounted read-only below
+      # so a re-scrape on the host is picked up without rebuilding the image.
+      - SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json
       - STRIPE_SECRET_KEY=sk_test_mock
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=${JWT_SECRET:-nomos-super-secret-key-development}
@@ -55,6 +65,10 @@ services:
         condition: service_started
       ollama:
         condition: service_healthy
+      whisper:
+        condition: service_started
+    volumes:
+      - ./scraped_laws.json:/usr/src/app/scraped_laws.json:ro
     networks:
       - nomos-network
 
@@ -114,10 +128,110 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
+  # Phase 1-6: local speech-to-text (STT). OpenAI-compatible endpoint
+  # (`POST /v1/audio/transcriptions`) served by speaches + faster-whisper, so
+  # the backend can be pointed at any compatible image via WHISPER_URL.
+  #
+  # Model: `Systran/faster-whisper-base` — small multilingual checkpoint
+  # (Greek included), pre-downloaded into the named cache volume at boot and
+  # kept warm by speaches. Backend WHISPER_MODEL must match PRELOAD_MODELS.
+  #
+  # CPU caveat: `base` runs at roughly 1–3× real time on a modern 4-core CPU
+  # (int8), so long recordings can take minutes and the first request after
+  # boot pays the model load. For better accuracy/throughput use the
+  # `latest-cuda` image (needs GPU pass-through) or a larger checkpoint.
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    ports:
+      - "8000:8000" # convenient for local curl; drop in locked-down setups
+    environment:
+      - WHISPER__INFERENCE_DEVICE=cpu
+      # int8 quantization keeps CPU inference usable.
+      - WHISPER__COMPUTE_TYPE=int8
+      # Pydantic list → JSON. Pre-download at boot so the first upload isn't
+      # a cold HuggingFace pull. Must match backend WHISPER_MODEL.
+      - 'PRELOAD_MODELS=["${WHISPER_MODEL:-Systran/faster-whisper-base}"]'
+    volumes:
+      - whisper_cache:/home/ubuntu/.cache/huggingface/hub
+    networks:
+      - nomos-network
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # 3-1: observability stack. Prometheus and the exporters stay on the
+  # internal compose network (no published ports); only Grafana is reachable,
+  # and only from localhost. Open http://localhost:3001 (admin password from
+  # GRAFANA_ADMIN_PASSWORD) after `docker compose up -d`.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - backend
+    networks:
+      - nomos-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - nomos-network
+    restart: unless-stopped
+
+  # Redis signal for the RedisDown alert (redis_up).
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - nomos-network
+    restart: unless-stopped
+
+  # Host disk/CPU/memory plus the backup-freshness textfile collector.
+  node_exporter:
+    image: prom/node-exporter:v1.8.2
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.textfile.directory=/prom-textfile'
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      - prom_textfile:/prom-textfile:ro
+    networks:
+      - nomos-network
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
   ollama_data:
+  whisper_cache:
+  prometheus_data:
+  grafana_data:
+  prom_textfile:
 
 networks:
   nomos-network:

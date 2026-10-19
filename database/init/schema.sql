@@ -29,6 +29,32 @@ CREATE TABLE subscriptions (
     current_period_end TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- One row per Stripe subscription (webhook replays upsert instead of
+-- inserting duplicates) + per-user lookup index.
+CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_stripe_subscription_id_uidx
+    ON subscriptions(stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS subscriptions_user_id_idx ON subscriptions(user_id);
+
+-- Daily usage counters (1-4): one atomic row per user / UTC day / quota kind.
+-- `day` is a UTC calendar date; quotaService resets at the next UTC midnight.
+-- Mirror of backend/src/scripts/migrate-usage-counters.js.
+CREATE TABLE IF NOT EXISTS usage_counters (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day DATE NOT NULL,
+    kind TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day, kind)
+);
+
+-- Stripe webhook idempotency (1-10): one row per processed event id, claimed
+-- BEFORE dispatch (webhook.js). Stripe delivers at-least-once, so a second
+-- delivery of the same evt_… id must be acked without reprocessing.
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+    event_id TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS stripe_webhook_events_processed_at_idx
+    ON stripe_webhook_events(processed_at);
 
 -- Conversations Table
 CREATE TABLE conversations (
@@ -95,7 +121,7 @@ CREATE TABLE legal_document_chunks (
 );
 CREATE INDEX IF NOT EXISTS legal_document_chunks_document_id_idx ON legal_document_chunks(document_id);
 CREATE INDEX IF NOT EXISTS legal_document_chunks_hnsw_idx
-    ON legal_document_chunks USING hnsw (embedding vector_l2_ops);
+    ON legal_document_chunks USING hnsw (embedding vector_cosine_ops);
 
 -- Audit Log Table (admin actions, tier changes, account deletions, failed logins)
 CREATE TABLE audit_log (
@@ -155,17 +181,23 @@ CREATE INDEX IF NOT EXISTS email_verification_tokens_user_id_idx
 -- before applying this schema.
 --
 -- On a running DB, the one-shot migration sequence is (in order):
---   -- 1) drop the HNSW index first, otherwise Postgres refuses
+--   -- 1) drop the HNSW indexes first, otherwise Postgres refuses
 --   --    ALTER COLUMN ... TYPE because the column is index-referenced.
+--   --    NOTE: legacy DBs have an auto-named index
+--   --    (legislation_embeddings_embedding_idx) from the original unnamed
+--   --    CREATE INDEX; migrate-vector-cosine-indexes.js drops both names.
 --   DROP INDEX IF EXISTS legislation_embeddings_hnsw_idx;
+--   DROP INDEX IF EXISTS legislation_embeddings_embedding_idx;
 --   TRUNCATE legislation_embeddings;
 --   -- 2) pgvector rejects ALTER if any rows have wrong-dim vectors;
 --   --    TRUNCATE above guarantees the column is empty.
 --   ALTER TABLE legislation_embeddings
 --     ALTER COLUMN embedding TYPE vector(1024);
---   -- 3) recreate the HNSW index against the new dim.
+--   -- 3) recreate the HNSW index against the new dim WITH the cosine
+--   --    opclass — queries use `<=>`, so the index must be vector_cosine_ops
+--   --    (migrate-vector-cosine-indexes.js does this for live DBs).
 --   CREATE INDEX legislation_embeddings_hnsw_idx
---     ON legislation_embeddings USING hnsw (embedding vector_l2_ops);
+--     ON legislation_embeddings USING hnsw (embedding vector_cosine_ops);
 --   -- 4) restart the backend with the new env so ollamaService.js
 --   --    resolves EMBED_DIM=1024 at module load.
 --   docker compose up -d --build backend;
@@ -189,8 +221,20 @@ CREATE TABLE legislation_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Create HNSW index for rapid retrieval
-CREATE INDEX ON legislation_embeddings USING hnsw (embedding vector_l2_ops);
+-- Create HNSW index for rapid retrieval. The opclass MUST match the query
+-- operator: ragService retrieves with cosine (`<=>`), so the index must use
+-- vector_cosine_ops. An L2 index cannot serve a cosine ORDER BY and the
+-- planner silently falls back to a sequential scan.
+CREATE INDEX IF NOT EXISTS legislation_embeddings_hnsw_idx
+    ON legislation_embeddings USING hnsw (embedding vector_cosine_ops);
+
+-- Race-free ingest dedupe: a partial unique index so
+-- INSERT ... ON CONFLICT (source_type, article_number) works for non-null
+-- pairs. Must match migrate-legislation-unique-index.js (which also dedupes
+-- legacy rows before creating it).
+CREATE UNIQUE INDEX IF NOT EXISTS legislation_embeddings_source_article_uidx
+    ON legislation_embeddings(source_type, article_number)
+    WHERE source_type IS NOT NULL AND article_number IS NOT NULL;
 
 -- Partial unique indexes — enforce single-use of an unused token at the DB
 -- layer regardless of app-layer compare-and-set correctness. The WHERE

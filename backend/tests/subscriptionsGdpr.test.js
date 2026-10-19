@@ -1,4 +1,11 @@
 // Phase 29: Subscriptions + GDPR API tests.
+//
+// Pin mock Stripe mode BEFORE ../src/routes/billing (via ./app) loads
+// stripeService: another test file in the same jest worker may have left a
+// live-looking STRIPE_SECRET_KEY in process.env, which would make the
+// billing mock-checkout tests 403.
+process.env.STRIPE_SECRET_KEY = 'sk_test_mock';
+
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
 const app = require('./app');
@@ -108,6 +115,51 @@ describe('Subscriptions API (/api/subscriptions)', () => {
 
     expect(res.statusCode).toEqual(200);
     expect(res.body.url).toContain('tier=enterprise');
+  });
+});
+
+describe('Billing mock-complete (/api/billing/mock-complete)', () => {
+  afterEach(() => {
+    db.query.mockReset();
+  });
+
+  it('should 401 without a token', async () => {
+    const res = await request(app).post('/api/billing/mock-complete').send({ tier: 'pro' });
+    expect(res.statusCode).toEqual(401);
+  });
+
+  it('should 400 on an invalid tier', async () => {
+    queueAuth({ id: 2 });
+    const res = await request(app)
+      .post('/api/billing/mock-complete')
+      .set('Authorization', `Bearer ${userToken()}`)
+      .send({ tier: 'platinum' });
+    expect(res.statusCode).toEqual(400);
+  });
+
+  it('should apply the mock tier through the shared upsert path', async () => {
+    queueAuth({ id: 2 });
+    db.query.mockResolvedValueOnce({ rows: [{ id: 9 }] }); // upsert INSERT ... RETURNING
+
+    const res = await request(app)
+      .post('/api/billing/mock-complete')
+      .set('Authorization', `Bearer ${userToken()}`)
+      .send({ tier: 'pro' });
+
+    expect(res.statusCode).toEqual(200);
+    expect(res.body).toEqual({ ok: true, tier: 'pro', status: 'active' });
+
+    const insertCall = db.query.mock.calls.find(
+      ([sql]) => typeof sql === 'string' && /INSERT INTO subscriptions/.test(sql)
+    );
+    expect(insertCall).toBeDefined();
+    expect(insertCall[0]).toMatch(/ON CONFLICT \(stripe_subscription_id\)/);
+
+    const tierUpdate = db.query.mock.calls.find(
+      ([sql]) => typeof sql === 'string' && /UPDATE users SET subscription_tier/.test(sql)
+    );
+    expect(tierUpdate).toBeDefined();
+    expect(tierUpdate[1]).toEqual(['pro', 2]);
   });
 });
 

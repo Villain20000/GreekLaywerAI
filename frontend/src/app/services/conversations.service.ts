@@ -23,6 +23,11 @@ export interface Message {
   created_at: string;
 }
 
+export interface ConversationPage {
+  conversations: Conversation[];
+  total: number;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -33,11 +38,25 @@ export class ConversationsService {
     return { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` };
   }
 
-  async list(limit = 20, offset = 0): Promise<Conversation[]> {
-    const res = await apiFetch(`${this.apiUrl}?limit=${limit}&offset=${offset}`, { headers: this.headers() });
+  /** One page of conversations plus the total match count. */
+  async listPage(limit = 20, offset = 0, q = ''): Promise<ConversationPage> {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset)
+    });
+    if (q.trim()) params.set('q', q.trim());
+    const res = await apiFetch(`${this.apiUrl}?${params.toString()}`, { headers: this.headers() });
     if (!res.ok) throw new Error(`List conversations failed (HTTP ${res.status})`);
     const data = await res.json();
-    return data.conversations || [];
+    const conversations: Conversation[] = data.conversations || [];
+    const total = Number.isFinite(Number(data.total)) ? Number(data.total) : conversations.length;
+    return { conversations, total };
+  }
+
+  /** Backwards-compatible array-only helper used by the chat side panel. */
+  async list(limit = 20, offset = 0, q = ''): Promise<Conversation[]> {
+    const page = await this.listPage(limit, offset, q);
+    return page.conversations;
   }
 
   async create(title?: string): Promise<Conversation> {

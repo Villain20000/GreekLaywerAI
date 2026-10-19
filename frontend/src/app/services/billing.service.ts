@@ -16,6 +16,19 @@ export interface SubscriptionState {
   tier: string;
 }
 
+/**
+ * Plan row rendered by the billing page. The catalog is owned by the backend
+ * (GET /api/billing/plans) — the UI must not hardcode names/prices/features.
+ */
+export interface TierPlan {
+  id: string;
+  tier: string;
+  name: string;
+  price: string;
+  features: string[];
+  recommended?: boolean;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -24,6 +37,16 @@ export class BillingService {
 
   private headers(): Record<string, string> {
     return { Authorization: `Bearer ${localStorage.getItem('nomos_token') || ''}` };
+  }
+
+  /** Server-owned plan catalog (GET /api/billing/plans). */
+  async getPlans(): Promise<TierPlan[]> {
+    const res = await apiFetch(`${this.apiUrl}/billing/plans`, { headers: this.headers() });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Plans failed (HTTP ${res.status})`);
+    }
+    return data.plans || [];
   }
 
   /** Start Stripe Checkout for a tier; returns the redirect URL. */
@@ -41,10 +64,45 @@ export class BillingService {
     return data.url;
   }
 
+  /**
+   * Create a Stripe Billing Portal session (live mode only) and return its
+   * URL. Mock mode 403s server-side with a readable error.
+   */
+  async createPortalSession(): Promise<string> {
+    const res = await apiFetch(`${this.apiUrl}/billing/portal`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Portal failed (HTTP ${res.status})`);
+    }
+    return data.url;
+  }
+
   async getSubscription(): Promise<SubscriptionState> {
     const res = await apiFetch(`${this.apiUrl}/subscriptions`, { headers: this.headers() });
     if (!res.ok) throw new Error(`Get subscription failed (HTTP ${res.status})`);
     return res.json();
+  }
+
+  /**
+   * Mock-mode only: after the mock checkout redirect
+   * (`?mock_payment=success&tier=…`), confirm the "payment" for real by
+   * applying the same tier-sync a Stripe webhook performs. The backend 403s
+   * this route in live Stripe mode.
+   */
+  async completeMockCheckout(tier: string): Promise<{ tier: string; status: string }> {
+    const res = await apiFetch(`${this.apiUrl}/billing/mock-complete`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tier })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Mock checkout failed (HTTP ${res.status})`);
+    }
+    return data;
   }
 
   async history(): Promise<Subscription[]> {
@@ -62,14 +120,19 @@ export class BillingService {
     if (!res.ok) throw new Error(`Cancel failed (HTTP ${res.status})`);
   }
 
-  async upgrade(tier: string): Promise<string> {
-    const res = await apiFetch(`${this.apiUrl}/subscriptions/upgrade`, {
+  /**
+   * Undo a cancellation scheduled at period end: live mode flips Stripe's
+   * `cancel_at_period_end` back to false and restores the local status.
+   */
+  async reactivate(): Promise<{ id: number; status: string } | null> {
+    const res = await apiFetch(`${this.apiUrl}/subscriptions/reactivate`, {
       method: 'POST',
-      headers: { ...this.headers(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tier })
+      headers: this.headers()
     });
-    if (!res.ok) throw new Error(`Upgrade failed (HTTP ${res.status})`);
-    const data = await res.json();
-    return data.url;
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Reactivate failed (HTTP ${res.status})`);
+    }
+    return data.subscription || null;
   }
 }

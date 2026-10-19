@@ -1,13 +1,15 @@
-import { Component } from '@angular/core';
+import { Component, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
-import { AuthService } from '../../services/auth.service';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { AuthErrorKind, AuthService, authErrorMessage } from '../../services/auth.service';
+import { sanitizeReturnUrl } from '../../guards/return-url';
 
 @Component({
   selector: 'app-login',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink],  templateUrl: './login.component.html',
+  imports: [CommonModule, FormsModule, RouterLink, TranslatePipe],  templateUrl: './login.component.html',
   // Phase 27 — zero per-component CSS. All chrome (page shell, .login-box
   // card, .peek-btn, .primary, .auth-links, fade-in keyframe, .spinner)
   // lives in src/styles.scss via legacy-name aliases. Empty styles array
@@ -15,6 +17,8 @@ import { AuthService } from '../../services/auth.service';
   styles: [] 
 })
 export class LoginComponent {
+  private readonly translate = inject(TranslateService);
+
   email = '';
   password = '';
   isLoading = false;
@@ -46,8 +50,12 @@ export class LoginComponent {
    * unknown-user branch. A kind-driven gate reads the server's
    * authoritative classification and stays correct if the server copy
    * drifts in future.
+   *
+   * The kind comes from the backend's machine-readable `code` (see
+   * `AuthErrorKind` in services/auth.service.ts) — never from the English
+   * prose.
    */
-  lastFailedKind: 'invalid_credentials' | 'unverified' | 'network' | 'server' | null = null;
+  lastFailedKind: AuthErrorKind | null = null;
 
   constructor(private authService: AuthService, private router: Router) {}
 
@@ -61,8 +69,11 @@ export class LoginComponent {
   }
 
   async onSubmit() {
-    if (!this.email || !this.password) {
-      this.error = 'Please fill in all fields';
+    // Whitespace-only input is treated as empty so a stray space can't
+    // trigger a wasted /login round-trip; the values themselves are sent
+    // untrimmed (passwords may legitimately contain spaces).
+    if (!this.email.trim() || !this.password.trim()) {
+      this.error = this.translate.instant('common.fillAll');
       this.lastFailedKind = null;
       return;
     }
@@ -77,7 +88,15 @@ export class LoginComponent {
     this.isLoading = false;
 
     if (result.ok) {
-      this.router.navigate(['/chat']);
+      // 2-7: honour the target authGuard captured before the sign-in detour.
+      // sanitizeReturnUrl() only accepts same-app paths, so a crafted
+      // ?returnUrl cannot send the freshly-authenticated user off-site.
+      const returnUrl = this.postLoginReturnUrl();
+      if (returnUrl) {
+        await this.router.navigateByUrl(returnUrl);
+      } else {
+        await this.router.navigate(['/chat']);
+      }
       return;
     }
 
@@ -86,11 +105,28 @@ export class LoginComponent {
     // click the link in their inbox to activate the account they created.
     // `lastFailedKind` is set in lockstep with `this.error` so the
     // template can branch on kind without string-matching server copy.
-    this.error = result.error;
+    //
+    // The message is the TRANSLATED copy picked by the backend's
+    // machine-readable `code`; the raw English server prose is never
+    // shown to the user.
+    this.error = authErrorMessage(this.translate, result);
     this.lastFailedKind = result.kind;
     if (result.kind === 'unverified') {
       this.showResend = true;
     }
+  }
+
+  /**
+   * Validated `?returnUrl=` target for the current /login URL, or null when
+   * absent/invalid. Exposed as a method so the spec can drive the
+   * navigation branches without rebuilding the router state.
+   */
+  postLoginReturnUrl(): string | null {
+    // Read from the live router URL rather than a cached snapshot: the
+    // login page may be re-entered with different query params (e.g. the
+    // guestGuard bounce) without recreating the component.
+    const raw = this.router.parseUrl(this.router.url).queryParams['returnUrl'];
+    return sanitizeReturnUrl(typeof raw === 'string' ? raw : null);
   }
 
   async onResend() {
@@ -99,10 +135,13 @@ export class LoginComponent {
     const result = await this.authService.resendVerification(this.email);
     this.resendIsLoading = false;
     if (result.ok) {
-      this.resendMessage =
-        'If that email is registered and unverified, a new link has been sent. Check your inbox (and spam folder).';
+      // Anti-enumeration: the server answers identically for known and
+      // unknown addresses, so the generic copy is the only safe message.
+      this.resendMessage = this.translate.instant('auth.login.resendMessage');
     } else {
-      this.resendMessage = result.error;
+      // A failure here is NOT email-specific (network error / 5xx), so the
+      // translated failure copy is shown — never the raw English prose.
+      this.resendMessage = authErrorMessage(this.translate, result);
     }
   }
 }

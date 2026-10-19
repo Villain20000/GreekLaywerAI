@@ -1,19 +1,22 @@
-import { Component, OnInit } from '@angular/core';
+import { Component, OnInit, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
-import { AuthService } from '../../services/auth.service';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { AuthService, authErrorMessage } from '../../services/auth.service';
 import { MIN_PASSWORD_LENGTH } from '../../shared/auth.constants';
 
 @Component({
   selector: 'app-reset-password',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink],  templateUrl: './reset-password.component.html',
+  imports: [CommonModule, FormsModule, RouterLink, TranslatePipe],  templateUrl: './reset-password.component.html',
   // Phase 27 — zero per-component CSS. All chrome lives in
   // src/styles.scss via legacy-name aliases; templates untouched.
   styles: [] 
 })
 export class ResetPasswordComponent implements OnInit {
+  private readonly translate = inject(TranslateService);
+
   // Token from the URL: ?token=<64-hex-chars>
   token: string | null = null;
 
@@ -44,20 +47,21 @@ export class ResetPasswordComponent implements OnInit {
     this.success = false;
 
     if (!this.newPassword || !this.confirmPassword) {
-      this.error = 'Please fill in all fields';
+      this.error = this.translate.instant('common.fillAll');
       return;
     }
     if (this.newPassword.length < this.minPasswordLength) {
-      this.error =
-        'Password must be at least ' + this.minPasswordLength + ' characters';
+      this.error = this.translate.instant('common.passwordMin', {
+        min: this.minPasswordLength
+      });
       return;
     }
     if (this.newPassword !== this.confirmPassword) {
-      this.error = 'Passwords do not match';
+      this.error = this.translate.instant('common.passwordsMismatch');
       return;
     }
     if (!this.token) {
-      this.error = 'Missing reset token';
+      this.error = this.translate.instant('auth.reset.missingTokenError');
       return;
     }
 
@@ -79,8 +83,10 @@ export class ResetPasswordComponent implements OnInit {
       // user are in localStorage and BehaviorSubjects). Navigate to /chat.
       setTimeout(() => this.router.navigate(['/chat']), 600);
     } else {
-      // Server message ("Invalid or expired reset link") is safe to show.
-      this.error = result.error;
+      // The backend's `code` picks the translated copy (e.g.
+      // `invalid_token` → auth.errors.invalidToken); the raw English
+      // server prose is never shown to the user.
+      this.error = authErrorMessage(this.translate, result);
     }
   }
 }

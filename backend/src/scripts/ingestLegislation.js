@@ -2,27 +2,52 @@
  * ingestLegislation.js
  *
  * Phase: 26 — Wires the Greek-law-scraping pipeline into the RAG layer.
+ * Phase: 1-8 — `SCRAPED_LAWS_PATH` override + race-free `ON CONFLICT` dedupe.
  *
  * Before this change:
  *   - `generateEmbedding()` returned Math.random() vectors, so every
  *     pgvector query returned irrelevant hits. The LLM had no real
  *     legal context to draw on.
  *   - `scraped_laws.json` (output of `prototype_scraper.py`) was ignored.
+ *   - `SCRAPED_LAWS_PATH` was documented but never read — an operator
+ *     pointing the script at a mounted file silently got the mocks.
  *
  * After this change:
- *   - Embeddings come from a real Ollama embed model (e.g. `nomic-embed-text`,
- *     768-dim) and throw a descriptive error if the model isn't pulled.
- *   - This script reads `<repo-root>/scraped_laws.json` (when present),
- *     normalizes each law into the `legislation_embeddings` schema, and
- *     merges with three small fallback mock articles so a brand-new env
- *     without scraped data still has something to retrieve.
- *   - Re-runs are idempotent at the row layer: a SELECT-then-INSERT
- *     pattern skips rows whose (source_type, article_number) match so
- *     re-running the script never duplicates or ever-bumps embeddings.
+ *   - Embeddings come from a real Ollama embed model (e.g. `bge-m3`,
+ *     1024-dim) and throw a descriptive error if the model isn't pulled.
+ *   - This script reads `scraped_laws.json` from `SCRAPED_LAWS_PATH`
+ *     when set, else `<repo-root>/scraped_laws.json` (the scraper's
+ *     default output), and merges it with three small fallback mock
+ *     articles so a brand-new env without scraped data still has
+ *     something to retrieve.
+ *   - Re-runs are idempotent at the DB layer: a single race-free
+ *     `INSERT ... ON CONFLICT (source_type, article_number) DO NOTHING`
+ *     against the partial unique index created by
+ *     `migrate-legislation-unique-index.js`. If a row already exists
+ *     (same source_type + article_number) the fresh row is discarded by
+ *     Postgres and reported as `skipped`; concurrent ingest runs can no
+ *     longer insert duplicates.
+ *     Choice of DO NOTHING over DO UPDATE: the documented contract is
+ *     that re-runs of an unchanged corpus never rewrite (bump) existing
+ *     embeddings — e.g. after an unrelated partial batch fails — and the
+ *     vector rows stay stable for operators comparing similarity scores.
+ *     Trade-off: the embed model is still called for every row (the DB
+ *     resolves the race, so no pre-embed SELECT exists); re-scraping
+ *     CHANGED text for an existing article therefore does not refresh it
+ *     — delete that row (or TRUNCATE) and re-run to re-ingest it.
+ *   - If `SCRAPED_LAWS_PATH` is set but points at a missing file, the
+ *     script fails loudly instead of silently falling back to mocks
+ *     (a broken mount should be visible in the operator's terminal).
+ *
+ * Requires `npm run migrate` (or the packaged container startup) to
+ * have created the partial unique index before rows are upserted.
  *
  * Usage:
  *   docker exec -it greeklaywerai-backend-1 \
  *     node src/scripts/ingestLegislation.js
+ *   # Point at a mounted file:
+ *   docker exec -it -e SCRAPED_LAWS_PATH=/data/scraped_laws.json \
+ *     greeklaywerai-backend-1 node src/scripts/ingestLegislation.js
  *   # After running `prototype_scraper.py` to refresh scraped_laws.json at
  *   # the repo root, re-run this script to ingest the new laws.
  */
@@ -56,17 +81,67 @@ const mockLegislation = [
 ];
 
 // Default scraper-output location is `<repo-root>/scraped_laws.json`,
-// two directories up from this script. Override via SCRAPED_LAWS_PATH
-// for a non-standard schema mount.
+// three directories up from this script. Override via SCRAPED_LAWS_PATH
+// for a non-standard schema mount (e.g. a docker bind mount).
 const DEFAULT_SCRAPED_LAWS_PATH = path.resolve(
   __dirname, '..', '..', '..', 'scraped_laws.json'
 );
 
 /**
+ * Resolve which `scraped_laws.json` the ingest should read.
+ *
+ * Precedence (matches the README's "override via SCRAPED_LAWS_PATH"):
+ *   1. `process.env.SCRAPED_LAWS_PATH` when set + non-blank (resolved to
+ *      an absolute path so relative overrides behave predictably).
+ *   2. `DEFAULT_SCRAPED_LAWS_PATH` (`<repo-root>/scraped_laws.json`).
+ *
+ * Read at CALL time (not module load) so a late `-e` / test env is honored.
+ *
+ * @returns {{ path: string, fromEnv: boolean }}
+ */
+function resolveScrapedLawsPath() {
+  const override = (process.env.SCRAPED_LAWS_PATH || '').trim();
+  if (override !== '') {
+    return { path: path.resolve(override), fromEnv: true };
+  }
+  return { path: DEFAULT_SCRAPED_LAWS_PATH, fromEnv: false };
+}
+
+/**
+ * Race-free idempotent upsert for one normalized row.
+ *
+ * The conflict target MUST repeat the partial index predicate
+ * (`WHERE source_type IS NOT NULL AND article_number IS NOT NULL`),
+ * otherwise Postgres cannot infer the partial unique index created by
+ * `migrate-legislation-unique-index.js` and errors with
+ * "no unique or exclusion constraint matching the ON CONFLICT
+ * specification".
+ *
+ * DO NOTHING (see header): a re-run never duplicates or rewrites rows;
+ * `rowCount === 0` is how the caller detects the skip.
+ */
+const INSERT_LEGISLATION_SQL = `
+  INSERT INTO legislation_embeddings
+      (source_type, article_number, title, content, embedding)
+   VALUES ($1, $2, $3, $4, $5::vector)
+   ON CONFLICT (source_type, article_number)
+     WHERE source_type IS NOT NULL AND article_number IS NOT NULL
+   DO NOTHING
+`;
+
+/**
  * Read `scraped_laws.json` from disk and normalize each entry into the
  * unified `{ source_type, article_number, title, content }` shape used by
- * `legislation_embeddings`. Returns an empty array on any failure so
- * the caller falls through to the mock articles instead of crashing.
+ * `legislation_embeddings`.
+ *
+ * Failure semantics:
+ *   - Explicit `scrapedPath` argument or an env-var override that points
+ *     at a missing file → THROW with a clear message. The operator asked
+ *     for a specific file; silently ingesting the mock corpus would hide
+ *     a broken scrape/mount (Phase 1-8 bug).
+ *   - Default path missing / unreadable / malformed → log and return []
+ *     so the caller falls through to the mock articles instead of
+ *     crashing a brand-new env.
  *
  * Schema mapping (scraper → DB row):
  *   source        → source_type   (e.g. 'ΦΕΚ' / 'Hellenic Parliament')
@@ -77,20 +152,34 @@ const DEFAULT_SCRAPED_LAWS_PATH = path.resolve(
  * Drops rows with missing critical fields rather than inserting NULL
  * titles that confuse the LLM.
  */
-function loadScrapedLaws(scrapedPath = DEFAULT_SCRAPED_LAWS_PATH) {
-  if (!fs.existsSync(scrapedPath)) {
+function loadScrapedLaws(scrapedPath) {
+  const resolved = scrapedPath
+    ? { path: scrapedPath, fromEnv: false }
+    : resolveScrapedLawsPath();
+  const filePath = resolved.path;
+
+  if (!fs.existsSync(filePath)) {
+    if (resolved.fromEnv) {
+      // Clear, actionable failure: the operator explicitly pointed at a
+      // file (env var); falling back to mocks would mask the bad path.
+      throw new Error(
+        `[ingest] SCRAPED_LAWS_PATH points to ${filePath}, but no such file exists. ` +
+        `Fix the path/mount, or unset SCRAPED_LAWS_PATH to use the default ` +
+        `${DEFAULT_SCRAPED_LAWS_PATH} (or the 3 mock articles).`
+      );
+    }
     console.log(
-      `[ingest] No scraped_laws.json found at ${scrapedPath}. ` +
+      `[ingest] No scraped_laws.json found at ${filePath}. ` +
       `Falling back to the 3 mock articles.`
     );
     return [];
   }
   try {
-    const raw = fs.readFileSync(scrapedPath, 'utf8');
+    const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) {
       console.warn(
-        `[ingest] ${scrapedPath} is not a JSON array — ignoring and using mocks.`
+        `[ingest] ${filePath} is not a JSON array — ignoring and using mocks.`
       );
       return [];
     }
@@ -106,37 +195,16 @@ function loadScrapedLaws(scrapedPath = DEFAULT_SCRAPED_LAWS_PATH) {
         content: law.full_text
       }));
     console.log(
-      `[ingest] Loaded ${normalized.length} scraped law(s) from ${scrapedPath}.`
+      `[ingest] Loaded ${normalized.length} scraped law(s) from ${filePath}.`
     );
     return normalized;
   } catch (err) {
     console.warn(
-      `[ingest] Failed to read/parse ${scrapedPath}: ${err.message}. ` +
+      `[ingest] Failed to read/parse ${filePath}: ${err.message}. ` +
       `Falling back to the 3 mock articles.`
     );
     return [];
   }
-}
-
-/**
- * SELECT-then-INSERT dedup check. Returns true iff a row with the same
- * (source_type, article_number) already exists; the caller skips the
- * INSERT to keep the run idempotent.
- *
- * App-level check rather than a DB unique constraint so this script
- * works on a freshly-initialised DB (no migration needed) and on an
- * existing DB (constraint not added). Trade-off: a race between two
- * concurrent ingest runs could insert a duplicate; in practice this
- * script is operator-console access, not production cron, and a
- * second pass would simply overwrite via the same hash anyway.
- */
-async function alreadyExists(sourceType, articleNumber) {
-  const result = await db.query(
-    `SELECT 1 FROM legislation_embeddings
-     WHERE source_type = $1 AND article_number = $2 LIMIT 1`,
-    [sourceType, articleNumber]
-  );
-  return result.rowCount > 0;
 }
 
 /**
@@ -152,7 +220,8 @@ async function ingest() {
   console.log('Starting legislation ingestion...');
 
   // 1. Merge: scraped laws first (operator's preferred source), then
-  //    fallback mocks. dedup at the per-row layer.
+  //    fallback mocks. Dedupe happens in Postgres (ON CONFLICT below),
+  //    so this is race-free even if two ingests overlap.
   const scraped = loadScrapedLaws();
   const corpus = [...scraped, ...mockLegislation];
 
@@ -162,15 +231,6 @@ async function ingest() {
 
   for (const item of corpus) {
     try {
-      // Idempotency: skip rows whose (source + article) already exist.
-      if (await alreadyExists(item.source_type, item.article_number)) {
-        console.log(
-          `[ingest] Skip ${item.source_type} Άρθρο ${item.article_number} (already ingested).`
-        );
-        skipped++;
-        continue;
-      }
-
       console.log(
         `[ingest] Vectorizing ${item.source_type} Άρθρο ${item.article_number}...`
       );
@@ -181,22 +241,26 @@ async function ingest() {
       const embedding = await generateEmbedding(textToEmbed);
       const embeddingStr = `[${embedding.join(',')}]`;
 
-      await db.query(
-        `INSERT INTO legislation_embeddings
-            (source_type, article_number, title, content, embedding)
-         VALUES ($1, $2, $3, $4, $5::vector)`,
-        [
-          item.source_type,
-          item.article_number,
-          item.title,
-          item.content,
-          embeddingStr
-        ]
-      );
-      console.log(
-        `[ingest] Ingested ${item.source_type} Άρθρο ${item.article_number}.`
-      );
-      inserted++;
+      const result = await db.query(INSERT_LEGISLATION_SQL, [
+        item.source_type,
+        item.article_number,
+        item.title,
+        item.content,
+        embeddingStr
+      ]);
+
+      if (result.rowCount > 0) {
+        console.log(
+          `[ingest] Ingested ${item.source_type} Άρθρο ${item.article_number}.`
+        );
+        inserted++;
+      } else {
+        // ON CONFLICT DO NOTHING discarded the row: already present.
+        console.log(
+          `[ingest] Skip ${item.source_type} Άρθρο ${item.article_number} (already ingested).`
+        );
+        skipped++;
+      }
     } catch (error) {
       failed++;
       console.error(
@@ -221,6 +285,8 @@ async function ingest() {
   if (failed > 0) {
     process.exitCode = 1;
   }
+
+  return { inserted, skipped, failed, total: corpus.length };
 }
 
 if (require.main === module) {
@@ -233,4 +299,11 @@ if (require.main === module) {
   );
 }
 
-module.exports = { ingest, loadScrapedLaws, alreadyExists };
+module.exports = {
+  ingest,
+  loadScrapedLaws,
+  resolveScrapedLawsPath,
+  buildEmbeddingText,
+  INSERT_LEGISLATION_SQL,
+  DEFAULT_SCRAPED_LAWS_PATH
+};

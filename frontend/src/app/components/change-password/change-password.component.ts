@@ -1,20 +1,23 @@
-import { Component } from '@angular/core';
+import { Component, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
-import { AuthService } from '../../services/auth.service';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { AuthService, authErrorMessage } from '../../services/auth.service';
 import { MIN_PASSWORD_LENGTH } from '../../shared/auth.constants';
 
 @Component({
   selector: 'app-change-password',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink],  templateUrl: './change-password.component.html',
+  imports: [CommonModule, FormsModule, RouterLink, TranslatePipe],  templateUrl: './change-password.component.html',
   // Phase 27 — zero per-component CSS. All chrome (page shell, card,
   // inputs, peek toggles, primary button, spinner, banners, footer
   // auth-link) is composed from src/styles.scss via legacy-name aliases.
   styles: [] 
 })
 export class ChangePasswordComponent {
+  private readonly translate = inject(TranslateService);
+
   currentPassword = '';
   newPassword = '';
   confirmPassword = '';
@@ -44,7 +47,7 @@ export class ChangePasswordComponent {
     this.success = false;
 
     if (!this.currentPassword || !this.newPassword || !this.confirmPassword) {
-      this.error = 'Please fill in all fields';
+      this.error = this.translate.instant('common.fillAll');
       // Reset peek toggles so a fresh attempt starts from a known state.
       this.showCurrent = false;
       this.showNew = false;
@@ -52,15 +55,17 @@ export class ChangePasswordComponent {
       return;
     }
     if (this.newPassword.length < this.minPasswordLength) {
-      this.error = `Password must be at least ${this.minPasswordLength} characters`;
+      this.error = this.translate.instant('common.passwordMin', {
+        min: this.minPasswordLength
+      });
       return;
     }
     if (this.newPassword !== this.confirmPassword) {
-      this.error = 'New passwords do not match';
+      this.error = this.translate.instant('auth.change.mismatch');
       return;
     }
     if (this.newPassword === this.currentPassword) {
-      this.error = 'New password must be different from your current password';
+      this.error = this.translate.instant('auth.change.sameAsCurrent');
       return;
     }
 
@@ -80,7 +85,10 @@ export class ChangePasswordComponent {
       this.newPassword = '';
       this.confirmPassword = '';
     } else {
-      this.error = result.error;
+      // The backend's `code` picks the translated copy (e.g.
+      // `password_change_failed` → auth.errors.passwordChangeFailed);
+      // the raw English server prose is never shown to the user.
+      this.error = authErrorMessage(this.translate, result);
     }
   }
 }

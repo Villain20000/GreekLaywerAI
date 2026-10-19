@@ -13,6 +13,12 @@ function requireTier(minTier) {
     if (!req.user) {
       return res.status(401).json({ error: 'Access denied. No token provided.' });
     }
+    // Platform admins retain access to premium features regardless of the
+    // billing tier attached to their row (e.g. an operator promoted via
+    // PATCH /api/admin/users/:id/role while still on 'basic').
+    if (req.user.role === 'admin') {
+      return next();
+    }
     const tier = req.user.subscription_tier || 'basic';
     if (!TIER_ORDER[tier] || TIER_ORDER[tier] < TIER_ORDER[minTier]) {
       return res.status(403).json({

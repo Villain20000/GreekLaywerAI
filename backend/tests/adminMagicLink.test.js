@@ -12,6 +12,21 @@
 // link doesn't use db.connect() (transactions) and so the test file is
 // a smaller, more focused mock surface.
 
+// Pin NODE_ENV='test' BEFORE the first require of application source.
+// This suite builds its own express app (makeApp) instead of using
+// tests/app.js, so it cannot rely on that harness's pin. Without it the
+// ambient environment decides the outcome: `../src/routes/auth` pulls in
+// authMiddleware (which refuses to load when NODE_ENV=production and
+// JWT_SECRET is unset/default) and emailService (which hard-throws in
+// production without a full SMTP configuration), so the whole suite dies
+// at import time. Same idiom as the ~30 sibling suites.
+//
+// NOTE: the "production gate" describe block below still flips
+// process.env.NODE_ENV to 'production' *at request time* and restores the
+// snapshot it took in its own beforeEach — which is now 'test'. That
+// restore path is unaffected by this file-level pin.
+process.env.NODE_ENV = 'test';
+
 const express = require('express');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');

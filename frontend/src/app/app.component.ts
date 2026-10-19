@@ -9,6 +9,8 @@ import {
 } from '@angular/router';
 import { filter, map, startWith } from 'rxjs/operators';
 import { MenuComponent } from './components/menu/menu.component';
+import { ConfirmDialogComponent } from './components/confirm-dialog/confirm-dialog.component';
+import { LanguageSwitcherComponent } from './i18n/language-switcher.component';
 
 /**
  * Phase 27 — AppComponent shell.
@@ -28,15 +30,21 @@ import { MenuComponent } from './components/menu/menu.component';
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, RouterOutlet, MenuComponent],
+  imports: [CommonModule, RouterOutlet, MenuComponent, ConfirmDialogComponent, LanguageSwitcherComponent],
   template: `
     <app-menu *ngIf="(showMenu$ | async)"></app-menu>
+    <!-- 2-8: menu-less public routes still need the EL/EN toggle. -->
+    <app-language-switcher
+      *ngIf="!(showMenu$ | async)"
+      class="nl-language-float"
+    ></app-language-switcher>
     <main
       class="nl-app-main"
       [class.has-menu]="(showMenu$ | async)"
     >
       <router-outlet></router-outlet>
     </main>
+    <app-confirm-dialog></app-confirm-dialog>
   `,  // Phase 27 — zero per-component CSS. All visual surface lives in
   // src/styles.scss under .nl-app-main / .has-menu utility classes
   // (and the menu's own .nl-menu-* palette). The comment above

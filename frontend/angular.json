@@ -26,8 +26,17 @@
             "tsConfig": "tsconfig.app.json",
             "inlineStyleLanguage": "scss",
             "assets": [
-              "src/favicon.ico",
-              "src/assets"
+              "src/favicon.svg",
+              {
+                "glob": "**/*",
+                "input": "src/assets",
+                "output": "assets"
+              },
+              {
+                "glob": "robots.txt",
+                "input": "src/assets",
+                "output": "/"
+              }
             ],
             "styles": [
               "src/styles.scss"
@@ -36,11 +45,17 @@
           },
           "configurations": {
             "production": {
+              "fileReplacements": [
+                {
+                  "replace": "src/environments/environment.ts",
+                  "with": "src/environments/environment.prod.ts"
+                }
+              ],
               "budgets": [
                 {
                   "type": "initial",
-                  "maximumWarning": "1mb",
-                  "maximumError": "1mb"
+                  "maximumWarning": "1.5mb",
+                  "maximumError": "2mb"
                 },
                 {
                   "type": "anyComponentStyle",

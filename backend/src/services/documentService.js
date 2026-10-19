@@ -1,8 +1,12 @@
 // Phase 29: Legal document processing pipeline.
 //
 // Flow: validate file → extract text (PDF/DOCX/TXT) → chunk text
-// (~500 tokens, 50-token overlap) → embed each chunk (bge-m3, 1024-dim)
-// → store document metadata + chunks + embeddings.
+// (~500 tokens, 50-token overlap) → embed each chunk (bge-m3, 1024-dim,
+// bounded concurrency) → store document metadata + chunks + embeddings
+// in one transaction (1-9).
+//
+// file_url is intentionally always NULL until object storage exists; the
+// column is retained for forward compatibility (see database/init/schema.sql).
 
 const db = require('../config/db');
 const ollamaService = require('./ollamaService');
@@ -22,6 +26,11 @@ function getMammoth() {
 
 const CHUNK_SIZE_TOKENS = 500;
 const CHUNK_OVERLAP_TOKENS = 50;
+
+// 1-9: bound in-flight embedding calls so a large document does not
+// saturate the local GPU — 3 concurrent requests is the sweet spot for
+// Ollama on a single device.
+const EMBEDDING_CONCURRENCY = 3;
 
 /**
  * Rough token count (words + CJK-ish chars). Good enough for chunk sizing.
@@ -99,20 +108,37 @@ function chunkText(text, { chunkSize = CHUNK_SIZE_TOKENS, overlap = CHUNK_OVERLA
 }
 
 /**
- * Extract raw text from a Buffer by detected content type.
- * PDF → pdf-parse, DOCX → mammoth, TXT → utf8 decode.
+ * Run `fn` over `items` with at most `limit` calls in flight, preserving
+ * result order. Stops pulling new items after the first failure, waits for
+ * the in-flight calls to settle, then rejects with the first error.
+ *
+ * 1-9: used to overlap chunk embeddings (bounded pool) instead of awaiting
+ * them strictly sequentially.
  */
-async function extractText(buffer, contentType) {
-  if (contentType === 'application/pdf') {
-    const data = await getPdfParse()(buffer);
-    return data.text || '';
-  }
-  if (contentType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-    const result = await getMammoth().extractRawText({ buffer });
-    return result.value || '';
-  }
-  // text/plain and anything else: decode as UTF-8
-  return buffer.toString('utf8');
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  let firstError = null;
+
+  const worker = async () => {
+    while (firstError === null) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await fn(items[index], index);
+      } catch (err) {
+        if (firstError === null) firstError = err;
+        return;
+      }
+    }
+  };
+
+  const workers = [];
+  for (let i = 0; i < Math.min(limit, items.length); i++) workers.push(worker());
+  await Promise.all(workers);
+
+  if (firstError) throw firstError;
+  return results;
 }
 
 /**
@@ -161,6 +187,15 @@ async function extractMetadata(buffer, { contentType, filename, title }) {
  * Full ingest pipeline: extract → chunk → embed → persist.
  * Returns the created document row (without the raw parsed_text for
  * the response envelope, which can be huge).
+ *
+ * 1-9 atomicity + batching:
+ *   - All embeddings are computed BEFORE any row is written, using a
+ *     bounded pool (EMBEDDING_CONCURRENCY). A failed/partial embedding
+ *     pass therefore cannot leave an orphaned document or partial chunks.
+ *   - The document row and every chunk row are then written inside one
+ *     BEGIN/COMMIT transaction on a single pooled connection, with
+ *     ROLLBACK on any failure so the write side is all-or-nothing too.
+ *   - Chunk rows are inserted in text order via their `chunk_index`.
  */
 async function processAndStoreDocument(userId, file, detectedType, title) {
   const normalizedTitle = typeof title === 'string' && title.trim()
@@ -174,26 +209,49 @@ async function processAndStoreDocument(userId, file, detectedType, title) {
 
   const chunks = chunkText(text);
 
-  const docResult = await db.query(
-    `INSERT INTO legal_documents
-       (user_id, filename, title, file_url, content_type, parsed_text, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING id, user_id, filename, title, content_type, metadata, created_at`,
-    [userId, file.originalname, normalizedTitle, null, detectedType, text || null, JSON.stringify(meta)]
+  // Bounded-concurrency embedding pass (local GPU: max 3 in flight).
+  const embeddings = await mapWithConcurrency(chunks, EMBEDDING_CONCURRENCY, (chunk) =>
+    ollamaService.generateEmbedding(chunk)
   );
-  const document = docResult.rows[0];
 
-  // Embed each chunk sequentially (local GPU: one embedding call at a time).
-  for (let i = 0; i < chunks.length; i++) {
-    const embedding = await ollamaService.generateEmbedding(chunks[i]);
-    const embeddingStr = `[${embedding.join(',')}]`;
-    await db.query(
-      `INSERT INTO legal_document_chunks (document_id, content, embedding, chunk_index)
-       VALUES ($1, $2, $3::vector, $4)`,
-      [document.id, chunks[i], embeddingStr, i]
+  // file_url stays NULL — see the header note (no storage backend yet).
+  const client = await db.connect();
+  let document;
+  try {
+    await client.query('BEGIN');
+
+    const docResult = await client.query(
+      `INSERT INTO legal_documents
+         (user_id, filename, title, file_url, content_type, parsed_text, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, user_id, filename, title, content_type, metadata, created_at`,
+      [userId, file.originalname, normalizedTitle, null, detectedType, text || null, JSON.stringify(meta)]
     );
+    document = docResult.rows[0];
+
+    for (let i = 0; i < chunks.length; i++) {
+      const embeddingStr = `[${embeddings[i].join(',')}]`;
+      await client.query(
+        `INSERT INTO legal_document_chunks (document_id, content, embedding, chunk_index)
+         VALUES ($1, $2, $3::vector, $4)`,
+        [document.id, chunks[i], embeddingStr, i]
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {
+      // ROLLBACK is best-effort; the original error is what matters.
+    }
+    throw err;
+  } finally {
+    client.release();
   }
 
+  // Audit after COMMIT (fail-open, so it never fails the upload) so the
+  // transaction stays as short as possible.
   await logAudit({
     userId,
     action: 'document.uploaded',
@@ -236,10 +294,7 @@ async function searchUserDocuments(query, userId, limit = 5, documentIds = null)
 
 module.exports = {
   chunkText,
-  extractText,
   extractMetadata,
   processAndStoreDocument,
-  searchUserDocuments,
-  CHUNK_SIZE_TOKENS,
-  CHUNK_OVERLAP_TOKENS
+  searchUserDocuments
 };

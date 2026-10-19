@@ -9,6 +9,16 @@
 // are reset in beforeEach via `db.query.mockReset()`, `db.connect.mockReset()`,
 // and `emailService.sendPasswordReset.mockReset()`.
 
+// Pin NODE_ENV='test' BEFORE the first require of application source.
+// This suite builds its own express app (makeApp) instead of using
+// tests/app.js, so it cannot rely on that harness's pin. Without it the
+// ambient environment decides the outcome: `../src/routes/auth` pulls in
+// authMiddleware (which refuses to load when NODE_ENV=production and
+// JWT_SECRET is unset/default) and emailService (which hard-throws in
+// production without a full SMTP configuration), so the whole suite dies
+// at import time. Same idiom as the ~30 sibling suites.
+process.env.NODE_ENV = 'test';
+
 const express = require('express');
 const request = require('supertest');
 const bcrypt = require('bcryptjs');
@@ -16,6 +26,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const db = require('../src/config/db');
 const { buildAuthRouter } = require('../src/routes/auth');
+const { AUTH_ERROR_CODES } = require('../src/constants/authErrors');
 const { createRateLimiters } = require('../src/middlewares/rateLimiters');
 const emailService = require('../src/services/emailService');
 
@@ -106,7 +117,10 @@ describe('Phase 23: forgot-password & reset-password', () => {
         .send({ email: 'noone@nomos.ai' });
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
       // No INSERT fired (no token row) because user not found.
       expect(db.query).toHaveBeenCalledTimes(1);
       // sendPasswordReset was NOT called for unknown email.
@@ -126,7 +140,10 @@ describe('Phase 23: forgot-password & reset-password', () => {
         .send({ email: 'real@nomos.ai' });
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
 
       // Exactly two SQL queries: lookup + insert.
       expect(db.query).toHaveBeenCalledTimes(2);
@@ -162,7 +179,10 @@ describe('Phase 23: forgot-password & reset-password', () => {
         .send({});
 
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
       // No DB queries (malformed short-circuits before SELECT).
       expect(db.query).not.toHaveBeenCalled();
     });
@@ -181,8 +201,40 @@ describe('Phase 23: forgot-password & reset-password', () => {
       // — so the route takes the early-200 branch above, not even the SELECT.
       // The test confirms defensiveness: shape matches the happy path.
       expect(res.statusCode).toEqual(200);
-      expect(res.body).toEqual({ ok: true });
+      expect(res.body).toEqual({
+        ok: true,
+        code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+      });
       expect(emailService.sendPasswordReset).not.toHaveBeenCalled();
+    });
+
+    it('returns a byte-identical body AND code for known vs unknown emails (anti-enumeration)', async () => {
+      // The whole point of /forgot-password is that an attacker cannot tell
+      // an existing address from a non-existent one. Adding the machine-
+      // readable `code` must NOT re-open that hole: the known-address
+      // response and the unknown-address response have to be the exact same
+      // body, `code` included.
+      const app = makeApp();
+
+      // Known address → SELECT finds a user, INSERT mints a token row.
+      db.query.mockResolvedValueOnce({ rows: [{ id: 7 }] });
+      db.query.mockResolvedValueOnce({ rows: [] });
+      const known = await request(app)
+        .post('/api/auth/forgot-password')
+        .send({ email: 'real@nomos.ai' });
+
+      // Unknown address → SELECT finds nothing.
+      db.query.mockResolvedValueOnce({ rows: [] });
+      const unknown = await request(app)
+        .post('/api/auth/forgot-password')
+        .send({ email: 'noone@nomos.ai' });
+
+      expect(known.statusCode).toEqual(unknown.statusCode);
+      expect(known.body).toEqual(unknown.body);
+      // And the shared code is the generic one — not a per-outcome code.
+      expect(known.body.code).toBe('request_accepted');
+      expect(unknown.body.code).toBe('request_accepted');
+      expect(known.body.code).toBe(AUTH_ERROR_CODES.REQUEST_ACCEPTED);
     });
   });
 
@@ -251,6 +303,7 @@ describe('Phase 23: forgot-password & reset-password', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired reset link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
     });
 
     it('returns 400 when the consume compare-and-set finds no unused row (concurrent reset)', async () => {
@@ -267,6 +320,7 @@ describe('Phase 23: forgot-password & reset-password', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired reset link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
     });
 
     it('returns 400 with the same generic message for a non-hex token (no signal leakage)', async () => {
@@ -278,6 +332,7 @@ describe('Phase 23: forgot-password & reset-password', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired reset link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
       // Token-shape check short-circuits before db.connect even fires.
       expect(db.connect).not.toHaveBeenCalled();
     });
@@ -291,6 +346,7 @@ describe('Phase 23: forgot-password & reset-password', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired reset link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
       expect(db.connect).not.toHaveBeenCalled();
     });
 
@@ -345,6 +401,7 @@ describe('Phase 23: forgot-password & reset-password', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBe('Invalid or expired reset link');
+      expect(res.body.code).toBe(AUTH_ERROR_CODES.INVALID_TOKEN);
     });
   });
 });

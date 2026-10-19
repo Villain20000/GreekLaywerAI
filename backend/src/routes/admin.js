@@ -8,21 +8,49 @@ const { logAudit, getAuditLogs } = require('../services/auditLog');
 router.use(authMiddleware);
 router.use(rbacMiddleware(['admin']));
 
-function parseUserId(rawId) {
+// Shared positive-integer validation for every `:id` route param. The two
+// aliases below keep call sites self-documenting (user id vs document id)
+// while sharing one implementation.
+function parsePositiveId(rawId) {
   const parsed = parseInt(rawId, 10);
   if (!Number.isInteger(parsed) || parsed <= 0) return null;
   return parsed;
 }
 
-// GET /api/admin/users — list every user (without password)
+const parseUserId = parsePositiveId;
+const parseDocumentId = parsePositiveId;
+
+// GET /api/admin/users — list every user (without password).
+//
+// 2-4: optional search + pagination, backward compatible with the previous
+// `{ users }`-only response. `q` matches the email case-insensitively;
+// `limit`/`offset` are clamped to sane bounds. `total`, `limit`, and
+// `offset` are additive so the UI can render a pager.
 router.get('/users', async (req, res) => {
   try {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), 200);
+    const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
+
+    // Search is parameterized (ILIKE) — never interpolate user input.
+    const filterParams = q ? [`%${q}%`] : [];
+    const where = q ? 'WHERE email ILIKE $1' : '';
+
     const result = await db.query(
       `SELECT id, email, role, subscription_tier, created_at
        FROM users
-       ORDER BY created_at DESC`
+       ${where}
+       ORDER BY created_at DESC, id DESC
+       LIMIT $${filterParams.length + 1} OFFSET $${filterParams.length + 2}`,
+      [...filterParams, limit, offset]
     );
-    res.json({ users: result.rows });
+    const countResult = await db.query(
+      `SELECT COUNT(*)::int AS total FROM users ${where}`,
+      filterParams
+    );
+    const total = Number(countResult.rows[0] && countResult.rows[0].total) || 0;
+
+    res.json({ users: result.rows, total, limit, offset });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -126,18 +154,44 @@ router.patch('/users/:id/tier', async (req, res) => {
   }
 });
 
-// GET /api/admin/audit-log — paginated audit trail (admin only)
+// GET /api/admin/audit-log — paginated audit trail (admin only).
+// Supports `userId` + `action` filters and `limit`/`offset` pagination. The
+// `total` field is additive (the `{ auditLog }` shape is unchanged) so the
+// admin viewer can render page counts without guessing.
 router.get('/audit-log', async (req, res) => {
   try {
     const limit = Math.min(Number.parseInt(req.query.limit, 10) || 50, 200);
     const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
-    const rows = await getAuditLogs({
-      userId: req.query.userId ? Number.parseInt(req.query.userId, 10) : undefined,
-      action: req.query.action || undefined,
+    const parsedUserId = Number.parseInt(req.query.userId, 10);
+    const userId = Number.isInteger(parsedUserId) && parsedUserId > 0 ? parsedUserId : undefined;
+    const action = typeof req.query.action === 'string' && req.query.action.trim()
+      ? req.query.action.trim()
+      : undefined;
+
+    const clauses = [];
+    const filterParams = [];
+    if (userId) {
+      filterParams.push(userId);
+      clauses.push(`user_id = $${filterParams.length}`);
+    }
+    if (action) {
+      filterParams.push(action);
+      clauses.push(`action = $${filterParams.length}`);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const countResult = await db.query(
+      `SELECT COUNT(*)::int AS total FROM audit_log ${where}`,
+      filterParams
+    );
+    const rows = await getAuditLogs({ userId, action, limit, offset });
+
+    res.json({
+      auditLog: rows,
+      total: Number(countResult.rows[0] && countResult.rows[0].total) || 0,
       limit,
       offset
     });
-    res.json({ auditLog: rows });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -200,13 +254,13 @@ router.get('/documents', async (req, res) => {
 // DELETE /api/admin/documents/:id — delete any user's document (admin only)
 router.delete('/documents/:id', async (req, res) => {
   try {
-    const userId = parseUserId(req.params.id);
-    if (userId === null) {
+    const documentId = parseDocumentId(req.params.id);
+    if (documentId === null) {
       return res.status(400).json({ error: 'Invalid document id' });
     }
     const result = await db.query(
       `DELETE FROM legal_documents WHERE id = $1 RETURNING id, user_id, filename`,
-      [userId]
+      [documentId]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Document not found' });
@@ -215,11 +269,11 @@ router.delete('/documents/:id', async (req, res) => {
       userId: result.rows[0].user_id,
       action: 'document.deleted_by_admin',
       resourceType: 'document',
-      resourceId: userId,
+      resourceId: documentId,
       newValue: { filename: result.rows[0].filename },
       ipAddress: req.ip
     });
-    res.json({ ok: true, deletedId: userId });
+    res.json({ ok: true, deletedId: documentId });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

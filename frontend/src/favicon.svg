@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="NomosAI">
+  <rect width="64" height="64" rx="14" fill="#0a0a0a"/>
+  <!-- Scales of justice: stem, beam, base -->
+  <g fill="none" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round">
+    <path d="M32 12v40"/>
+    <path d="M22 52h20"/>
+    <path d="M14 19h36"/>
+  </g>
+  <!-- Pans -->
+  <g fill="#ffffff">
+    <circle cx="32" cy="12" r="2.5"/>
+    <path d="M6 30q8 12 16 0z"/>
+    <path d="M42 30q8 12 16 0z"/>
+  </g>
+  <!-- Suspension lines -->
+  <g fill="none" stroke="#ffffff" stroke-width="2.25" stroke-linecap="round">
+    <path d="M14 19v11"/>
+    <path d="M50 19v11"/>
+  </g>
+</svg>

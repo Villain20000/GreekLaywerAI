@@ -4,3 +4,7 @@ out-tsc/
 .angular/
 .env
 .DS_Store
+
+# Command Code session-local permission grants (machine-specific paths).
+# The durable project preferences under .commandcode/taste/ ARE tracked.
+.commandcode/settings.json

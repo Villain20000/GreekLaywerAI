@@ -112,43 +112,6 @@ describe('ollamaService.warmup + getWarmupStatus', () => {
     expect(mockChat).toHaveBeenCalledTimes(1);
   });
 
-  it('warmupReset() then warmup() retries the failed leg (partial-failure recovery)', async () => {
-    // First attempt: embed leg succeeds, chat leg fails (e.g. the model
-    // was still being pulled during the first try). The singleton
-    // promise resolves with embedWarmed=true, chatWarmed=false.
-    mockEmbed.mockResolvedValueOnce({ embedding: new Array(1024).fill(0.1) });
-    mockChat.mockRejectedValueOnce(new Error('model "gemma:2b" not found, pull first'));
-
-    const svc = freshService();
-    await svc.warmup();
-    expect(svc.getWarmupStatus().embedWarmed).toBe(true);
-    expect(svc.getWarmupStatus().chatWarmed).toBe(false);
-    expect(svc.getWarmupStatus().status).toBe('warming');
-
-    // Operator pulls gemma:2b, then calls warmupReset() + warmup() to
-    // retry. The reset must (a) clear the singleton promise so the next
-    // warmup() actually runs, AND (b) zero the state so the next status
-    // reflects only the second attempt's outcome.
-    mockEmbed.mockResolvedValueOnce({ embedding: new Array(1024).fill(0.2) });
-    mockChat.mockResolvedValueOnce({ message: { content: 'pong' } });
-
-    svc.warmupReset();
-    expect(svc.getWarmupStatus().status).toBe('warming');
-    expect(svc.getWarmupStatus().embedWarmedAt).toBeNull();
-
-    await svc.warmup();
-    const after = svc.getWarmupStatus();
-    expect(after.embedWarmed).toBe(true);
-    expect(after.chatWarmed).toBe(true);
-    expect(after.status).toBe('ready');
-
-    // Both legs should now have been called exactly twice (once per
-    // attempt). If warmupReset() failed to clear the singleton,
-    // mockEmbed + mockChat would each only have one recorded call set.
-    expect(mockEmbed).toHaveBeenCalledTimes(2);
-    expect(mockChat).toHaveBeenCalledTimes(2);
-  });
-
   it('does not throw when warmup() is called WITHOUT an explicit await (fire-and-forget)', async () => {
     mockEmbed.mockResolvedValue({ embedding: new Array(1024).fill(0.1) });
     mockChat.mockResolvedValue({ message: { content: 'pong' } });

@@ -5,24 +5,24 @@
       <span class="brand-text">NomosAI</span>
     </div>
 
-    <h2>Create Account</h2>
-    <p>Join the elite Greek AI lawyer workspace</p>
+    <h2>{{ 'auth.register.title' | translate }}</h2>
+    <p>{{ 'auth.register.subtitle' | translate }}</p>
 
     <div class="form-group">
-      <label for="register-email">Email</label>
+      <label for="register-email">{{ 'common.email' | translate }}</label>
       <input
         id="register-email"
         type="email"
         [(ngModel)]="email"
         name="email"
         autocomplete="email"
-        placeholder="you@example.com"
+        [attr.placeholder]="'auth.register.emailPlaceholder' | translate"
         (keyup.enter)="onSubmit()"
       />
     </div>
 
     <div class="form-group">
-      <label for="register-password">Password</label>
+      <label for="register-password">{{ 'common.password' | translate }}</label>
       <div class="password-row">
         <input
           id="register-password"
@@ -30,14 +30,14 @@
           [(ngModel)]="password"
           name="password"
           autocomplete="new-password"
-          placeholder="At least 8 characters"
+          [attr.placeholder]="'auth.register.passwordPlaceholder' | translate"
           (keyup.enter)="onSubmit()"
         />
         <button
           type="button"
           class="peek-btn"
           (click)="togglePasswordVisibility()"
-          [attr.aria-label]="showPassword ? 'Hide password' : 'Show password'"
+          [attr.aria-label]="showPassword ? ('common.hidePassword' | translate) : ('common.showPassword' | translate)"
           [attr.aria-pressed]="showPassword"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -51,7 +51,7 @@
     </div>
 
     <div class="form-group">
-      <label for="register-confirm-password">Confirm Password</label>
+      <label for="register-confirm-password">{{ 'common.confirmPassword' | translate }}</label>
       <div class="password-row">
         <input
           id="register-confirm-password"
@@ -59,13 +59,13 @@
           [(ngModel)]="confirmPassword"
           name="confirmPassword"
           autocomplete="new-password"
-          placeholder="Repeat your password"
+          [attr.placeholder]="'auth.register.confirmPlaceholder' | translate"
         />
         <button
           type="button"
           class="peek-btn"
           (click)="toggleConfirmPasswordVisibility()"
-          [attr.aria-label]="showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'"
+          [attr.aria-label]="showConfirmPassword ? ('common.hideConfirmPassword' | translate) : ('common.showConfirmPassword' | translate)"
           [attr.aria-pressed]="showConfirmPassword"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -86,19 +86,19 @@
     </div>
 
     <button class="primary" (click)="onSubmit()" [disabled]="isLoading">
-      <span *ngIf="!isLoading">Create account</span>
+      <span *ngIf="!isLoading">{{ 'auth.register.createAccount' | translate }}</span>
       <span *ngIf="isLoading">
         <span class="spinner" aria-hidden="true"></span>
-        Creating account…
+        {{ 'auth.register.creating' | translate }}
       </span>
     </button>
 
-    <div class="auth-links" role="navigation" aria-label="Authentication options">
-      <a routerLink="/login" class="auth-link">
+    <div class="auth-links" role="navigation" [attr.aria-label]="'auth.authOptions' | translate">
+      <a routerLink="/login" queryParamsHandling="preserve" class="auth-link">
         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" class="auth-link-icon">
           <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V8h16v10zm-9-3h-2v2H7v-2H5v-2h2v-2h2v2h2v2z" />
         </svg>
-        <span>Already have an account? Sign in</span>
+        <span>{{ 'auth.register.haveAccount' | translate }}</span>
       </a>
     </div>
   </div>
@@ -109,16 +109,16 @@
       <span class="brand-text">NomosAI</span>
     </div>
 
-    <h2>Check your email</h2>
-    <p>We sent a verification link to <strong>{{ submittedEmail }}</strong>.</p>
-    <p>Click the link in the email to activate your account. The link is valid for 24 hours.</p>
-    <p class="muted">Did not arrive? Check your spam folder, or</p>
+    <h2>{{ 'auth.register.checkEmail' | translate }}</h2>
+    <p>{{ 'auth.register.sentToPrefix' | translate }} <strong>{{ submittedEmail }}</strong>.</p>
+    <p>{{ 'auth.register.clickLink' | translate }}</p>
+    <p class="muted">{{ 'auth.register.notArrived' | translate }}</p>
 
     <button class="secondary" (click)="onResend()" [disabled]="resendIsLoading">
-      <span *ngIf="!resendIsLoading">Resend verification email</span>
+      <span *ngIf="!resendIsLoading">{{ 'auth.register.resend' | translate }}</span>
       <span *ngIf="resendIsLoading">
         <span class="spinner" aria-hidden="true"></span>
-        Sending…
+        {{ 'auth.register.sending' | translate }}
       </span>
     </button>
 
@@ -129,6 +129,6 @@
       <span>{{ resendMessage }}</span>
     </div>
 
-    <p class="footer-link"><a routerLink="/login">← Back to sign in</a></p>
+    <p class="footer-link"><a routerLink="/login" queryParamsHandling="preserve">{{ 'common.backToSignIn' | translate }}</a></p>
   </div>
 </div>

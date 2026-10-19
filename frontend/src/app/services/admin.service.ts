@@ -12,6 +12,45 @@ export interface AdminUser {
   created_at: string | Date;
 }
 
+export interface AdminUsersQuery {
+  q?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AdminUsersPage {
+  users: AdminUser[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AuditLogEntry {
+  id: number;
+  user_id: number | null;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  old_value: unknown;
+  new_value: unknown;
+  ip_address: string | null;
+  created_at: string | Date;
+}
+
+export interface AuditLogQuery {
+  userId?: number | null;
+  action?: string | null;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AuditLogPage {
+  auditLog: AuditLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface FeedbackSummary {
   days: number;
   total: number;
@@ -38,12 +77,19 @@ export class AdminService {
   }
 
   /**
-   * Fetch all users (admin-only backend).
-   * Returns an Observable so callers can subscribe and unsubscribe cleanly.
+   * Fetch users (admin-only backend). Supports the API's email search +
+   * pagination params. The page envelope carries the server's `total` so the
+   * component can render a pager; a legacy `{ users }`-only body still works.
    */
-  listUsers(): Observable<AdminUser[]> {
-    return new Observable<AdminUser[]>((observer) => {
-      apiFetch(`${this.apiUrl}/users`, { method: 'GET', headers: this.headers() })
+  listUsers(query: AdminUsersQuery = {}): Observable<AdminUsersPage> {
+    const params = new URLSearchParams();
+    if (query.q) params.set('q', query.q);
+    if (query.limit !== undefined) params.set('limit', String(query.limit));
+    if (query.offset !== undefined) params.set('offset', String(query.offset));
+    const qs = params.toString();
+
+    return new Observable<AdminUsersPage>((observer) => {
+      apiFetch(`${this.apiUrl}/users${qs ? `?${qs}` : ''}`, { method: 'GET', headers: this.headers() })
         .then(async (response) => {
           if (response.status === 401) {
             this.authService.logout();
@@ -56,7 +102,51 @@ export class AdminService {
             return;
           }
           const data = await response.json();
-          observer.next(data.users || []);
+          const users: AdminUser[] = data.users || [];
+          observer.next({
+            users,
+            total: typeof data.total === 'number' ? data.total : users.length,
+            limit: typeof data.limit === 'number' ? data.limit : (query.limit ?? users.length),
+            offset: typeof data.offset === 'number' ? data.offset : (query.offset ?? 0)
+          });
+          observer.complete();
+        })
+        .catch((err) => observer.error(err));
+    });
+  }
+
+  /**
+   * Fetch the audit trail. Mirrors GET /api/admin/audit-log's filters
+   * (`userId`, `action`) and pagination (`limit`, `offset`).
+   */
+  listAuditLog(query: AuditLogQuery = {}): Observable<AuditLogPage> {
+    const params = new URLSearchParams();
+    if (query.userId) params.set('userId', String(query.userId));
+    if (query.action) params.set('action', query.action);
+    if (query.limit !== undefined) params.set('limit', String(query.limit));
+    if (query.offset !== undefined) params.set('offset', String(query.offset));
+    const qs = params.toString();
+
+    return new Observable<AuditLogPage>((observer) => {
+      apiFetch(`${this.apiUrl}/audit-log${qs ? `?${qs}` : ''}`, { method: 'GET', headers: this.headers() })
+        .then(async (response) => {
+          if (response.status === 401) {
+            this.authService.logout();
+            observer.error(new Error('Session expired'));
+            return;
+          }
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            observer.error(new Error(body?.error || `HTTP ${response.status}`));
+            return;
+          }
+          const auditLog: AuditLogEntry[] = body.auditLog || [];
+          observer.next({
+            auditLog,
+            total: typeof body.total === 'number' ? body.total : auditLog.length,
+            limit: typeof body.limit === 'number' ? body.limit : (query.limit ?? auditLog.length),
+            offset: typeof body.offset === 'number' ? body.offset : (query.offset ?? 0)
+          });
           observer.complete();
         })
         .catch((err) => observer.error(err));

@@ -1,0 +1,30 @@
+# NomosAI Prometheus configuration (3-1 observability).
+#
+# Lives on the internal compose network only: the container does not publish
+# a host port. Grafana reaches it at http://prometheus:9090.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: nomosai
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Backend exposes prom-client metrics at /metrics (no auth, internal only).
+  - job_name: backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['backend:3000']
+
+  # Redis exporter (oliver006/redis_exporter) exposes redis_up and friends.
+  - job_name: redis
+    static_configs:
+      - targets: ['redis_exporter:9121']
+
+  # Host/container disk, CPU, memory. The textfile collector publishes the
+  # backup freshness gauge written by backend/src/scripts/backupDb.js.
+  - job_name: node
+    static_configs:
+      - targets: ['node_exporter:9100']

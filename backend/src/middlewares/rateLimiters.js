@@ -74,10 +74,11 @@ const STANDARD_OPTIONS = {
 };
 
 /**
- * Construct the four limiters used on /api/auth/*.
+ * Construct the limiters used on /api/auth/*.
  *
  *   - register                per-IP, 5/hour (prod) / 1000/hour (test)
  *   - login                   per-IP, 10/minute (prod) / 1000/minute (test)
+ *   - me                      per-user, 120/minute (prod) / 1000/minute (test)
  *   - changePasswordPreAuth   per-IP, 30/minute (prod) / 1000/minute (test)
  *                              applied BEFORE authMiddleware so 401s cost
  *                              bounded CPU.
@@ -129,6 +130,19 @@ function createRateLimiters(options = {}) {
       max: resolveCap(options.loginMax, 10),                                   // 10/min per IP
       keyGenerator: (req) => `login:${req.ip}`,
       store: createStore('login')
+    }),
+
+    // 1-3: lenient cap on GET /api/auth/me. The route is cheap (req.user is
+    // hydrated by authMiddleware), but an authenticated client could poll it
+    // in a tight loop; 120/min per user bounds that without ever bothering
+    // the ~2 calls a real page load makes. Mounted AFTER authMiddleware so
+    // the bucket keys on the user id (see auth.js).
+    me: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.meMax, 120),                                     // 120/min per user id
+      keyGenerator: (req) => userKey(req, 'me'),
+      store: createStore('me')
     }),
 
     // Per-IP layer before authMiddleware. Bounds the cost of hitting
@@ -238,7 +252,7 @@ function createRateLimiters(options = {}) {
   };
 }
 
-module.exports = { createRateLimiters, createAiRateLimiters };
+module.exports = { createRateLimiters, createAiRateLimiters, createApiRateLimiters };
 
 /**
  * Phase 29: AI-route rate limiters, tier-aware.
@@ -317,6 +331,119 @@ function createAiRateLimiters(options = {}) {
       max: resolveCap(options.aiFeedbackMax, 30),
       keyGenerator: (req) => userKey(req, 'ai_feedback'),
       store: createStore('ai_feedback')
+    })
+  };
+}
+
+/**
+ * 1-3: rate limiters for the authenticated product surface that previously
+ * had none — documents, conversations, subscriptions, GDPR, billing.
+ *
+ * Every route below is mounted BEHIND authMiddleware (see index.js), so
+ * req.user.id is always hydrated and the bucket keys per account. The
+ * webhook endpoint is deliberately NOT covered here: Stripe retries
+ * deliveries and a generic 429 would be indistinguishable from a handler
+ * failure (which SHOULD be retried) — webhook idempotency instead lives in
+ * `stripe_webhook_events` (1-10).
+ *
+ * Caps are per-minute and sized so normal UI flows (list + poll + a few
+ * uploads) never trip while abuse (embedding spam, export/delete loops,
+ * checkout churn) is bounded:
+ *
+ *   - documentUpload      10/min   (parsing + embeddings; the expensive one)
+ *   - documentSearch      30/min   (embedding + vector search)
+ *   - conversationList   120/min   (cheap reads, chat UI polls)
+ *   - conversationCreate  30/min
+ *   - subscriptionRead    60/min
+ *   - subscriptionCancel   5/min   (Stripe API + state change)
+ *   - gdprExport           5/min   (full-table dump)
+ *   - gdprDelete           3/hour  (irreversible; slower than any UI flow)
+ *   - billingCheckout     10/min   (Stripe session creation)
+ *   - billingMockComplete 10/min   (dev-only tier grant; live mode 403s)
+ */
+function createApiRateLimiters(options = {}) {
+  const isTest = options.isTest ?? (NODE_ENV === 'test');
+  const TEST_CEILING = 1000;
+
+  function resolveCap(overrideOption, productionDefault) {
+    if (overrideOption !== undefined && overrideOption !== null) return overrideOption;
+    if (isTest) return TEST_CEILING;
+    return productionDefault;
+  }
+
+  const userKey = (req, prefix) =>
+    `${prefix}:${req.user && req.user.id !== undefined ? req.user.id : 'anon'}`;
+
+  return {
+    documentUpload: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.documentUploadMax, 10),                          // 10/min per user id
+      keyGenerator: (req) => userKey(req, 'doc_upload'),
+      store: createStore('doc_upload')
+    }),
+    documentSearch: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.documentSearchMax, 30),                          // 30/min per user id
+      keyGenerator: (req) => userKey(req, 'doc_search'),
+      store: createStore('doc_search')
+    }),
+    conversationList: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.conversationListMax, 120),                       // 120/min per user id
+      keyGenerator: (req) => userKey(req, 'conv_list'),
+      store: createStore('conv_list')
+    }),
+    conversationCreate: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.conversationCreateMax, 30),                      // 30/min per user id
+      keyGenerator: (req) => userKey(req, 'conv_create'),
+      store: createStore('conv_create')
+    }),
+    subscriptionRead: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.subscriptionReadMax, 60),                        // 60/min per user id
+      keyGenerator: (req) => userKey(req, 'sub_read'),
+      store: createStore('sub_read')
+    }),
+    subscriptionCancel: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.subscriptionCancelMax, 5),                       // 5/min per user id
+      keyGenerator: (req) => userKey(req, 'sub_cancel'),
+      store: createStore('sub_cancel')
+    }),
+    gdprExport: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.gdprExportMax, 5),                               // 5/min per user id
+      keyGenerator: (req) => userKey(req, 'gdpr_export'),
+      store: createStore('gdpr_export')
+    }),
+    gdprDelete: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 60 * 1000,
+      max: resolveCap(options.gdprDeleteMax, 3),                               // 3/hour per user id
+      keyGenerator: (req) => userKey(req, 'gdpr_delete'),
+      store: createStore('gdpr_delete')
+    }),
+    billingCheckout: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.billingCheckoutMax, 10),                         // 10/min per user id
+      keyGenerator: (req) => userKey(req, 'billing_checkout'),
+      store: createStore('billing_checkout')
+    }),
+    billingMockComplete: rateLimit({
+      ...STANDARD_OPTIONS,
+      windowMs: 60 * 1000,
+      max: resolveCap(options.billingMockCompleteMax, 10),                     // 10/min per user id
+      keyGenerator: (req) => userKey(req, 'billing_mock'),
+      store: createStore('billing_mock')
     })
   };
 }

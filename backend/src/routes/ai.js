@@ -5,11 +5,13 @@ const db = require('../config/db');
 const ragService = require('../services/ragService');
 const documentService = require('../services/documentService');
 const ollamaService = require('../services/ollamaService');
+const transcriptionService = require('../services/transcriptionService');
 const inferenceQueue = require('../services/inferenceQueue');
 const { rbacMiddleware } = require('../middlewares/authMiddleware');
 const { requireTier } = require('../middlewares/tierMiddleware');
+const { enforceAiQuota } = require('../middlewares/quotaMiddleware');
 const { createAiRateLimiters } = require('../middlewares/rateLimiters');
-const { validate, validateUploadedFile } = require('../middlewares/validation');
+const { validate, validateUploadedFile, sniffFileType } = require('../middlewares/validation');
 const { check } = require('express-validator');
 const { recordAiQueryDuration } = require('../middlewares/metrics');
 
@@ -22,11 +24,77 @@ const limiters = createAiRateLimiters();
 // validated by magic bytes in validateUploadedFile (Phase 29) — the multer
 // `fileFilter` here only enforces per-endpoint size caps, because multer
 // receives the stream before the buffer exists.
+// Phase 1-2: the cap is env-overridable (AI_UPLOAD_MAX_BYTES) so tests can
+// exercise the LIMIT_FILE_SIZE → 413 path without pushing 25 MB of bytes.
 const storage = multer.memoryStorage();
+const UPLOAD_MAX_BYTES = (() => {
+  const parsed = Number(process.env.AI_UPLOAD_MAX_BYTES);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 25 * 1024 * 1024;
+})();
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 25 * 1024 * 1024 }
+  limits: { fileSize: UPLOAD_MAX_BYTES }
 });
+
+// Phase 1-2: conversationId is persisted into an integer FK column, and a
+// non-numeric value ('abc', 1e30, …) would otherwise reach Postgres and blow
+// up with 22P02 (invalid_text_representation) → 500. Normalize at the edge so
+// callers get a 400 instead. Absent/null/'' means "do not persist".
+function parseConversationId(raw) {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, value: null };
+  const value = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  // Number.isSafeInteger also rejects 1e30-style floats that pg would send as
+  // "1e+30" and Postgres would reject with another 22P02.
+  if (!Number.isSafeInteger(value) || value <= 0) return { ok: false, value: null };
+  return { ok: true, value };
+}
+
+// BullMQ job ids are opaque strings (custom ids are allowed), so they are not
+// integer-validated like conversationId — but keep them bounded so a
+// pathological path segment can never be used as a Redis key bomb.
+const MAX_JOB_ID_LENGTH = 128;
+
+function isValidJobId(raw) {
+  return typeof raw === 'string' && raw.length > 0 && raw.length <= MAX_JOB_ID_LENGTH;
+}
+
+// Phase 1-2: cap the synchronous /query wait on the inference queue so a stuck
+// worker cannot hold the HTTP request open forever. Env-overridable
+// (AI_QUERY_TIMEOUT_MS) because a cold model load on slow hardware can
+// legitimately take minutes.
+const DEFAULT_QUERY_TIMEOUT_MS = 120000;
+
+function getQueryTimeoutMs() {
+  const parsed = Number(process.env.AI_QUERY_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QUERY_TIMEOUT_MS;
+}
+
+function inferenceTimeoutError(timeoutMs) {
+  const error = new Error(`Inference timed out after ${timeoutMs} ms`);
+  error.code = 'AI_QUERY_TIMEOUT';
+  return error;
+}
+
+/**
+ * Await a job's result with a hard upper bound. The loser promise stays
+ * pending (the worker may still finish and store the result for the polling
+ * fallback), but the HTTP request is released with a 504 marker error.
+ */
+async function waitUntilFinished(job, queueEvents) {
+  const timeoutMs = getQueryTimeoutMs();
+  let timer = null;
+  try {
+    return await Promise.race([
+      queueEvents ? job.waitUntilFinished(queueEvents) : job.waitUntilFinished(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(inferenceTimeoutError(timeoutMs)), timeoutMs);
+        if (timer && typeof timer.unref === 'function') timer.unref();
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // Prompt validation shared by /query and /query/stream.
 const validatePrompt = validate([
@@ -141,9 +209,14 @@ router.post(
   limiters.query,
   rbacMiddleware(['user', 'admin', 'enterprise']),
   validatePrompt,
+  enforceAiQuota,
   async (req, res) => {
     try {
       const { prompt, useRag = true, conversationId, documentIds = [] } = req.body;
+      const parsedConversationId = parseConversationId(conversationId);
+      if (!parsedConversationId.ok) {
+        return res.status(400).json({ error: 'conversationId must be a positive integer' });
+      }
       const rag = useRag
         ? await retrieveRagContext(prompt, req.user.id, documentIds)
         : { contextStr: '', sources: [], confidence: 0 };
@@ -151,24 +224,30 @@ router.post(
       // Phase 29: inference runs through the BullMQ queue (concurrency 1,
       // GPU protection). waitUntilFinished() blocks the HTTP request until
       // the worker stores the result — same response shape as before.
+      // Phase 1-2: the wait is capped (504 on expiry, see waitUntilFinished).
       const startedAt = Date.now();
       const job = await inferenceQueue.addInferenceJob(prompt, rag.contextStr, {
         userId: req.user.id,
-        conversationId: conversationId || null,
+        conversationId: parsedConversationId.value,
         prompt,
         sources: rag.sources,
         confidence: rag.confidence
       });
       const queueEvents = inferenceQueue.getQueueEvents();
-      const response = queueEvents
-        ? await job.waitUntilFinished(queueEvents)
-        : await job.waitUntilFinished();
+      const response = await waitUntilFinished(job, queueEvents);
       recordAiQueryDuration(Date.now() - startedAt);
 
-      const messageId = await storeExchange(conversationId, req.user.id, prompt, response, job.id, {
-        sources: rag.sources,
-        confidence: rag.confidence
-      });
+      const messageId = await storeExchange(
+        parsedConversationId.value,
+        req.user.id,
+        prompt,
+        response,
+        job.id,
+        {
+          sources: rag.sources,
+          confidence: rag.confidence
+        }
+      );
 
       res.json({
         response,
@@ -177,6 +256,10 @@ router.post(
         confidence: rag.confidence
       });
     } catch (error) {
+      if (error && error.code === 'AI_QUERY_TIMEOUT') {
+        console.error('AI query timeout:', error.message);
+        return res.status(504).json({ error: error.message });
+      }
       console.error('AI query error:', error);
       res.status(500).json({ error: error.message });
     }
@@ -191,16 +274,21 @@ router.post(
   limiters.stream,
   rbacMiddleware(['user', 'admin', 'enterprise']),
   validatePrompt,
+  enforceAiQuota,
   async (req, res) => {
     try {
       const { prompt, useRag = true, conversationId, documentIds = [] } = req.body;
+      const parsedConversationId = parseConversationId(conversationId);
+      if (!parsedConversationId.ok) {
+        return res.status(400).json({ error: 'conversationId must be a positive integer' });
+      }
       const rag = useRag
         ? await retrieveRagContext(prompt, req.user.id, documentIds)
         : { contextStr: '', sources: [], confidence: 0 };
 
       const job = await inferenceQueue.addInferenceJob(prompt, rag.contextStr, {
         userId: req.user.id,
-        conversationId: conversationId || null,
+        conversationId: parsedConversationId.value,
         prompt,
         sources: rag.sources,
         confidence: rag.confidence
@@ -224,13 +312,19 @@ router.get(
   rbacMiddleware(['user', 'admin', 'enterprise']),
   async (req, res) => {
     try {
+      if (!isValidJobId(req.params.jobId)) {
+        return res.status(400).json({ error: 'Invalid job id' });
+      }
       const job = await inferenceQueue.getJob(req.params.jobId);
       if (!belongsToUser(job, req.user.id)) {
         return res.status(404).json({ error: 'Job not found' });
       }
       const state = await job.getState();
       if (state === 'completed') {
-        const conversationId = job.data && job.data.conversationId;
+        // Defensive normalization: the job data was validated at enqueue time,
+        // but a malformed historical payload must never reach Postgres as-is.
+        const parsedConversationId = parseConversationId(job.data && job.data.conversationId);
+        const conversationId = parsedConversationId.ok ? parsedConversationId.value : null;
         const answerMetadata = {
           sources: Array.isArray(job.data && job.data.sources) ? job.data.sources : [],
           confidence: Number.isFinite(Number(job.data && job.data.confidence))
@@ -323,6 +417,9 @@ router.delete(
   rbacMiddleware(['user', 'admin', 'enterprise']),
   async (req, res) => {
     try {
+      if (!isValidJobId(req.params.jobId)) {
+        return res.status(400).json({ error: 'Invalid job id' });
+      }
       const job = await inferenceQueue.getJob(req.params.jobId);
       if (!belongsToUser(job, req.user.id)) {
         return res.status(404).json({ error: 'Job not found' });
@@ -336,12 +433,16 @@ router.delete(
   }
 );
 
-// Phase 7: Audio Streaming Endpoint — premium (pro tier, role-gated)
+// Phase 7: Audio Streaming Endpoint — premium (pro tier or higher).
+// Tier (not role) is the gate: paid pro/enterprise accounts carry
+// role='user' and would otherwise be rejected by an RBAC role check before
+// requireTier ever ran. requireTier runs before the upload so unauthorized
+// callers never stream bytes into memory.
 router.post(
   '/audio-query',
   limiters.audioQuery,
-  rbacMiddleware(['admin', 'enterprise']),
   requireTier('pro'),
+  enforceAiQuota,
   upload.single('audio'),
   validateUploadedFile('audio'),
   async (req, res) => {
@@ -349,42 +450,125 @@ router.post(
       const audioBuffer = req.file.buffer;
       console.log(`Received audio clip of size ${audioBuffer.length} bytes (${req.file.detectedType})`);
 
-      const mockTranscription = 'Τι προβλέπει ο νόμος για το δικαίωμα στην προσωπικότητα;';
+      // Phase 1-6: real STT via the local whisper sidecar (privacy-preserving
+      // — audio never leaves the deployment). The transcript becomes the
+      // inference prompt, so the rest of the flow (RAG → queued inference →
+      // poll) is unchanged.
+      const transcription = await transcriptionService.transcribe(audioBuffer, {
+        mimeType: req.file.detectedType
+      });
+      // Log the size only — the spoken content may be privileged.
+      console.log(`Transcribed ${audioBuffer.length} audio bytes to ${transcription.length} chars`);
 
-      const rag = await retrieveRagContext(mockTranscription, req.user.id);
+      const rag = await retrieveRagContext(transcription, req.user.id);
 
-      const conversationId = req.body && req.body.conversationId;
-      const job = await inferenceQueue.addInferenceJob(mockTranscription, rag.contextStr, {
+      const conversationId = parseConversationId(req.body && req.body.conversationId);
+      if (!conversationId.ok) {
+        return res.status(400).json({ error: 'conversationId must be a positive integer' });
+      }
+      const job = await inferenceQueue.addInferenceJob(transcription, rag.contextStr, {
         userId: req.user.id,
-        conversationId: conversationId || null,
-        prompt: mockTranscription,
+        conversationId: conversationId.value,
+        prompt: transcription,
         sources: rag.sources,
         confidence: rag.confidence
       });
       res.json({ jobId: job.id });
     } catch (error) {
+      if (error instanceof transcriptionService.TranscriptionError) {
+        console.error(`Audio transcription failed (${error.code}):`, error.message);
+        return res.status(error.status).json({ error: error.publicMessage });
+      }
       console.error('Audio query error:', error);
       res.status(500).json({ error: error.message });
     }
   }
 );
 
-// Multimodal Upload Endpoint — premium (enterprise tier, role-gated)
+// Multimodal Upload Endpoint — premium (enterprise tier or higher).
+// Same tier-not-role rationale as /audio-query above.
+//
+// Phase 1-7: real document handling. PDF and DOCX are text-extracted through
+// the shared document pipeline (documentService.extractMetadata — the same
+// parser processAndStoreDocument uses) and then answered with the normal
+// RAG + local-LLM path. Vision is out of scope by decision (2026-10-18):
+// images get an explicit "not supported" envelope instead of a canned reply.
+const MULTIMODAL_DOCUMENT_TYPES = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+];
+// Prompt char budget: enough for a multi-page contract excerpt while keeping
+// the local model's context window + latency bounded.
+const MULTIMODAL_DOCUMENT_MAX_CHARS = 8000;
+
+// The shared validateUploadedFile('multimodal') whitelist predates DOCX
+// support and rejects it before the handler can see the bytes, so the route
+// sniffs with the same dependency-free magic-byte helper instead:
+//   - unrecognizable bytes        → 400 (validateUploadedFile's convention)
+//   - recognized, but not PDF/DOCX (images, plain text, …) → 415 below
+function validateMultimodalUpload(req, res, next) {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+  const detectedType = sniffFileType(req.file.buffer);
+  if (!detectedType) {
+    return res.status(400).json({
+      error: `Unsupported file type. Allowed: ${MULTIMODAL_DOCUMENT_TYPES.join(', ')}`
+    });
+  }
+  // Strip path components so a crafted multipart name can never traverse
+  // directories downstream (same sanitization as validateUploadedFile).
+  if (req.file.originalname) {
+    req.file.originalname = req.file.originalname.replace(/[\\/]/g, '_');
+  }
+  req.file.detectedType = detectedType;
+  next();
+}
+
 router.post(
   '/multimodal',
   limiters.multimodal,
-  rbacMiddleware(['admin', 'enterprise']),
   requireTier('enterprise'),
+  enforceAiQuota,
   upload.single('file'),
-  validateUploadedFile('multimodal'),
+  validateMultimodalUpload,
   async (req, res) => {
     try {
-      const fileBuffer = req.file.buffer;
-      console.log(`Received file of size ${fileBuffer.length} bytes, type: ${req.file.detectedType}`);
+      const detectedType = req.file.detectedType;
+      if (!MULTIMODAL_DOCUMENT_TYPES.includes(detectedType)) {
+        return res.status(415).json({
+          error: 'Unsupported media type. Upload a PDF or DOCX document.'
+        });
+      }
 
-      const mockResponse =
-        'Έχω αναλύσει το επισυναπτόμενο έγγραφο. Φαίνεται να είναι νομικό συμβόλαιο.';
-      res.json({ response: mockResponse });
+      const { text } = await documentService.extractMetadata(req.file.buffer, {
+        contentType: detectedType,
+        filename: req.file.originalname
+      });
+      const excerpt = typeof text === 'string' ? text.trim().slice(0, MULTIMODAL_DOCUMENT_MAX_CHARS) : '';
+      if (!excerpt) {
+        // Scanned/image-only PDFs have no text layer — say so instead of
+        // letting the model invent a summary of an empty context.
+        return res.status(422).json({ error: 'Could not extract text from the document' });
+      }
+      console.log(
+        `Multimodal document of ${req.file.buffer.length} bytes (${detectedType}) → ${excerpt.length} prompt chars`
+      );
+
+      // The attached document is the question; retrieved legislation is the
+      // grounding context (same Greek prompt shape as the chat routes).
+      const prompt = [
+        'Ανέλυσε το ακόλουθο νομικό έγγραφο που επισύναψε ο χρήστης και απάντησε με βάση το περιεχόμενό του.',
+        'Σχολίασε τα βασικά νομικά σημεία, τις υποχρεώσεις και τυχόν κινδύνους που προκύπτουν.',
+        '',
+        'Περιεχόμενο εγγράφου:',
+        excerpt
+      ].join('\n');
+
+      const rag = await retrieveRagContext(excerpt, req.user.id);
+      const response = await ollamaService.generateResponse(prompt, rag.contextStr);
+
+      res.json({ response, sources: rag.sources, confidence: rag.confidence });
     } catch (error) {
       console.error('Multimodal error:', error);
       res.status(500).json({ error: error.message });

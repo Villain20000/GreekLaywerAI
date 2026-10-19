@@ -1,0 +1,1 @@
+- Prefers parallel subagents for multi-area work: when a task spans several independent areas, dispatch multiple subagents concurrently (one per area) instead of working sequentially, and give each subagent a strict, non-overlapping file scope so their edits don't collide. Confidence: 0.9

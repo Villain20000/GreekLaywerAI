@@ -1,64 +1,123 @@
-// Phase 23: Email service.
+// Phase 23 + 24 + P0-6: Email service.
 //
-// MVP posture:
-//   - The project does not yet ship a transactional email provider (no
-//     nodemailer/@sendgrid/mail in backend/package.json). To keep the
-//     /forgot-password → /reset-password flow testable end-to-end without an
-//     SMTP dependency, sendPasswordReset() in this module logs the reset
-//     URL to the server console with a clearly-marked DEV prefix. In dev
-//     environments the implementer copies the URL out of the logs and pastes
-//     it into the browser.
+// Transports (selected by EMAIL_TRANSPORT):
+//   - 'console' (default, dev/test only): logs the reset / verify URL with a
+//     [DEV-EMAIL] prefix. REFUSES to run when NODE_ENV=production — the log
+//     line contains a raw bearer credential.
+//   - 'smtp': nodemailer transport configured via SMTP_HOST / SMTP_PORT /
+//     SMTP_SECURE / SMTP_USER / SMTP_PASS + EMAIL_FROM.
 //
-// Production swap-in (one-file change, no caller edits):
-//   - Set EMAIL_TRANSPORT=smtp + SMTP_HOST / SMTP_PORT / SMTP_USER /
-//     SMTP_PASS / EMAIL_FROM env vars; swap the body of sendPasswordReset
-//     for a nodemailer createTransport(...).sendMail(...) call. The exported
-//     signature is intentionally minimal (to, resetUrl) so any provider
-//     plugs in cleanly.
+// Production posture: this module HARD-THROWS at load time when
+// NODE_ENV=production and SMTP is not fully configured (same fail-fast style
+// as authMiddleware's JWT_SECRET guard). The pre-fix behavior — return 200
+// while sending zero emails — shipped unverifiable accounts and unrecoverable
+// passwords; a crashing deploy is strictly better than a silent one.
+
+const nodemailer = require('nodemailer');
 
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:4200';
+const EMAIL_TRANSPORT = (process.env.EMAIL_TRANSPORT || 'console').toLowerCase();
+const EMAIL_FROM = process.env.EMAIL_FROM || 'NomosAI <no-reply@nomos.ai>';
 
-/**
- * Shared prod-guard + dev-transport switch — every email-sending function
- * below calls this so we can't accidentally leak a plaintext token in
- * production logs.
- */
-function assertSafeSend() {
-  if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production') {
+  const problems = [];
+  if (EMAIL_TRANSPORT !== 'smtp') {
+    problems.push(`EMAIL_TRANSPORT must be 'smtp' (got '${EMAIL_TRANSPORT}')`);
+  }
+  if (!process.env.SMTP_HOST) problems.push('SMTP_HOST is required');
+  if (!process.env.EMAIL_FROM) problems.push('EMAIL_FROM is required');
+  if (problems.length) {
     throw new Error(
-      '[emailService] send called in production without SMTP configured. ' +
-      'Set EMAIL_TRANSPORT=smtp + SMTP_HOST/PORT/USER/PASS/EMAIL_FROM env vars.'
+      `[emailService] production email is not configured: ${problems.join('; ')}. ` +
+      'Refusing to boot.'
     );
   }
-  if (process.env.EMAIL_TRANSPORT && process.env.EMAIL_TRANSPORT !== 'console') {
+}
+
+let transporter = null;
+
+function getTransporter() {
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+      auth: process.env.SMTP_USER
+        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+        : undefined
+    });
+  }
+  return transporter;
+}
+
+/**
+ * Bounded exponential-backoff retry for transient SMTP failures (connection
+ * resets, 4xx greylisting). Non-transient auth errors fail after the same
+ * attempts — callers already treat send failures as non-fatal (fire-and-
+ * forget with a .catch() that logs).
+ */
+async function sendWithRetry(sendFn, { attempts = 3, baseDelayMs = 500 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await sendFn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+async function sendMail({ to, subject, text, html }) {
+  const info = await sendWithRetry(() =>
+    getTransporter().sendMail({ from: EMAIL_FROM, to, subject, text, html })
+  );
+  return info;
+}
+
+/**
+ * Console-transport guard. Unreachable when the load-time production guard
+ * ran, but defense-in-depth: never print a raw token to production logs.
+ */
+function assertConsoleSafe() {
+  if (process.env.NODE_ENV === 'production') {
     throw new Error(
-      `[emailService] EMAIL_TRANSPORT=${process.env.EMAIL_TRANSPORT} is not yet implemented. ` +
-      'Currently only the dev "console" transport is available.'
+      '[emailService] the console email transport refuses to run with NODE_ENV=production.'
     );
   }
 }
 
 /**
  * Send a password-reset email.
- * @param {string} toEmail  Recipient's email address (already verified to exist in users table).
- * @param {string} resetToken Plaintext reset token (32-byte hex). The caller built and
- *                          SHA256-hashed this token for DB storage; the plaintext is the
- *                          secret only this function consumes.
+ * @param {string} toEmail  Recipient's email address.
+ * @param {string} resetToken Plaintext reset token (32-byte hex); the caller
+ *                            stored only its SHA-256.
  * @returns {Promise<void>}
  */
 async function sendPasswordReset(toEmail, resetToken) {
   const resetUrl = `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
-  // Hard guard: the dev transport prints the raw reset token to logs. If
-  // this function ever runs in production (NODE_ENV=production) it would
-  // leak the bearer credential to anyone with log access. assertSafeSend()
-  // refuses to send rather than silently leak.
-  assertSafeSend();
+
+  if (EMAIL_TRANSPORT === 'smtp') {
+    await sendMail({
+      to: toEmail,
+      subject: 'NomosAI — Επαναφορά κωδικού πρόσβασης',
+      text:
+        'Ζητήσατε επαναφορά κωδικού πρόσβασης για τον λογαριασμό σας στο NomosAI.\n\n' +
+        `Ορίστε νέο κωδικό από τον παρακάτω σύνδεσμο (ισχύει 1 ώρα):\n${resetUrl}\n\n` +
+        'Αν δεν υποβάλατε εσείς αυτό το αίτημα, αγνοήστε αυτό το email.'
+    });
+    return;
+  }
+
+  assertConsoleSafe();
   console.log(
     `[DEV-EMAIL] Password-reset requested for ${toEmail}.\n` +
     `             Reset URL: ${resetUrl}\n` +
     `             (Dev console transport; never run with NODE_ENV=production.)`
   );
-  return Promise.resolve();
 }
 
 /**
@@ -69,13 +128,25 @@ async function sendPasswordReset(toEmail, resetToken) {
  */
 async function sendEmailVerification(toEmail, verifyToken) {
   const verifyUrl = `${APP_BASE_URL}/verify-email?token=${encodeURIComponent(verifyToken)}`;
-  assertSafeSend();
+
+  if (EMAIL_TRANSPORT === 'smtp') {
+    await sendMail({
+      to: toEmail,
+      subject: 'NomosAI — Επιβεβαίωση email',
+      text:
+        'Καλώς ήρθατε στο NomosAI.\n\n' +
+        `Επιβεβαιώστε τη διεύθυνση email σας από τον παρακάτω σύνδεσμο (ισχύει 24 ώρες):\n${verifyUrl}\n\n` +
+        'Αν δεν δημιουργήσατε εσείς αυτόν τον λογαριασμό, αγνοήστε αυτό το email.'
+    });
+    return;
+  }
+
+  assertConsoleSafe();
   console.log(
     `[DEV-EMAIL] Email-verification requested for ${toEmail}.\n` +
     `             Verify URL: ${verifyUrl}\n` +
     `             (Dev console transport; never run with NODE_ENV=production.)`
   );
-  return Promise.resolve();
 }
 
 module.exports = {

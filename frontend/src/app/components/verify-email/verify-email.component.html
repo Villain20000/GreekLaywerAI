@@ -1,13 +1,13 @@
 <div class="verify-container">
   <div class="verify-box">
-    <h2>Verifying…</h2>
-    <p *ngIf="!finished">Hang on while we activate your account.</p>
+    <h2>{{ 'auth.verify.title' | translate }}</h2>
+    <p *ngIf="!finished">{{ 'auth.verify.waiting' | translate }}</p>
     <div *ngIf="finished && success" class="success-msg">
-      Email verified. Signing you in&hellip;
+      {{ 'auth.verify.success' | translate }}
     </div>
     <div *ngIf="finished && !success" class="error-msg">{{ error }}</div>
     <p *ngIf="finished && !success" class="footer-link">
-      <a routerLink="/login">Back to sign in</a>
+      <a routerLink="/login">{{ 'common.backToSignIn' | translate }}</a>
     </p>
   </div>
 </div>

@@ -1,0 +1,89 @@
+# NomosAI alert rules (3-1 observability).
+#
+# Metric names match backend/src/middlewares/metrics.js and the compose
+# sidecars:
+#   nomos_http_requests_total{method,route,status}
+#   inference_queue_depth
+#   nomos_db_query_duration_seconds_bucket{status,le}
+#   redis_up                                   (redis_exporter)
+#   node_filesystem_*                          (node_exporter)
+#   nomos_backup_last_success_timestamp_seconds (node_exporter textfile)
+groups:
+  - name: nomosai-availability
+    rules:
+      - alert: BackendDown
+        expr: up{job="backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'NomosAI backend is down'
+          description: 'Prometheus has failed to scrape backend:3000/metrics for 2 minutes.'
+
+      - alert: High5xxRate
+        expr: |
+          (
+            sum(rate(nomos_http_requests_total{status=~"5.."}[5m]))
+            /
+            (sum(rate(nomos_http_requests_total[5m])) > 0)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'NomosAI 5xx rate is above 5%'
+          description: 'More than 5% of HTTP responses were 5xx over the last 5 minutes.'
+
+      - alert: InferenceQueueBackedUp
+        expr: max(inference_queue_depth) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'NomosAI inference queue is backed up'
+          description: 'More than 20 inference jobs have been queued or running for 10 minutes.'
+
+  - name: nomosai-dependencies
+    rules:
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'NomosAI Redis is unreachable'
+          description: 'redis_exporter cannot PING Redis; the BullMQ queue and rate limiting are degraded.'
+
+      - alert: DiskSpaceLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node",fstype!~"tmpfs|overlay|squashfs|ramfs"}
+            /
+            node_filesystem_size_bytes{job="node",fstype!~"tmpfs|overlay|squashfs|ramfs"}
+          ) * 100 < 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'NomosAI host disk is below 10% free'
+          description: 'Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has less than 10% free space.'
+
+  - name: nomosai-backups
+    rules:
+      - alert: BackupStale
+        expr: time() - nomos_backup_last_success_timestamp_seconds > 48 * 3600
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'NomosAI database backup is stale'
+          description: 'The last successful pg_dump was more than 48 hours ago ({{ $value | humanizeDuration }}).'
+
+      - alert: BackupMetricMissing
+        expr: absent(nomos_backup_last_success_timestamp_seconds)
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'NomosAI backup freshness metric is missing'
+          description: 'No successful backup has published a Prometheus textfile since Prometheus started; check the backup cron sidecar and PROM_TEXTFILE_DIR.'

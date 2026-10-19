@@ -22,6 +22,11 @@ jobs:
       - name: Run backend tests
         working-directory: backend
         run: npm test
+      - name: Audit backend runtime dependencies
+        working-directory: backend
+        # Gates on critical runtime advisories. Remaining high advisories are
+        # dev-only or need semver-major upgrades (tracked by Dependabot).
+        run: npm audit --omit=dev --audit-level=critical
       - name: Build backend Docker image
         run: docker build -t nomosai-backend:ci ./backend
 
@@ -38,6 +43,10 @@ jobs:
       - name: Install frontend deps
         working-directory: frontend
         run: npm ci
+      - name: Install Chrome for Karma
+        working-directory: frontend
+        # karma.conf.js resolves CHROME_BIN through puppeteer.executablePath().
+        run: npx puppeteer browsers install chrome
       - name: Run frontend tests
         working-directory: frontend
         run: npm test -- --watch=false --browsers=ChromeHeadless

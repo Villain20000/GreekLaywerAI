@@ -1,15 +1,37 @@
 import { ComponentFixture, TestBed, fakeAsync, tick } from '@angular/core/testing';
 import { ChangePasswordComponent } from './change-password.component';
 import { AuthService } from '../../services/auth.service';
-import { Router } from '@angular/router';
-import { provideRouter } from '@angular/router';
+import { Router, provideRouter } from '@angular/router';
 import { By } from '@angular/platform-browser';
+import { MIN_PASSWORD_LENGTH } from '../../shared/auth.constants';
+import { lookupTranslation, provideTestTranslate } from '../../i18n/testing';
+
+/**
+ * Greek copy for a dictionary key, with `{{param}}` placeholders resolved the
+ * same way ngx-translate's default parser resolves them.
+ *
+ * The dictionary is the source of truth for the rendered wording, so the
+ * assertions below resolve the key instead of hard-coding a literal. Throws
+ * when the key is missing so a dictionary regression fails the spec loudly
+ * instead of silently comparing against `undefined`.
+ */
+function elCopy(key: string, params: Record<string, string | number> = {}): string {
+  const raw = lookupTranslation('el', key);
+  if (raw === undefined) {
+    throw new Error(`Missing i18n key: ${key}`);
+  }
+  return Object.entries(params).reduce(
+    (text, [name, value]) =>
+      text.replace(new RegExp(`\\{\\{${name}\\}\\}`, 'g'), String(value)),
+    raw
+  );
+}
 
 describe('ChangePasswordComponent', () => {
   let component: ChangePasswordComponent;
   let fixture: ComponentFixture<ChangePasswordComponent>;
   let mockAuthService: { changePassword: jasmine.Spy };
-  let mockRouter: { navigate: jasmine.Spy };
+  let mockRouter: Router;
 
   beforeEach(async () => {
     mockAuthService = {
@@ -17,16 +39,25 @@ describe('ChangePasswordComponent', () => {
         .createSpy('changePassword')
         .and.resolveTo({ ok: true })
     };
-    mockRouter = { navigate: jasmine.createSpy('navigate') };
 
     await TestBed.configureTestingModule({
       imports: [ChangePasswordComponent],
       providers: [
         { provide: AuthService, useValue: mockAuthService },
-        { provide: Router, useValue: mockRouter },
-        provideRouter([])
+        // Real Router via provideRouter + spy on navigate: RouterLink needs a
+        // working ActivatedRoute/Router graph to render hrefs, while the specs
+        // only care about programmatic navigate() calls.
+        provideRouter([]),
+        // 2-8 (i18n): the form template uses the `translate` pipe and the
+        // component injects TranslateService, so the spec needs the
+        // ngx-translate providers (TranslateStore is not `providedIn: 'root'`
+        // in @ngx-translate/core@16).
+        ...provideTestTranslate()
       ]
     }).compileComponents();
+
+    mockRouter = TestBed.inject(Router);
+    spyOn(mockRouter, 'navigate');
 
     fixture = TestBed.createComponent(ChangePasswordComponent);
     component = fixture.componentInstance;
@@ -42,7 +73,7 @@ describe('ChangePasswordComponent', () => {
     component.newPassword = '';
     component.confirmPassword = '';
     await component.onSubmit();
-    expect(component.error).toBe('Please fill in all fields');
+    expect(component.error).toBe(elCopy('common.fillAll'));
     expect(mockAuthService.changePassword).not.toHaveBeenCalled();
   });
 
@@ -51,7 +82,9 @@ describe('ChangePasswordComponent', () => {
     component.newPassword = 'short';
     component.confirmPassword = 'short';
     await component.onSubmit();
-    expect(component.error).toMatch(/at least 8/);
+    expect(component.error).toBe(
+      elCopy('common.passwordMin', { min: MIN_PASSWORD_LENGTH })
+    );
     expect(mockAuthService.changePassword).not.toHaveBeenCalled();
   });
 
@@ -60,7 +93,7 @@ describe('ChangePasswordComponent', () => {
     component.newPassword = 'newPassword456';
     component.confirmPassword = 'newPassword789';
     await component.onSubmit();
-    expect(component.error).toBe('New passwords do not match');
+    expect(component.error).toBe(elCopy('auth.change.mismatch'));
     expect(mockAuthService.changePassword).not.toHaveBeenCalled();
   });
 
@@ -69,9 +102,7 @@ describe('ChangePasswordComponent', () => {
     component.newPassword = 'samePassword1';
     component.confirmPassword = 'samePassword1';
     await component.onSubmit();
-    expect(component.error).toBe(
-      'New password must be different from your current password'
-    );
+    expect(component.error).toBe(elCopy('auth.change.sameAsCurrent'));
     expect(mockAuthService.changePassword).not.toHaveBeenCalled();
   });
 
@@ -96,6 +127,8 @@ describe('ChangePasswordComponent', () => {
   it('should surface server error and stop loading on failure', fakeAsync(() => {
     mockAuthService.changePassword.and.resolveTo({
       ok: false,
+      kind: 'password_change_failed',
+      code: 'password_change_failed',
       error: 'Password change failed',
       status: 400
     });
@@ -106,7 +139,10 @@ describe('ChangePasswordComponent', () => {
     component.onSubmit();
     tick();
 
-    expect(component.error).toBe('Password change failed');
+    // The rendered copy is the TRANSLATED one picked by the backend's
+    // `code` — the raw English server prose never reaches the user.
+    expect(component.error).toBe(elCopy('auth.errors.passwordChangeFailed'));
+    expect(component.error).not.toContain('Password change failed');
     expect(component.success).toBeFalse();
     expect(component.isLoading).toBeFalse();
   }));
@@ -123,7 +159,9 @@ describe('ChangePasswordComponent', () => {
     const links = fixture.debugElement.queryAll(By.css('.auth-links a.auth-link'));
     expect(links.length).toBe(1);
     expect(links[0].nativeElement.getAttribute('href')).toBe('/chat');
-    expect(links[0].nativeElement.textContent).toContain('Back to workspace');
+    expect(links[0].nativeElement.textContent).toContain(
+      elCopy('auth.change.backToWorkspace')
+    );
   });
 
   it('starts with all three password peek toggles hidden', () => {

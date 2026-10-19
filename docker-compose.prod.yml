@@ -39,6 +39,12 @@ services:
       - OLLAMA_EMBED_MODEL=bge-m3
       - OLLAMA_EMBED_DIM=1024
       - OLLAMA_CHAT_MODEL=gemma2b-mmap
+      # Phase 1-6: local speech-to-text (see the `whisper` sidecar below).
+      # Audio stays on the deployment; WHISPER_URL can point at an external
+      # OpenAI-compatible STT service if one is provided deliberately.
+      - WHISPER_URL=${WHISPER_URL:-http://whisper:8000}
+      - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}
+      - WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
       - STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}
       - STRIPE_PRICE_ID_PRO=${STRIPE_PRICE_ID_PRO:-}
@@ -48,15 +54,32 @@ services:
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set for production}
       - CORS_ORIGINS=${CORS_ORIGINS:-https://your-domain.gr}
       - APP_BASE_URL=${APP_BASE_URL:-https://your-domain.gr}
+      # P0-6: production email is mandatory — the backend refuses to boot
+      # without SMTP configured (verification + reset emails are otherwise
+      # silently undeliverable). SMTP_HOST/EMAIL_FROM are required at
+      # compose time so misconfiguration fails before containers start.
+      - EMAIL_TRANSPORT=smtp
+      - EMAIL_FROM=${EMAIL_FROM:?EMAIL_FROM must be set for production}
+      - SMTP_HOST=${SMTP_HOST:?SMTP_HOST must be set for production}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_SECURE=${SMTP_SECURE:-false}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
       - TRUST_PROXY=uniquelocal,loopback
       - RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}
       - RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}
       - RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}
       - ADMIN_MAGIC_LINK_ENABLED=${ADMIN_MAGIC_LINK_ENABLED:-false}
+      # Phase 1-8: scraper output consumed by the ingest script; bind-mounted
+      # read-only below. Regenerate on the host and re-run the ingest command.
+      - SCRAPED_LAWS_PATH=/usr/src/app/scraped_laws.json
+    volumes:
+      - ./scraped_laws.json:/usr/src/app/scraped_laws.json:ro
     depends_on:
       - db
       - redis
       - ollama
+      - whisper
     networks:
       - nomos-prod-network
     restart: always
@@ -65,7 +88,7 @@ services:
     build:
       context: ./frontend
     ports:
-      - "80:4200" # Mapping to port 80 for production access
+      - "80:80" # nginx serves the production bundle on port 80
     depends_on:
       - backend
     networks:
@@ -102,6 +125,34 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Phase 1-6: local speech-to-text (STT) sidecar. Same OpenAI-compatible
+  # speaches/faster-whisper image as dev, CPU variant (no GPU reservation —
+  # GPU is reserved for the chat/embedding Ollama above). No published ports:
+  # audio only travels over the internal compose network.
+  #
+  # Model: `Systran/faster-whisper-base`, pre-downloaded into the named cache
+  # volume at boot. Bump WHISPER_MODEL + PRELOAD_MODELS together (and
+  # WHISPER_TIMEOUT_MS for long clips). CPU-only caveat: `base` transcribes at
+  # roughly 1–3× real time on a 4-core host, so a 10-minute recording can take
+  # minutes — size the deploy (or switch to the CUDA image) accordingly.
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    environment:
+      - WHISPER__INFERENCE_DEVICE=cpu
+      - WHISPER__COMPUTE_TYPE=int8
+      - 'PRELOAD_MODELS=["${WHISPER_MODEL:-Systran/faster-whisper-base}"]'
+    volumes:
+      - whisper_cache_prod:/home/ubuntu/.cache/huggingface/hub
+    networks:
+      - nomos-prod-network
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+
   # Phase 29: daily DB backup (pg_dump, custom format). Wire the cron
   # inside the container to run backupDb.js at 02:00.
   backup:
@@ -110,6 +161,7 @@ services:
       - ./backend:/app/backend
       - ./database:/app/database
       - backups_prod:/backups
+      - prom_textfile_prod:/prom-textfile
     environment:
       - DB_HOST=db
       - DB_PORT=5432
@@ -117,6 +169,9 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
       - DB_NAME=nomos_db
       - BACKUP_DIR=/backups
+      # 3-1: publish backup freshness for the BackupStale alert. The path is
+      # a named volume read by node_exporter's textfile collector below.
+      - PROM_TEXTFILE_DIR=/prom-textfile
     entrypoint: >
       /bin/sh -c "apk add --no-cache postgresql-client > /dev/null 2>&1
       && echo '0 2 * * * cd /app/backend && node src/scripts/backupDb.js' > /etc/crontabs/root
@@ -127,29 +182,93 @@ services:
       - nomos-prod-network
     restart: always
 
-  # Phase 29: monitoring stack (Prometheus scrapes /metrics, Grafana charts).
-  prometheus:
-    image: prom/prometheus:latest
+  # 1-5: daily data-retention sweep. Mirrors the `backup` cron sidecar:
+  # runs `retentionCleanup.js` at 03:00 inside the container. The script
+  # prints a per-table summary and records it via the audit log.
+  # Semantics: conversations are pruned by updated_at (active chats
+  # survive), legal_documents + audit_log by created_at.
+  retention:
+    image: node:20-alpine
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
+      - ./backend:/app/backend
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=nomos_admin
+      - DB_PASSWORD=${DB_PASSWORD:-secure_prod_password}
+      - DB_NAME=nomos_db
+      - RETENTION_CONVERSATIONS_DAYS=${RETENTION_CONVERSATIONS_DAYS:-365}
+      - RETENTION_DOCUMENTS_DAYS=${RETENTION_DOCUMENTS_DAYS:-365}
+      - RETENTION_AUDIT_LOG_DAYS=${RETENTION_AUDIT_LOG_DAYS:-90}
+    entrypoint: >
+      /bin/sh -c "echo '0 3 * * * cd /app/backend && node src/scripts/retentionCleanup.js' > /etc/crontabs/root
+      && crond -f"
+    depends_on:
+      - db
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  # 3-1: observability stack. Prometheus and both exporters are internal-only
+  # (no published ports). Grafana binds to localhost only; access it through
+  # an SSH tunnel (`ssh -L 3001:127.0.0.1:3001 user@host`) or a reverse proxy
+  # with TLS/auth. Dashboards and datasources are provisioned read-only.
+  prometheus:
+    image: prom/prometheus:v2.54.1
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-    ports:
-      - "9090:9090"
+      - '--storage.tsdb.retention.time=30d'
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - backend
     networks:
       - nomos-prod-network
     restart: always
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.2.0
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3001:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  # Redis signal for the RedisDown alert (redis_up).
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - nomos-prod-network
+    restart: always
+
+  # Host disk/CPU/memory plus the backup-freshness textfile collector. The
+  # backup sidecar writes nomos_backup.prom into the shared prom_textfile_prod
+  # volume; node_exporter exposes it as nomos_backup_last_success_timestamp_seconds.
+  node_exporter:
+    image: prom/node-exporter:v1.8.2
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.textfile.directory=/prom-textfile'
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      - prom_textfile_prod:/prom-textfile:ro
     networks:
       - nomos-prod-network
     restart: always
@@ -158,9 +277,11 @@ volumes:
   pgdata_prod:
   redisdata_prod:
   ollama_models_prod:
+  whisper_cache_prod:
   backups_prod:
   prometheus_data:
   grafana_data:
+  prom_textfile_prod:
 
 networks:
   nomos-prod-network:

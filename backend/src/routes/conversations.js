@@ -9,6 +9,10 @@ const router = express.Router();
 const db = require('../config/db');
 const { validate } = require('../middlewares/validation');
 const { check } = require('express-validator');
+const { createApiRateLimiters } = require('../middlewares/rateLimiters');
+
+// 1-3: per-user caps on the list/create hot paths (see rateLimiters.js).
+const limiters = createApiRateLimiters();
 
 const DEFAULT_TITLE = 'Νέα συνομιλία';
 
@@ -17,20 +21,38 @@ function parsePositiveInt(raw) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
-// GET /api/conversations?limit=20&offset=0 — list user's conversations
-router.get('/', async (req, res) => {
+// GET /api/conversations?limit=20&offset=0&q= — list user's conversations
+//
+// `q` is an optional case-insensitive title filter (parameterized — never
+// interpolated into SQL). `total` is the full match count so the UI can
+// paginate; the original `conversations` array shape is unchanged.
+router.get('/', limiters.conversationList, async (req, res) => {
   try {
     const limit = Math.min(Number.parseInt(req.query.limit, 10) || 20, 100);
     const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 255) : '';
+
+    const params = [req.user.id, limit, offset];
+    let searchSql = '';
+    if (q) {
+      params.push(`%${q}%`);
+      searchSql = ` AND title ILIKE $${params.length}`;
+    }
+
+    // COUNT(*) OVER() returns the total across the filtered set in the same
+    // round-trip as the page, so an empty page simply reports 0.
     const result = await db.query(
-      `SELECT id, title, created_at, updated_at
+      `SELECT id, title, created_at, updated_at, COUNT(*) OVER() AS total_count
        FROM conversations
-       WHERE user_id = $1
+       WHERE user_id = $1${searchSql}
        ORDER BY updated_at DESC, id DESC
        LIMIT $2 OFFSET $3`,
-      [req.user.id, limit, offset]
+      params
     );
-    res.json({ conversations: result.rows });
+    const conversations = result.rows.map(({ total_count, ...conversation }) => conversation);
+    const rawTotal = result.rows.length > 0 ? Number(result.rows[0].total_count) : 0;
+    const total = Number.isFinite(rawTotal) ? rawTotal : result.rows.length;
+    res.json({ conversations, total });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -39,6 +61,7 @@ router.get('/', async (req, res) => {
 // POST /api/conversations — create (title optional, auto-generated)
 router.post(
   '/',
+  limiters.conversationCreate,
   validate([check('title').optional({ values: 'null' }).isString().isLength({ max: 255 })]),
   async (req, res) => {
     try {

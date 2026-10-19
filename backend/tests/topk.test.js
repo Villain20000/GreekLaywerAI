@@ -118,9 +118,9 @@ describe('ragService top-K default (Phase 34 regression lock)', () => {
       expect(res.statusCode).toEqual(200);
       expect(ragService.retrieveContext).toHaveBeenCalledTimes(1);
 
-      // The audio-query route uses a hard-coded mockTranscription
-      // constant — we don't assert on the value, only on no explicit
-      // limit override.
+      // The audio-query route forwards the whisper transcript as the
+      // retrieval query — we don't assert on the value here, only on no
+      // explicit limit override.
       const callArgs = ragService.retrieveContext.mock.calls[0];
       expect(callArgs.length === 1 || callArgs[1] === undefined).toBe(true);
     });

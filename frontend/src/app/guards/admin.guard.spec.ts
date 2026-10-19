@@ -64,9 +64,13 @@ describe('adminGuard (observable pipeline)', () => {
 
   it('does not subscribe to user$ until ready$ resolves', () => {
     const auth = buildAuth({ ready: false });
-    setup(auth); // discard the guard result; we only care about subscription timing
+    const guard$ = setup(auth);
+    // The guard returns a cold Observable; subscription only happens when the
+    // router runs the guard, so drive it explicitly here.
+    const subscription = guard$.subscribe();
     expect(auth.__ready.observed).toBe(true);
     expect(auth.__user.observed).toBe(false);
+    subscription.unsubscribe();
   });
 
   it('allows admins through after ready$ resolves and user$ emits admin', async () => {

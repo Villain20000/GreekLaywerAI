@@ -4,6 +4,7 @@ const db = require('../src/config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const inferenceQueue = require('../src/services/inferenceQueue');
+const { AUTH_ERROR_CODES } = require('../src/constants/authErrors');
 
 const JWT_SECRET = 'nomos-super-secret-key-development';
 
@@ -61,7 +62,7 @@ describe('NomosAI API Endpoints', () => {
 
   // Phase 22: reset db.query ONLY. jest.resetAllMocks() is too aggressive —
   // it would wipe the `mockResolvedValue` / `mockImplementation` defaults
-  // set on ollamaService.retrieveContext / ollamaService.streamResponse /
+  // set on ollamaService.generateResponse /
   // ragService.formatContextForGemma in tests/app.js, turning AI tests'
   // mocked `Mock response` into `undefined` and hanging the audio-query
   // response stream. Targeted mockReset() preserves the module-scoped mocks
@@ -125,6 +126,8 @@ describe('NomosAI API Endpoints', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body).toHaveProperty('error', 'User already exists');
+      // Machine-readable companion to the (unchanged) error string.
+      expect(res.body.code).toBe('email_taken');
     });
 
     it('should hash-set a sha256 verify-token and INSERT into email_verification_tokens on register', async () => {
@@ -210,6 +213,37 @@ describe('NomosAI API Endpoints', () => {
       expect(decoded.tv).toBe(1);
     });
 
+    it('should normalize login email case/whitespace to the stored lowercase form', async () => {
+      const mockHashedPassword = await bcrypt.hash('password123', 10);
+      db.query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            email: 'ent@nomos.ai',
+            password_hash: mockHashedPassword,
+            role: 'enterprise',
+            subscription_tier: 'enterprise',
+            token_version: 1,
+            verified_at: new Date('2026-01-01T00:00:00Z')
+          }
+        ]
+      });
+
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ email: '  Ent@Nomos.AI  ', password: 'password123' });
+
+      expect(res.statusCode).toEqual(200);
+      expect(res.body).toHaveProperty('token');
+      // The SELECT must receive the normalized email — not the raw body —
+      // otherwise a mixed-case registration could never log in.
+      const selectCall = db.query.mock.calls.find(
+        ([sql]) => typeof sql === 'string' && /FROM users WHERE email = \$1/.test(sql)
+      );
+      expect(selectCall).toBeDefined();
+      expect(selectCall[1][0]).toBe('ent@nomos.ai');
+    });
+
     it('should reject login for unverified accounts with the canonical "Email not verified" message', async () => {
       const mockHashedPassword = await bcrypt.hash('password123', 10);
       db.query.mockResolvedValueOnce({
@@ -233,6 +267,9 @@ describe('NomosAI API Endpoints', () => {
 
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toMatch(/Email not verified/);
+      // The stable code the client should branch on instead of matching
+      // the English prose above.
+      expect(res.body.code).toBe('unverified_email');
       expect(res.body.token).toBeUndefined();
     });
 
@@ -267,6 +304,7 @@ describe('NomosAI API Endpoints', () => {
 
       expect(res.statusCode).toEqual(403);
       expect(res.body).toHaveProperty('error', 'Cannot self-register as admin');
+      expect(res.body.code).toBe('admin_registration_forbidden');
     });
 
     // (Phase 18 test: anonymous /me still 401s.)
@@ -534,14 +572,14 @@ describe('NomosAI API Endpoints', () => {
       expect(res.body).toHaveProperty('response', 'Mock response');
     });
 
-    it('should block user-role from premium audio-query with 403', async () => {
-      queueAuth({ id: 2, role: 'user' });
+    it('should block user-role basic-tier from premium audio-query with 403', async () => {
+      queueAuth({ id: 2, role: 'user', subscription_tier: 'basic' });
       const res = await request(app)
         .post('/api/ai/audio-query')
         .set('Authorization', `Bearer ${userToken}`)
         .attach('audio', Buffer.from('fake-audio-data'), 'test.webm');
       expect(res.statusCode).toEqual(403);
-      expect(res.body).toHaveProperty('error', 'Access denied. Insufficient permissions.');
+      expect(res.body.error).toMatch(/requires the pro subscription tier/i);
     });
 
     // Phase 29: audio-query now enqueues an inference job and returns its
@@ -558,6 +596,28 @@ describe('NomosAI API Endpoints', () => {
       expect(res.body).toHaveProperty('jobId');
     });
 
+    it('should allow user-role PRO-tier to use audio-query (tier, not role, is the gate)', async () => {
+      queueAuth({ id: 2, role: 'user', subscription_tier: 'pro' });
+      const webm = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('fake-audio')]);
+      const res = await request(app)
+        .post('/api/ai/audio-query')
+        .set('Authorization', `Bearer ${userToken}`)
+        .attach('audio', webm, 'test.webm');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body).toHaveProperty('jobId');
+    });
+
+    it('should allow admin (basic tier) to bypass the tier gate', async () => {
+      queueAuth({ id: 99, role: 'admin', subscription_tier: 'basic' });
+      const webm = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('fake-audio')]);
+      const res = await request(app)
+        .post('/api/ai/audio-query')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .attach('audio', webm, 'test.webm');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body).toHaveProperty('jobId');
+    });
+
     it('should reject audio uploads whose magic bytes do not match an allowed audio type', async () => {
       queueAuth({ id: 1, role: 'enterprise', subscription_tier: 'enterprise' });
       const res = await request(app)
@@ -568,13 +628,24 @@ describe('NomosAI API Endpoints', () => {
       expect(res.body.error).toMatch(/Unsupported file type/);
     });
 
-    it('should block user-role from multimodal upload with 403', async () => {
-      queueAuth({ id: 2, role: 'user' });
+    it('should block user-role basic-tier from multimodal upload with 403', async () => {
+      queueAuth({ id: 2, role: 'user', subscription_tier: 'basic' });
       const res = await request(app)
         .post('/api/ai/multimodal')
         .set('Authorization', `Bearer ${userToken}`)
         .attach('file', Buffer.from('fake-pdf-data'), 'document.pdf');
       expect(res.statusCode).toEqual(403);
+      expect(res.body.error).toMatch(/requires the enterprise subscription tier/i);
+    });
+
+    it('should block user-role PRO-tier from multimodal upload with 403 (enterprise required)', async () => {
+      queueAuth({ id: 2, role: 'user', subscription_tier: 'pro' });
+      const res = await request(app)
+        .post('/api/ai/multimodal')
+        .set('Authorization', `Bearer ${userToken}`)
+        .attach('file', Buffer.from('fake-pdf-data'), 'document.pdf');
+      expect(res.statusCode).toEqual(403);
+      expect(res.body.error).toMatch(/requires the enterprise subscription tier/i);
     });
 
     // Phase 29: multimodal requires the enterprise tier AND valid PDF magic
@@ -585,6 +656,17 @@ describe('NomosAI API Endpoints', () => {
       const res = await request(app)
         .post('/api/ai/multimodal')
         .set('Authorization', `Bearer ${enterpriseToken}`)
+        .attach('file', pdf, 'document.pdf');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body).toHaveProperty('response');
+    });
+
+    it('should allow user-role ENTERPRISE-tier to use multimodal upload', async () => {
+      queueAuth({ id: 2, role: 'user', subscription_tier: 'enterprise' });
+      const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.from('fake-pdf-data')]);
+      const res = await request(app)
+        .post('/api/ai/multimodal')
+        .set('Authorization', `Bearer ${userToken}`)
         .attach('file', pdf, 'document.pdf');
       expect(res.statusCode).toEqual(200);
       expect(res.body).toHaveProperty('response');
@@ -721,6 +803,112 @@ describe('NomosAI API Endpoints', () => {
         .set('Authorization', `Bearer ${adminToken}`)
         .send({ role: 'super-admin' });
       expect(res.statusCode).toEqual(400);
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // Machine-readable auth error codes.
+  //
+  // The Angular client used to classify auth failures by matching the
+  // server's ENGLISH PROSE (e.g. `data.error.startsWith('Email not
+  // verified')`). That is brittle: rewording a message silently breaks
+  // the client. Every auth error response now carries a stable `code`.
+  //
+  // These tests pin BOTH halves of the contract:
+  //   1. the `code` vocabulary is small, frozen and snake_case, and
+  //   2. the human-readable `error` strings are BYTE-FOR-BYTE unchanged
+  //      (a concurrent frontend effort depends on them).
+  // ------------------------------------------------------------------------
+  describe('Auth error codes (machine-readable)', () => {
+    it('exposes a small, frozen, unique, snake_case vocabulary', () => {
+      const values = Object.values(AUTH_ERROR_CODES);
+
+      // Frozen: a consumer cannot mutate the shared map.
+      expect(Object.isFrozen(AUTH_ERROR_CODES)).toBe(true);
+
+      // Unique: no two names may share a wire value.
+      expect(new Set(values).size).toBe(values.length);
+
+      // Small: the vocabulary is a fixed, documented set, not a free-for-all.
+      expect(values.length).toBeLessThanOrEqual(20);
+
+      // Stable shape: lower snake_case, no spaces, no punctuation surprises.
+      for (const value of values) {
+        expect(value).toMatch(/^[a-z][a-z0-9_]*$/);
+      }
+
+      // The values the client actually branches on are pinned verbatim.
+      expect(AUTH_ERROR_CODES.UNVERIFIED_EMAIL).toBe('unverified_email');
+      expect(AUTH_ERROR_CODES.INVALID_CREDENTIALS).toBe('invalid_credentials');
+      expect(AUTH_ERROR_CODES.EMAIL_TAKEN).toBe('email_taken');
+      expect(AUTH_ERROR_CODES.INVALID_TOKEN).toBe('invalid_token');
+      expect(AUTH_ERROR_CODES.REQUEST_ACCEPTED).toBe('request_accepted');
+    });
+
+    it('re-exports the same map from routes/auth.js (single source of truth)', () => {
+      expect(require('../src/routes/auth').AUTH_ERROR_CODES).toBe(AUTH_ERROR_CODES);
+    });
+
+    it('keeps the human-readable error strings byte-for-byte unchanged', async () => {
+      // Golden strings. If one of these changes, the frontend's prose
+      // matching (and any other client) breaks — that is a breaking change
+      // and must be a deliberate, reviewed edit.
+      const mockHashedPassword = await bcrypt.hash('password123', 4);
+
+      // 1. login — unknown address / wrong password → generic 400.
+      db.query.mockResolvedValueOnce({ rows: [] });
+      const badLogin = await request(app)
+        .post('/api/auth/login')
+        .send({ email: 'ghost@nomos.ai', password: 'password123' });
+      expect(badLogin.statusCode).toEqual(400);
+      expect(badLogin.body.error).toBe('Invalid credentials');
+      expect(badLogin.body.code).toBe('invalid_credentials');
+
+      // 2. login — unverified account.
+      db.query.mockResolvedValueOnce({
+        rows: [{
+          id: 1,
+          email: 'pending@nomos.ai',
+          password_hash: mockHashedPassword,
+          role: 'user',
+          subscription_tier: 'basic',
+          token_version: 1,
+          verified_at: null
+        }]
+      });
+      const unverified = await request(app)
+        .post('/api/auth/login')
+        .send({ email: 'pending@nomos.ai', password: 'password123' });
+      expect(unverified.statusCode).toEqual(400);
+      expect(unverified.body.error).toBe(
+        'Email not verified. Check your inbox for the verification link.'
+      );
+      expect(unverified.body.code).toBe('unverified_email');
+
+      // 3. register — address already taken.
+      db.query.mockResolvedValueOnce({ rows: [{ id: 1 }] });
+      const taken = await request(app)
+        .post('/api/auth/register')
+        .send({ email: 'taken@nomos.ai', password: 'password123' });
+      expect(taken.statusCode).toEqual(400);
+      expect(taken.body.error).toBe('User already exists');
+      expect(taken.body.code).toBe('email_taken');
+
+      // 4. verify-email — invalid / expired token.
+      const badVerify = await request(app)
+        .post('/api/auth/verify-email')
+        .send({ token: 'not-hex' });
+      expect(badVerify.statusCode).toEqual(400);
+      expect(badVerify.body.error).toBe('Invalid or expired verification link');
+      expect(badVerify.body.code).toBe('invalid_token');
+
+      // 5. reset-password — invalid / expired token.
+      const badReset = await request(app)
+        .post('/api/auth/reset-password')
+        .send({ token: 'not-hex', newPassword: 'newSecret123' });
+      expect(badReset.statusCode).toEqual(400);
+      expect(badReset.body.error).toBe('Invalid or expired reset link');
+      expect(badReset.body.code).toBe('invalid_token');
     });
   });
 });

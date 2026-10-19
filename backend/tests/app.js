@@ -33,11 +33,6 @@ jest.mock('../src/config/db', () => ({
 }));
 jest.mock('../src/services/ollamaService', () => ({
   generateResponse: jest.fn().mockResolvedValue('Mock response'),
-  streamResponse: jest.fn().mockImplementation((prompt, context, res) => {
-    res.write('data: {"content": "Mock stream"}\n\n');
-    res.write('data: [DONE]\n\n');
-    res.end();
-  }),
   generateEmbedding: jest.fn().mockResolvedValue([0.1, 0.2, 0.3])
 }));
 jest.mock('../src/services/ragService', () => ({
@@ -63,6 +58,11 @@ jest.mock('../src/services/inferenceQueue', () => ({
 // Phase 29: mock the document pipeline (real PDF/DOCX parsing is exercised
 // by dedicated unit tests, not route tests).
 jest.mock('../src/services/documentService', () => ({
+  // Phase 1-7: /multimodal extracts text through this shared parser.
+  extractMetadata: jest.fn().mockResolvedValue({
+    meta: { size_bytes: 10, filename: 'doc.pdf', contentType: 'application/pdf', char_count: 18 },
+    text: 'Μοκ νομικό κείμενο εγγράφου.'
+  }),
   processAndStoreDocument: jest.fn().mockResolvedValue({
     document: {
       id: 1,
@@ -80,6 +80,18 @@ jest.mock('../src/services/documentService', () => ({
   ]),
   chunkText: jest.fn()
 }));
+// Phase 1-6: the whisper STT sidecar is a real HTTP dependency; route tests
+// drive this mock (unit coverage of the real client lives in
+// tests/transcription.test.js). TranscriptionError/ERROR_CODES are re-exported
+// from the real module so the route's typed error mapping stays exercised.
+jest.mock('../src/services/transcriptionService', () => {
+  const actual = jest.requireActual('../src/services/transcriptionService');
+  return {
+    transcribe: jest.fn().mockResolvedValue('Μεταγραμμένο κείμενο δοκιμής'),
+    TranscriptionError: actual.TranscriptionError,
+    ERROR_CODES: actual.ERROR_CODES
+  };
+});
 // Phase 23 + 24: stub the emailService dev-transport so test runs don't
 // spam the console with `[DEV-EMAIL] ...` lines. The focus tests register
 // + login in `api.test.js` don't introspect these mock calls; this mock

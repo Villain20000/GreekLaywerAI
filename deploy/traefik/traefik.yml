@@ -1,0 +1,52 @@
+# NomosAI staging — Traefik v3 static configuration.
+#
+# This file is mounted read-only into the `traefik` service in
+# docker-compose.staging.yml. Routing (routers/services/middlewares) comes
+# from Docker labels on the `frontend` container; certificates and the ACME
+# account are configured with CLI flags in compose because they depend on
+# STAGING_DOMAIN / ACME_EMAIL / STAGING_ACME_CA.
+#
+# Public HTTP (80) is redirected to HTTPS (443). The internal `traefik`
+# entrypoint (8080) is never published; it only exposes /ping for the
+# container healthcheck.
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+accessLog: {}
+
+api:
+  dashboard: false
+
+ping:
+  entryPoint: traefik
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      # nginx/Express normalize header names to underscores; drop aliasing
+      # names (X_Auth_User, X.Auth.User, …) so they cannot spoof X-Auth-User.
+      aliasHeadersStrategy: delete
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+    http:
+      aliasHeadersStrategy: delete
+  # Internal-only liveness endpoint used by `traefik healthcheck --ping`.
+  traefik:
+    address: ":8080"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: "nomos-staging-network"

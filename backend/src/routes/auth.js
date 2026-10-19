@@ -6,6 +6,12 @@ const db = require('../config/db');
 const { authMiddleware, normalizeRole } = require('../middlewares/authMiddleware');
 const { createRateLimiters } = require('../middlewares/rateLimiters');
 const { sendPasswordReset, sendEmailVerification } = require('../services/emailService');
+const { logAudit } = require('../services/auditLog');
+// Stable, machine-readable error codes. Every error response below carries
+// a `code` next to its (unchanged) human-readable `error` string so clients
+// can branch on the code instead of pattern-matching English prose.
+// See src/constants/authErrors.js for the full contract.
+const { AUTH_ERROR_CODES } = require('../constants/authErrors');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'nomos-super-secret-key-development';
 const MIN_PASSWORD_LENGTH = 8;
@@ -83,18 +89,25 @@ function buildAuthRouter(options = {}) {
     try {
       // Hard block: reject admin self-promotion before any other validation.
       if (req.body && req.body.role === 'admin') {
-        return res.status(403).json({ error: 'Cannot self-register as admin' });
+        return res.status(403).json({
+          error: 'Cannot self-register as admin',
+          code: AUTH_ERROR_CODES.ADMIN_REGISTRATION_FORBIDDEN
+        });
       }
 
       const { email, password } = req.body;
 
       if (!email || !password) {
-        return res.status(400).json({ error: 'Email and password required' });
+        return res.status(400).json({
+          error: 'Email and password required',
+          code: AUTH_ERROR_CODES.INVALID_REQUEST
+        });
       }
 
       if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
         return res.status(400).json({
-          error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`
+          error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
+          code: AUTH_ERROR_CODES.INVALID_REQUEST
         });
       }
 
@@ -105,7 +118,10 @@ function buildAuthRouter(options = {}) {
         [normalizedEmail]
       );
       if (existing.rows.length > 0) {
-        return res.status(400).json({ error: 'User already exists' });
+        return res.status(400).json({
+          error: 'User already exists',
+          code: AUTH_ERROR_CODES.EMAIL_TAKEN
+        });
       }
 
       const salt = await bcrypt.genSalt(12);
@@ -163,10 +179,13 @@ function buildAuthRouter(options = {}) {
       // signup races surfaces here. Translate to 400 with the same copy
       // the synchronous duplicate-check returns.
       if (error && error.code === '23505' && error.constraint === 'users_email_key') {
-        return res.status(400).json({ error: 'User already exists' });
+        return res.status(400).json({
+          error: 'User already exists',
+          code: AUTH_ERROR_CODES.EMAIL_TAKEN
+        });
       }
       console.error('Registration Error:', error);
-      res.status(500).json({ error: 'Server error' });
+      res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
     }
   });
 
@@ -185,33 +204,76 @@ function buildAuthRouter(options = {}) {
       const { email, password } = req.body;
 
       if (!email || !password) {
-        return res.status(400).json({ error: 'Email and password required' });
+        return res.status(400).json({
+          error: 'Email and password required',
+          code: AUTH_ERROR_CODES.INVALID_REQUEST
+        });
       }
+
+      // Email lookups MUST match the normalized (trim+lowercase) form
+      // persisted by /register and /forgot-password. Querying the raw body
+      // meant `User@x.com` could register but never log in.
+      const normalizedEmail = String(email).trim().toLowerCase();
 
       const result = await db.query(
         `SELECT id, email, password_hash, role, subscription_tier, token_version, verified_at
          FROM users WHERE email = $1`,
-        [email]
+        [normalizedEmail]
       );
       if (result.rows.length === 0) {
+        // 1-11: audit failed logins so credential-stuffing attempts leave a
+        // trail. Fire-and-forget (logAudit is fail-open and never throws);
+        // only the SUBMITTED email is recorded as the resource id — never
+        // the password, and no user id (the account may not exist).
+        logAudit({
+          action: 'auth.login_failed',
+          resourceType: 'user',
+          resourceId: normalizedEmail,
+          ipAddress: req.ip,
+          newValue: { reason: 'unknown_email' }
+        });
         // Generic "Invalid credentials" — same as for wrong-password on a
         // verified account — so we don't leak whether the email exists.
-        return res.status(400).json({ error: 'Invalid credentials' });
+        // The `code` is identical for both failure kinds too, so the code
+        // carries no enumeration signal either.
+        return res.status(400).json({
+          error: 'Invalid credentials',
+          code: AUTH_ERROR_CODES.INVALID_CREDENTIALS
+        });
       }
 
       const user = result.rows[0];
       const isMatch = await bcrypt.compare(password, user.password_hash);
       if (!isMatch) {
-        return res.status(400).json({ error: 'Invalid credentials' });
+        // 1-11: same audit shape as the unknown-email branch so operators
+        // can distinguish "no such account" from "bad password" without the
+        // client ever seeing that difference (response stays byte-identical).
+        logAudit({
+          action: 'auth.login_failed',
+          resourceType: 'user',
+          resourceId: normalizedEmail,
+          ipAddress: req.ip,
+          newValue: { reason: 'bad_password' }
+        });
+        return res.status(400).json({
+          error: 'Invalid credentials',
+          code: AUTH_ERROR_CODES.INVALID_CREDENTIALS
+        });
       }
 
       // Phase 24: unverified accounts cannot mint JWTs. The 400 message is
       // a static string the LoginComponent pattern-matches on to surface
       // a "Resend verification email" button. Do NOT change this copy
       // without updating LoginComponent's unverified-state detector.
+      //
+      // The `code` is the stable, machine-readable counterpart: clients
+      // should branch on `code === 'unverified_email'` instead of matching
+      // the English prose (which is exactly the fragility this field
+      // removes). The prose stays for backwards compatibility.
       if (user.verified_at === null) {
         return res.status(400).json({
-          error: 'Email not verified. Check your inbox for the verification link.'
+          error: 'Email not verified. Check your inbox for the verification link.',
+          code: AUTH_ERROR_CODES.UNVERIFIED_EMAIL
         });
       }
 
@@ -230,7 +292,7 @@ function buildAuthRouter(options = {}) {
       });
     } catch (error) {
       console.error('Login Error:', error);
-      res.status(500).json({ error: 'Server error' });
+      res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
     }
   });
 
@@ -244,7 +306,7 @@ function buildAuthRouter(options = {}) {
    * request naturally. If authMiddleware passed, the user exists — the
    * former 404 path is unreachable (authMiddleware 401s on missing user).
    */
-  router.get('/me', authMiddleware, async (req, res) => {
+  router.get('/me', authMiddleware, limiters.me, async (req, res) => {
     try {
       res.json({
         user: {
@@ -269,7 +331,7 @@ function buildAuthRouter(options = {}) {
       });
     } catch (error) {
       console.error('Auth /me error:', error);
-      res.status(500).json({ error: 'Server error' });
+      res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
     }
   });
 
@@ -312,12 +374,16 @@ function buildAuthRouter(options = {}) {
           currentPassword.length === 0 ||
           newPassword.length === 0
         ) {
-          return res.status(400).json({ error: 'Current and new password required' });
+          return res.status(400).json({
+            error: 'Current and new password required',
+            code: AUTH_ERROR_CODES.INVALID_REQUEST
+          });
         }
 
         if (newPassword.length < MIN_PASSWORD_LENGTH) {
           return res.status(400).json({
-            error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`
+            error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
+            code: AUTH_ERROR_CODES.INVALID_REQUEST
           });
         }
 
@@ -327,18 +393,27 @@ function buildAuthRouter(options = {}) {
         );
         if (lookup.rows.length === 0) {
           // JWT pointed at a deleted user.
-          return res.status(401).json({ error: 'User not found' });
+          return res.status(401).json({
+            error: 'User not found',
+            code: AUTH_ERROR_CODES.USER_NOT_FOUND
+          });
         }
         const stored = lookup.rows[0].password_hash;
 
         const matches = await bcrypt.compare(currentPassword, stored);
         if (!matches) {
-          return res.status(400).json({ error: 'Password change failed' });
+          return res.status(400).json({
+            error: 'Password change failed',
+            code: AUTH_ERROR_CODES.PASSWORD_CHANGE_FAILED
+          });
         }
 
         // Defensive: don't silently accept a no-op rotation.
         if (await bcrypt.compare(newPassword, stored)) {
-          return res.status(400).json({ error: 'Password change failed' });
+          return res.status(400).json({
+            error: 'Password change failed',
+            code: AUTH_ERROR_CODES.PASSWORD_CHANGE_FAILED
+          });
         }
 
         const salt = await bcrypt.genSalt(12);
@@ -364,7 +439,10 @@ function buildAuthRouter(options = {}) {
         );
 
         if (!updateResult.rowCount || updateResult.rowCount === 0) {
-          return res.status(409).json({ error: 'Password change failed' });
+          return res.status(409).json({
+            error: 'Password change failed',
+            code: AUTH_ERROR_CODES.PASSWORD_CHANGE_FAILED
+          });
         }
 
         const freshUser = updateResult.rows[0];
@@ -386,7 +464,7 @@ function buildAuthRouter(options = {}) {
         });
       } catch (error) {
         console.error('Change-password error:', error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
       }
     }
   );
@@ -396,11 +474,16 @@ function buildAuthRouter(options = {}) {
    *
    * Body: { email: string }. Public route.
    *
-   * Always returns 200 with `{ ok: true }` regardless of whether the email
-   * exists. Side-effects (token row insert, email send) only fire when the
-   * user exists — so attackers can't enumerate accounts via 200-vs-404 timing
-   * or response-body differences. A short random jitter (50-200 ms) further
-   * smooths response latency so a high-resolution timer can't distinguish.
+   * Always returns 200 with `{ ok: true, code: 'request_accepted' }`
+   * regardless of whether the email exists. Side-effects (token row insert,
+   * email send) only fire when the user exists — so attackers can't
+   * enumerate accounts via 200-vs-404 timing or response-body differences.
+   * A short random jitter (50-200 ms) further smooths response latency so a
+   * high-resolution timer can't distinguish.
+   *
+   * The `code` is deliberately the SAME for known, unknown and malformed
+   * addresses: a per-outcome code would reintroduce the account-enumeration
+   * oracle this route exists to prevent.
    *
    * Rate limits (stacked): per-IP 5/min + 20/hr (block spam bursts AND slow
    * burn), per-email 3/hr (stop an attacker from spamming one address).
@@ -433,7 +516,10 @@ function buildAuthRouter(options = {}) {
           // Even if the body is malformed, return the same generic 200 so
           // an attacker can't probe the validator (timing or otherwise).
           await jitter();
-          return res.status(200).json({ ok: true });
+          return res.status(200).json({
+            ok: true,
+            code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+          });
         }
 
         const lookup = await db.query(
@@ -468,12 +554,18 @@ function buildAuthRouter(options = {}) {
         }
 
         await jitter();
-        return res.status(200).json({ ok: true });
+        return res.status(200).json({
+          ok: true,
+          code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+        });
       } catch (error) {
         console.error('Forgot-password error:', error);
         // Always 200 on success-pathway failures too — no enumeration signal.
         await jitter();
-        res.status(200).json({ ok: true });
+        res.status(200).json({
+          ok: true,
+          code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+        });
       }
     }
   );
@@ -512,13 +604,19 @@ function buildAuthRouter(options = {}) {
           newPassword.length < MIN_PASSWORD_LENGTH
         ) {
           // Generic 400 — no signal about which check failed.
-          return res.status(400).json({ error: 'Invalid or expired reset link' });
+          return res.status(400).json({
+            error: 'Invalid or expired reset link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
 
         // Defensive: token must be hex of expected length (64 hex chars from
         // crypto.randomBytes(32)). Anything else short-circuits before DB.
         if (!/^[a-f0-9]{64}$/i.test(token)) {
-          return res.status(400).json({ error: 'Invalid or expired reset link' });
+          return res.status(400).json({
+            error: 'Invalid or expired reset link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
 
         const tokenHash = crypto
@@ -543,7 +641,10 @@ function buildAuthRouter(options = {}) {
           );
           if (lookupRes.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Invalid or expired reset link' });
+            return res.status(400).json({
+              error: 'Invalid or expired reset link',
+              code: AUTH_ERROR_CODES.INVALID_TOKEN
+            });
           }
 
           const tokenRowId = lookupRes.rows[0].id;
@@ -561,7 +662,10 @@ function buildAuthRouter(options = {}) {
             // Concurrent reset consumed the token between our SELECT and
             // this UPDATE.
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Invalid or expired reset link' });
+            return res.status(400).json({
+              error: 'Invalid or expired reset link',
+              code: AUTH_ERROR_CODES.INVALID_TOKEN
+            });
           }
 
           const salt = await bcrypt.genSalt(12);
@@ -580,7 +684,7 @@ function buildAuthRouter(options = {}) {
           );
           if (!userUpdate.rowCount) {
             await client.query('ROLLBACK');
-            return res.status(500).json({ error: 'Server error' });
+            return res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
           }
 
           const freshUser = userUpdate.rows[0];
@@ -607,7 +711,7 @@ function buildAuthRouter(options = {}) {
         }
       } catch (error) {
         console.error('Reset-password error:', error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
       }
     }
   );
@@ -645,10 +749,16 @@ function buildAuthRouter(options = {}) {
         const { token } = req.body || {};
 
         if (typeof token !== 'string') {
-          return res.status(400).json({ error: 'Invalid or expired verification link' });
+          return res.status(400).json({
+            error: 'Invalid or expired verification link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
         if (!/^[a-f0-9]{64}$/i.test(token)) {
-          return res.status(400).json({ error: 'Invalid or expired verification link' });
+          return res.status(400).json({
+            error: 'Invalid or expired verification link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
 
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
@@ -667,7 +777,10 @@ function buildAuthRouter(options = {}) {
           );
           if (lookupRes.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Invalid or expired verification link' });
+            return res.status(400).json({
+              error: 'Invalid or expired verification link',
+              code: AUTH_ERROR_CODES.INVALID_TOKEN
+            });
           }
 
           const tokenRowId = lookupRes.rows[0].id;
@@ -684,7 +797,10 @@ function buildAuthRouter(options = {}) {
           );
           if (!consumeRes.rowCount || consumeRes.rowCount === 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Invalid or expired verification link' });
+            return res.status(400).json({
+              error: 'Invalid or expired verification link',
+              code: AUTH_ERROR_CODES.INVALID_TOKEN
+            });
           }
 
           // Atomic verify + tv bump. verified_at=NOW() marks the user active
@@ -702,7 +818,7 @@ function buildAuthRouter(options = {}) {
           );
           if (!userUpdate.rowCount) {
             await client.query('ROLLBACK');
-            return res.status(500).json({ error: 'Server error' });
+            return res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
           }
 
           const freshUser = userUpdate.rows[0];
@@ -730,7 +846,7 @@ function buildAuthRouter(options = {}) {
         }
       } catch (error) {
         console.error('Verify-email error:', error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
       }
     }
   );
@@ -739,10 +855,11 @@ function buildAuthRouter(options = {}) {
    * Phase 24: Resend-verification.
    *
    * Body: { email: string }. Public route. Always returns 200 with
-   * `{ ok: true }` regardless of email existence — same anti-enumeration
-   * posture as /forgot-password. 50–200ms jitter smooths response-time
-   * differences between "email exists, send" and "email does not exist,
-   * skip".
+   * `{ ok: true, code: 'request_accepted' }` regardless of email existence —
+   * same anti-enumeration posture as /forgot-password. 50–200ms jitter
+   * smooths response-time differences between "email exists, send" and
+   * "email does not exist, skip". The `code` is identical in every case on
+   * purpose: a per-outcome code would be an enumeration oracle.
    *
    * Side effects when the user exists AND verified_at IS NULL:
    *   - Insert a fresh email_verification_tokens row with 24h expiry.
@@ -766,7 +883,10 @@ function buildAuthRouter(options = {}) {
             email.length > 320 ||
             !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
           await jitter();
-          return res.status(200).json({ ok: true });
+          return res.status(200).json({
+            ok: true,
+            code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+          });
         }
 
         const lookup = await db.query(
@@ -797,11 +917,17 @@ function buildAuthRouter(options = {}) {
         }
 
         await jitter();
-        return res.status(200).json({ ok: true });
+        return res.status(200).json({
+          ok: true,
+          code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+        });
       } catch (error) {
         console.error('Resend-verification error:', error);
         await jitter();
-        res.status(200).json({ ok: true });
+        res.status(200).json({
+          ok: true,
+          code: AUTH_ERROR_CODES.REQUEST_ACCEPTED
+        });
       }
     }
   );
@@ -843,6 +969,13 @@ function buildAuthRouter(options = {}) {
    *  - URL leaks via Referer / browser history — dev-only. The hard gate
    *    above is what prevents accidental prod exposure.
    *
+   * Audit note (1-11): the failure paths here are deliberately NOT written
+   * to audit_log. Invalid / expired / forged magic tokens are rejected
+   * *before* any DB read, and logging them would turn a tokenless
+   * brute-force probe into an unbounded DB-write vector. Failed-login
+   * auditing therefore lives only on /login (which is per-IP rate-limited);
+   * there is no password-login failure path in this route to audit.
+   *
    * Returns:
    *   - 200 with `{ ok, token, user }` matching the response shape of
    *     /reset-password and /verify-email. Same frontend swap path works.
@@ -861,12 +994,18 @@ function buildAuthRouter(options = {}) {
           process.env.NODE_ENV === 'production' &&
           process.env.ADMIN_MAGIC_LINK_ENABLED !== 'true'
         ) {
-          return res.status(404).json({ error: 'Not found' });
+          return res.status(404).json({
+            error: 'Not found',
+            code: AUTH_ERROR_CODES.NOT_FOUND
+          });
         }
 
         const { token } = req.body || {};
         if (typeof token !== 'string' || token.length === 0) {
-          return res.status(400).json({ error: 'Invalid or expired magic link' });
+          return res.status(400).json({
+            error: 'Invalid or expired magic link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
 
         let decoded;
@@ -875,14 +1014,20 @@ function buildAuthRouter(options = {}) {
         } catch (_err) {
           // Signature mismatch OR exp elapsed — same 400 as everything else
           // so no oracle distinguishes signature-failure from format-failure.
-          return res.status(400).json({ error: 'Invalid or expired magic link' });
+          return res.status(400).json({
+            error: 'Invalid or expired magic link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
 
         if (decoded.kind !== 'admin_magic') {
           // Reject tokens that are otherwise-valid session JWTs (no `kind`
           // claim) by treating the missing claim the same as a wrong one.
           // Defends against accidental cookie/header cross-flow replay.
-          return res.status(400).json({ error: 'Invalid or expired magic link' });
+          return res.status(400).json({
+            error: 'Invalid or expired magic link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
 
         const lookup = await db.query(
@@ -891,12 +1036,18 @@ function buildAuthRouter(options = {}) {
           [decoded.id]
         );
         if (lookup.rows.length === 0) {
-          return res.status(400).json({ error: 'Invalid or expired magic link' });
+          return res.status(400).json({
+            error: 'Invalid or expired magic link',
+            code: AUTH_ERROR_CODES.INVALID_TOKEN
+          });
         }
         const dbUser = lookup.rows[0];
         const role = normalizeRole(dbUser.role, dbUser.subscription_tier);
         if (role !== 'admin') {
-          return res.status(403).json({ error: 'Admin role required' });
+          return res.status(403).json({
+            error: 'Admin role required',
+            code: AUTH_ERROR_CODES.ADMIN_ROLE_REQUIRED
+          });
         }
 
         // Phase 22 atomicity + verify-folding:
@@ -920,7 +1071,7 @@ function buildAuthRouter(options = {}) {
           [dbUser.id]
         );
         if (!updateRes.rowCount) {
-          return res.status(500).json({ error: 'Server error' });
+          return res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
         }
         const freshUser = updateRes.rows[0];
         const newToken = signUserToken(freshUser);
@@ -947,7 +1098,7 @@ function buildAuthRouter(options = {}) {
         });
       } catch (error) {
         console.error('Admin-magic-link redeem error:', error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Server error', code: AUTH_ERROR_CODES.SERVER_ERROR });
       }
     }
   );
@@ -980,3 +1131,8 @@ const defaultRouter = buildAuthRouter();
 module.exports = defaultRouter;
 module.exports.buildAuthRouter = buildAuthRouter;
 module.exports.default = defaultRouter;
+// Re-exported so consumers can reach the vocabulary from either place:
+//   const { AUTH_ERROR_CODES } = require('../routes/auth');
+//   const { AUTH_ERROR_CODES } = require('../constants/authErrors');
+// The canonical definition lives in src/constants/authErrors.js.
+module.exports.AUTH_ERROR_CODES = AUTH_ERROR_CODES;

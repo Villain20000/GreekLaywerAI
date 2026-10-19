@@ -1,6 +1,36 @@
 const { Ollama } = require('ollama');
 
-const ollama = new Ollama({ host: process.env.OLLAMA_URL || 'http://127.0.0.1:11434' });
+// Phase 1-2: outbound HTTP timeout. A hung Ollama (cold model load, paging,
+// or a wedged process) must not pin an HTTP request or an inference worker
+// slot forever. ollama-js accepts a custom `fetch` in its config, so the
+// AbortSignal is injected once here and covers EVERY call (chat, embeddings,
+// warmup) without touching each request site. Env-overridable
+// (OLLAMA_TIMEOUT_MS) because a cold model load on slow hardware can
+// legitimately exceed the default.
+const OLLAMA_TIMEOUT_DEFAULT_MS = 120000;
+
+function getOllamaTimeoutMs() {
+  const parsed = Number(process.env.OLLAMA_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : OLLAMA_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * fetch() wrapper handed to the Ollama client. Every call gets
+ * AbortSignal.timeout(); an existing caller-provided signal is preserved and
+ * combined with AbortSignal.any where the runtime supports it.
+ */
+function timeoutFetch(url, options = {}) {
+  const timeoutSignal = AbortSignal.timeout(getOllamaTimeoutMs());
+  const signal = options.signal && typeof AbortSignal.any === 'function'
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : (options.signal || timeoutSignal);
+  return fetch(url, { ...options, signal });
+}
+
+const ollama = new Ollama({
+  host: process.env.OLLAMA_URL || 'http://127.0.0.1:11434',
+  fetch: timeoutFetch
+});
 const MODEL_NAME = process.env.OLLAMA_CHAT_MODEL || 'gemma:2b'; // Placeholder for gemma:4b or gemma:12b
 // Dedicated embedding model. Default to `bge-m3` because it emits
 // 1024-dim vectors — matching the `legislation_embeddings.embedding
@@ -47,37 +77,6 @@ async function generateResponse(prompt, context = '') {
   }
 }
 
-async function streamResponse(prompt, context = '', res) {
-  try {
-    const fullPrompt = context ? `Σχετική νομοθεσία (Context):\n${context}\n\nΕρώτημα πελάτη (Question):\n${prompt}` : prompt;
-    
-    const responseStream = await ollama.chat({
-      model: MODEL_NAME,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: fullPrompt }
-      ],
-      stream: true
-    });
-    
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    
-    for await (const chunk of responseStream) {
-      if (chunk.message && chunk.message.content) {
-        res.write(`data: ${JSON.stringify({ content: chunk.message.content })}\n\n`);
-      }
-    }
-    res.write('data: [DONE]\n\n');
-    res.end();
-  } catch (error) {
-    console.error('Ollama streaming error:', error);
-    res.write(`data: ${JSON.stringify({ error: 'Inference failed' })}\n\n`);
-    res.end();
-  }
-}
-
 // Generate embeddings via the local Ollama embedding model. This is the
 // real vectorizer for the RAG pipeline — it replaced a Math.random()-based
 // 768-dim placeholder because random vectors produced irrelevant
@@ -104,25 +103,6 @@ const warmupState = {
 };
 
 let warmupPromise = null;
-
-/**
- * Operator-driven recovery from a partial warmup failure (e.g. Ollama
- * reachable mid-leg but the chat model wasn't pulled yet, or a transient
- * disk error on the first attempt). Clears the singleton promise so the
- * next warmup() call actually runs a fresh attempt; both flags reset to
- * false so getWarmupStatus() reports `warming` again.
- *
- * Idempotent: calling reset when no warmup is in progress is a no-op.
- * Exported (not just internal) so an admin CLI / future operator tooling
- * can recover without container restart.
- */
-function warmupReset() {
-  warmupPromise = null;
-  warmupState.embedWarmed = false;
-  warmupState.embedWarmedAt = null;
-  warmupState.chatWarmed = false;
-  warmupState.chatWarmedAt = null;
-}
 
 /**
  * Pre-warm both Ollama models in a fire-and-forget manner.
@@ -263,9 +243,7 @@ async function generateEmbedding(text) {
 
 module.exports = {
   generateResponse,
-  streamResponse,
   generateEmbedding,
   warmup,
-  warmupReset,
   getWarmupStatus
 };

@@ -1,0 +1,10 @@
+User-agent: *
+Disallow: /admin
+Allow: /
+
+# Authenticated application views are not useful to crawlers.
+Disallow: /chat
+Disallow: /documents
+Disallow: /conversations
+Disallow: /billing
+Disallow: /profile

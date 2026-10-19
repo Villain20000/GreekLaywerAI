@@ -11,8 +11,11 @@ describe('AuthService', () => {
       navigate: jasmine.createSpy('navigate')
     };
     
-    // Clear localStorage before each test
+    // Clear localStorage before each test. Both keys matter: the service
+    // constructor restores BOTH the token and the cached user, and a previous
+    // spec's background refreshFromServer() can leave nomos_user behind.
     localStorage.removeItem('nomos_token');
+    localStorage.removeItem('nomos_user');
 
     TestBed.configureTestingModule({
       providers: [
@@ -162,12 +165,13 @@ describe('AuthService', () => {
       expect(result.ok).toBeTrue();
 
       // Find the POST call specifically (the constructor's GET /me is also
-      // routed through the same spy).
+      // routed through the same spy). URLs are same-origin relative because
+      // environment.apiBaseUrl is ''.
       const calls = fetchSpy.calls
         .allArgs()
         .filter(
           ([url, init]) =>
-            url === 'http://localhost:3000/api/auth/change-password' &&
+            url === '/api/auth/change-password' &&
             (init as RequestInit | undefined)?.method === 'POST'
         );
       expect(calls.length).toBe(1);
@@ -210,6 +214,172 @@ describe('AuthService', () => {
           status: 0
         })
       );
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Rate limiting: a 429 is classified by HTTP STATUS, never by the body.
+  // The backend rate-limits the auth surface (POST /api/auth/login at
+  // 10/min per IP) and its limiter answers
+  // `{ error: 'Too many requests, please try again later.' }` — NO `code`
+  // at all — so the client used to report a rate limit as a server error.
+  // ------------------------------------------------------------------
+  describe('rate-limit classification (HTTP 429)', () => {
+    const originalFetch = globalThis.fetch;
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    const stubResponse = (status: number, body: unknown): void => {
+      globalThis.fetch = jasmine
+        .createSpy('fetch')
+        .and.returnValue(
+          Promise.resolve({
+            ok: false,
+            status,
+            json: () => Promise.resolve(body)
+          } as Response)
+        );
+    };
+
+    it('maps a code-less 429 on login to kind=rate_limited', async () => {
+      stubResponse(429, { error: 'Too many requests, please try again later.' });
+
+      const result = await service.login('u@nomos.ai', 'pw');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({
+          ok: false,
+          kind: 'rate_limited',
+          code: null,
+          status: 429
+        })
+      );
+    });
+
+    it('maps a 429 that carries a code to kind=rate_limited (the status wins)', async () => {
+      stubResponse(429, { error: 'Too many requests', code: 'server_error' });
+
+      const result = await service.login('u@nomos.ai', 'pw');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({ ok: false, kind: 'rate_limited', status: 429 })
+      );
+    });
+
+    it('maps a code-less 429 on register to kind=rate_limited', async () => {
+      stubResponse(429, { error: 'Too many requests, please try again later.' });
+
+      const result = await service.register('u@nomos.ai', 'password123');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({ ok: false, kind: 'rate_limited', status: 429 })
+      );
+    });
+
+    it('maps a code-less 429 on resend-verification to kind=rate_limited', async () => {
+      stubResponse(429, { error: 'Too many requests, please try again later.' });
+
+      const result = await service.resendVerification('u@nomos.ai');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({ ok: false, kind: 'rate_limited', status: 429 })
+      );
+    });
+
+    it('still classifies a code-less 400 as invalid_request', async () => {
+      stubResponse(400, { error: 'Bad request' });
+
+      const result = await service.register('u@nomos.ai', 'password123');
+
+      expect(result).toEqual(
+        jasmine.objectContaining({ ok: false, kind: 'invalid_request', status: 400 })
+      );
+    });
+  });
+
+  // P0-2: the GDPR endpoints live under /api/gdpr, NOT /api/auth. These
+  // specs pin the URLs + request shape against backend/src/routes/gdpr.js.
+  describe('GDPR data export + account deletion', () => {
+    const originalFetch = globalThis.fetch;
+
+    beforeEach(() => {
+      localStorage.setItem('nomos_token', 'jwt-abc');
+    });
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      localStorage.removeItem('nomos_token');
+      localStorage.removeItem('nomos_user');
+    });
+
+    it('exportData() GETs /api/gdpr/export with the bearer token', async () => {
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ user: { id: 1 }, messages: [] })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      const data = await service.exportData();
+
+      expect(data).toEqual({ user: { id: 1 }, messages: [] });
+      // environment.apiBaseUrl is '' (same-origin): the URL on the wire is
+      // relative, not an absolute localhost:3000 URL.
+      const exportCalls = fetchSpy.calls
+        .allArgs()
+        .filter(
+          ([url, init]) =>
+            url === '/api/gdpr/export' &&
+            ((init as RequestInit | undefined)?.method ?? 'GET') === 'GET'
+        );
+      expect(exportCalls.length).toBe(1);
+      // apiFetch sends a Headers instance, not a plain record.
+      const init = exportCalls[0][1] as RequestInit;
+      expect((init.headers as Headers).get('Authorization')).toBe('Bearer jwt-abc');
+    });
+
+    it('exportData() surfaces the server error on non-OK responses', async () => {
+      spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: false,
+          status: 401,
+          json: async () => ({ error: 'Unauthorized' })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      await expectAsync(service.exportData()).toBeRejectedWithError('Unauthorized');
+    });
+
+    it('deleteAccount() DELETEs /api/gdpr/account with confirm+email and clears the session', async () => {
+      const fetchSpy = spyOn(globalThis, 'fetch').and.callFake(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true })
+        } as unknown as Response)
+      );
+      service = new AuthService(mockRouter);
+
+      await service.deleteAccount('user@nomos.ai');
+
+      const deleteCalls = fetchSpy.calls
+        .allArgs()
+        .filter(
+          ([url, init]) =>
+            url === '/api/gdpr/account' &&
+            (init as RequestInit | undefined)?.method === 'DELETE'
+        );
+      expect(deleteCalls.length).toBe(1);
+      const init = deleteCalls[0][1] as RequestInit;
+      expect(init.body).toBe(JSON.stringify({ confirm: true, email: 'user@nomos.ai' }));
+      // Successful deletion signs the user out locally.
+      expect(localStorage.getItem('nomos_token')).toBeNull();
+      expect(mockRouter.navigate).toHaveBeenCalledWith(['/login']);
     });
   });
 });

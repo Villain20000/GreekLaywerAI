@@ -1,13 +1,14 @@
-import { Component } from '@angular/core';
+import { Component, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
-import { AuthService } from '../../services/auth.service';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { AuthService, authErrorMessage } from '../../services/auth.service';
 
 @Component({
   selector: 'app-register',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink],  templateUrl: './register.component.html',
+  imports: [CommonModule, FormsModule, RouterLink, TranslatePipe],  templateUrl: './register.component.html',
   // Phase 27 — zero per-component CSS. Design-system chrome
   // (.register-container, .register-box, .form-group, .peek-btn,
   // .primary/.secondary buttons, .spinner, .error-msg/.success-msg,
@@ -16,6 +17,8 @@ import { AuthService } from '../../services/auth.service';
   styles: [] 
 })
 export class RegisterComponent {
+  private readonly translate = inject(TranslateService);
+
   email = '';
   password = '';
   confirmPassword = '';
@@ -50,22 +53,22 @@ export class RegisterComponent {
     this.error = '';
 
     if (!this.email || !this.password || !this.confirmPassword) {
-      this.error = 'Please fill in all fields';
+      this.error = this.translate.instant('common.fillAll');
       // Reset peek toggles so a fresh attempt starts from a known state.
       this.showPassword = false;
       this.showConfirmPassword = false;
       return;
     }
     if (!this.isValidEmail(this.email)) {
-      this.error = 'Please enter a valid email address';
+      this.error = this.translate.instant('common.invalidEmail');
       return;
     }
     if (this.password.length < 8) {
-      this.error = 'Password must be at least 8 characters';
+      this.error = this.translate.instant('common.passwordMin', { min: 8 });
       return;
     }
     if (this.password !== this.confirmPassword) {
-      this.error = 'Passwords do not match';
+      this.error = this.translate.instant('common.passwordsMismatch');
       return;
     }
 
@@ -80,7 +83,10 @@ export class RegisterComponent {
       this.submitted = true;
       this.submittedEmail = this.email;
     } else {
-      this.error = result.error;
+      // The server's `code` picks the translated copy (e.g.
+      // `email_taken` → auth.errors.emailTaken); the raw English prose is
+      // never shown to the user.
+      this.error = authErrorMessage(this.translate, result);
     }
   }
 
@@ -96,9 +102,11 @@ export class RegisterComponent {
     const result = await this.authService.resendVerification(this.submittedEmail);
     this.resendIsLoading = false;
     if (result.ok) {
-      this.resendMessage = 'If that email is registered and unverified, a new link has been sent.';
+      this.resendMessage = this.translate.instant('auth.register.resendMessage');
     } else {
-      this.resendMessage = result.error;
+      // A failure here is NOT email-specific (network error / 5xx), so the
+      // translated failure copy is shown — never the raw English prose.
+      this.resendMessage = authErrorMessage(this.translate, result);
     }
   }
 

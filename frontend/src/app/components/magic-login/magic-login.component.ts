@@ -1,7 +1,8 @@
-import { Component, OnInit } from '@angular/core';
+import { Component, OnInit, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
-import { AuthService } from '../../services/auth.service';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { AuthService, authErrorMessage } from '../../services/auth.service';
 
 /**
  * Phase 25 (admin bypass): MagicLoginComponent.
@@ -25,12 +26,14 @@ import { AuthService } from '../../services/auth.service';
 @Component({
   selector: 'app-magic-login',
   standalone: true,
-  imports: [CommonModule, RouterLink],  templateUrl: './magic-login.component.html',
+  imports: [CommonModule, RouterLink, TranslatePipe],  templateUrl: './magic-login.component.html',
   // Phase 27 — zero per-component CSS. All chrome lives in
   // src/styles.scss via legacy-name aliases; templates untouched.
   styles: [] 
 })
 export class MagicLoginComponent implements OnInit {
+  private readonly translate = inject(TranslateService);
+
   finished = false;
   success = false;
   error = '';
@@ -47,7 +50,7 @@ export class MagicLoginComponent implements OnInit {
     const token = this.route.snapshot.queryParamMap.get('token');
     if (!token) {
       this.finished = true;
-      this.error = 'Invalid magic link. No token in URL.';
+      this.error = this.translate.instant('auth.magic.noToken');
       return;
     }
 
@@ -66,7 +69,11 @@ export class MagicLoginComponent implements OnInit {
         this.router.navigate([role === 'admin' ? '/admin' : '/chat']);
       }, 600);
     } else {
-      this.error = result.error;
+      // The backend's `code` picks the translated copy (e.g.
+      // `invalid_token` → auth.errors.invalidToken, `admin_role_required`
+      // → auth.errors.adminRoleRequired); the raw English server prose is
+      // never shown to the user.
+      this.error = authErrorMessage(this.translate, result);
     }
   }
 }
