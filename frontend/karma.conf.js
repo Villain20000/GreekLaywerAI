@@ -43,6 +43,15 @@ module.exports = async function (config) {
     colors: true,
     logLevel: config.LOG_INFO,
     autoWatch: false,
+    // GitHub-hosted runners disable unprivileged user namespaces, so Chrome's
+    // sandbox cannot start there. CI opts into this launcher explicitly;
+    // local runs keep the sandboxed ChromeHeadless default.
+    customLaunchers: {
+      ChromeHeadlessNoSandbox: {
+        base: 'ChromeHeadless',
+        flags: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
+      }
+    },
     browsers: ['ChromeHeadless'],
     singleRun: true,
     restartOnFileChange: false

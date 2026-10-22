@@ -188,6 +188,12 @@ describe('ProfileComponent (today\'s quota usage)', () => {
   });
 
   describe('email change form', () => {
+    // ngOnInit() populates `user`; these tests exercise the submit path in
+    // isolation, so seed the same value the lifecycle hook would.
+    beforeEach(() => {
+      component.user = authStub.userValue;
+    });
+
     it('rejects an invalid address without calling the server', async () => {
       component.emailChangeAddress = 'not-an-email';
       component.emailChangePassword = 'password123';
