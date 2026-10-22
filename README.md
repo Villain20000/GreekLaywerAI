@@ -12,17 +12,20 @@
 1. [Feature set](#feature-set)
 2. [Screenshots](#screenshots)
 3. [Architecture](#architecture)
-4. [Technology stack](#technology-stack)
-5. [Quick start](#quick-start)
-6. [Environment variables](#environment-variables)
-7. [Database schema & migrations](#database-schema--migrations)
-8. [API reference](#api-reference)
-9. [Frontend](#frontend)
-10. [Services & middlewares](#services--middlewares)
-11. [Production operations](#production-operations)
-12. [Testing](#testing)
-13. [Project structure](#project-structure)
-14. [Roadmap](#roadmap)
+4. [How it works](#how-it-works)
+5. [Technology stack](#technology-stack)
+6. [Quick start](#quick-start)
+7. [Environment variables](#environment-variables)
+8. [Database schema & migrations](#database-schema--migrations)
+9. [API reference](#api-reference)
+10. [Frontend](#frontend)
+11. [Services & middlewares](#services--middlewares)
+12. [Security & privacy](#security--privacy)
+13. [Production operations](#production-operations)
+14. [Testing](#testing)
+15. [Troubleshooting](#troubleshooting)
+16. [Project structure](#project-structure)
+17. [Roadmap](#roadmap)
 
 ---
 
@@ -125,6 +128,64 @@ locally.
 The SPA always calls `/api/*` on its own origin; the dev server proxies to the
 backend and nginx proxies in production, so no CORS or hostname is baked into
 the bundle.
+
+---
+
+## How it works
+
+### Chat request lifecycle
+
+```
+Browser
+  └─ POST /api/ai/query/live             (JWT + quota check)
+      └─ retrieveRagContext()            (Ansvar MCP or pgvector + user docs)
+          └─ BullMQ inference job        (concurrency 1; Redis or inline)
+              └─ Ollama /api/chat        (token deltas)
+                  └─ streamHub           (Redis pub/sub or in-process)
+                      └─ SSE chunk/done  (GET .../events)
+                          └─ messages row (citation_metadata + confidence)
+```
+
+1. **Authenticate and meter.** `authMiddleware` validates the Bearer JWT and
+   checks `token_version` against the live `users` row; `quotaMiddleware`
+   consumes one daily AI unit (admins bypass). Unverified accounts never
+   receive a JWT.
+2. **Retrieve legislation.** `retrieveRagContext()` in
+   `backend/src/routes/ai.js` calls `ragService.retrieveContext()`. With
+   Ansvar configured, the MCP gateway is queried first; otherwise (or on any
+   failure/empty result) the local pgvector HNSW index is searched with a
+   `bge-m3` embedding.
+3. **Add personal documents.** When the request selects uploaded document
+   ids, `documentService.searchUserDocuments()` runs a second cosine search
+   scoped to `user_id`, so a forged id can never read another user's chunks.
+4. **Format the prompt.** `formatContextForGemma()` labels every source;
+   `ollamaService` combines it with the canonical Greek legal system prompt.
+5. **Serialize inference.** `inferenceQueue` runs a BullMQ worker with
+   concurrency 1 to protect the GPU; without Redis, an in-process gate
+   serializes work instead.
+6. **Stream tokens.** The worker publishes deltas through `streamHub`
+   (Redis pub/sub with local fallback); the SPA receives `chunk`, `done` and
+   `error` events over SSE. The polling `/api/ai/query` path returns the
+   completed answer instead.
+7. **Persist and cite.** `storeExchange()` writes the user/assistant rows and
+   `citation_metadata` (sources + confidence) so history reloads with the same
+   citations. Feedback is stored in `message_feedback`.
+8. **Render safely.** The SPA sanitizes Markdown with DOMPurify, shows the
+   sources panel and confidence badge, and supports copy, regenerate, feedback
+   and "load older messages".
+
+### Retrieval modes
+
+| Mode | Active when | Data leaving the deployment | Failure behavior | Cache |
+|---|---|---|---|---|
+| **Ansvar MCP** | Ansvar credentials configured | Chat query text only | Falls back to local pgvector | `rag:context:ansvar:*` for `RAG_CACHE_TTL_SECONDS` |
+| **Local pgvector** | Default, or any Ansvar failure/empty result | Nothing | Request errors if both retrieval paths fail | `rag:context:*` for `RAG_CACHE_TTL_SECONDS` |
+| **Personal documents** | Request includes `documentIds` | Nothing | Per-request error; legislation retrieval may still succeed | Owner-scoped query, no shared cache |
+
+The MCP client negotiates the Streamable HTTP session, lists `tools/list`,
+chooses a search tool (or the pinned `ANSVAR_TOOL_NAME`), and normalizes
+results into the same `{title, source_type, article_number, content,
+similarity}` shape as pgvector. Only normalized results are cached.
 
 ---
 
@@ -541,6 +602,72 @@ Routes: `/`, `/login`, `/register`, `/forgot-password`, `/reset-password`,
 
 ---
 
+## Security & privacy
+
+### Trust boundaries
+
+- **Browser → edge** — TLS terminates at Traefik in staging/production;
+  Cloudflare real-IP handling is optional. The SPA stores only the JWT, a
+  user snapshot and UI preferences in browser storage.
+- **Edge → backend** — nginx serves the SPA and proxies `/api/*`; the API is
+  not published directly in production. Helmet adds CSP/HSTS-family headers
+  and nginx adds its own content-type, referrer and permissions headers.
+- **Backend → data services** — PostgreSQL, Redis, Ollama and whisper are
+  private compose services. Only the frontend/edge ports are exposed.
+- **Backend → Ansvar** — optional external egress. Only the chat query text
+  is sent, and only when credentials are explicitly configured.
+
+### Identity and authorization
+
+- Passwords are bcrypt-hashed. JWTs are Bearer-only (no auth cookies, so no
+  CSRF surface); `token_version` invalidates older tokens after password,
+  email or reset changes.
+- Email verification is required before login. Reset, verification and
+  email-change tokens are stored as SHA-256 hashes, single-use and expiring.
+- RBAC (`user`, `admin`, `enterprise`) gates AI, billing, document and admin
+  routes. Every document/conversation query is scoped to `req.user.id`.
+- Per-tier quotas and per-route rate limiters bound AI, upload, auth and
+  billing endpoints; Traefik adds per-IP edge limits in production.
+
+### Input and output handling
+
+- `express-validator` validates JSON bodies. Uploads are checked by magic
+  bytes (not extension), capped at 25 MB and restricted to PDF/DOCX/TXT.
+- Scanned PDFs are rasterized with page and OCR limits; encrypted PDFs are
+  rejected. OCR and vision output is treated as untrusted text.
+- Assistant Markdown is sanitized with DOMPurify before rendering, and the
+  API sends CSP/HSTS-family headers via Helmet.
+- Admin document management returns metadata only; deletion is audit-logged.
+
+### Privacy and data lifecycle
+
+- **Local by default.** Prompts, uploads and embeddings stay inside the
+  deployment unless Ansvar is enabled. Enabling Ansvar sends the legal
+  question text to the gateway; documents and conversation history are not
+  sent.
+- **Owner scoping.** Document chunks and conversations are always queried
+  with the caller's user id, including semantic search over personal files.
+- **Retention.** `RETENTION_CONVERSATIONS_DAYS`,
+  `RETENTION_DOCUMENTS_DAYS` and `RETENTION_AUDIT_LOG_DAYS` drive cleanup.
+  Account deletion is scheduled after `ACCOUNT_DELETION_GRACE_HOURS` and
+  cascades through the user's rows.
+- **Secrets.** Every supported secret can come from a mounted file via
+  `<NAME>_FILE`. Production refuses to boot with the development JWT secret
+  or without SMTP configuration.
+- **Audit.** Role/tier changes, document uploads/deletions, failed logins and
+  account-deletion actions land in `audit_log`.
+
+### Operational caveats
+
+- Cloudflare WAF, bot management and account-side rate limits are configured
+  outside this repository.
+- The compose stacks are single-host. The Kubernetes baseline externalizes
+  PostgreSQL, Redis and Ollama and runs a dedicated queue worker.
+- Sentry receives error events only when a DSN is configured; the SDKs are
+  inert otherwise.
+
+---
+
 ## Production operations
 
 - **Compose / TLS** — `docker-compose.prod.yml` runs Traefik v3.7 as the only
@@ -582,6 +709,19 @@ Routes: `/`, `/login`, `/register`, `/forgot-password`, `/reset-password`,
   chat query text is sent; uploaded documents remain local. Failures fall back
   to pgvector, and status is exposed under `checks.ansvar` on `/health`.
 
+### Deployment topologies
+
+| Target | Entry point | State and services | Typical use |
+|---|---|---|---|
+| **Development** | `docker compose up --build` → `http://localhost:4200` | Local named volumes; mock Stripe; console email | Day-to-day work and screenshots |
+| **Staging** | `docker compose --env-file .env.staging -f docker-compose.staging.yml up -d` | Isolated staging volumes; Traefik + Let's Encrypt staging CA; sandbox SMTP | Production-like validation without public trust |
+| **Production** | `docker compose --env-file .env.production -f docker-compose.prod.yml up -d` | Named volumes; Traefik + production ACME; GPU Ollama; optional monitoring profile | Single-host deployment |
+| **Kubernetes** | Manifests in [`deploy/k8s/`](deploy/k8s/README.md) | External PostgreSQL/Redis/Ollama; dedicated queue worker; HPA and probes | Multi-replica web tier |
+
+The compose files run every service on one host. The Kubernetes baseline
+separates the web tier from the single-concurrency inference worker so GPU
+concurrency stays at one while HTTP replicas scale horizontally.
+
 ---
 
 ## Testing
@@ -605,12 +745,69 @@ compose/monitoring configuration and backup/restore.
 cd frontend
 npx tsc -p tsconfig.spec.json --noEmit
 npx ngc -p tsconfig.app.json --noEmit
-npm test          # Karma + Jasmine; needs a Chrome/Chromium binary
+npm test -- --watch=false --browsers=ChromeHeadlessNoSandbox
 npm run build     # production build incl. service worker
 ```
 
 Karma is memory-hungry in constrained environments; the type-checks above are
-the fast, deterministic gate.
+the fast, deterministic gate. `ChromeHeadlessNoSandbox` is the CI launcher for
+GitHub-hosted runners, which disable unprivileged user namespaces. Local runs
+keep the default sandboxed `ChromeHeadless` launcher unless that browser cannot
+start.
+
+### CI gates
+
+[`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
+
+- **Backend** — `npm ci`, the full Jest/Supertest suite, a critical
+  runtime-dependency audit, and a production Docker build.
+- **Frontend** — `npm ci`, Puppeteer's Chrome install, the Karma suite with
+  `ChromeHeadlessNoSandbox`, a production `ng build`, and a Docker build.
+
+The release workflow builds and scans both images, and the weekly ZAP baseline
+runs against staging.
+
+---
+
+## Troubleshooting
+
+### Runtime and health
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `/health` returns 503 | PostgreSQL or Redis is down; only those checks force 503 | `docker compose ps`, then `docker compose logs db redis`; verify `DB_PASSWORD` and `REDIS_URL`. |
+| Ollama health stays `warming` | Model pull is still running, or the models are absent | `docker compose logs -f ollama`; `docker compose exec ollama ollama list`; pull `bge-m3` and `gemma2b-mmap`. |
+| Chat returns 504 | Queue saturation or a cold model load | Inspect `/health` queue depth; raise `AI_QUERY_TIMEOUT_MS`; keep exactly one inference worker. |
+| Backend cannot reach DB/Redis outside compose | Defaults point at compose hostnames | Set `DB_HOST=127.0.0.1` and `REDIS_URL=redis://127.0.0.1:6379` for a host-run backend. |
+
+### AI and retrieval
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Answers have no sources | Local corpus is empty and Ansvar is disabled | Run `node src/scripts/ingestLegislation.js`; check `checks.ansvar` on `/health`. |
+| `checks.ansvar.status` is `disabled` | No credentials configured | Set `ANSVAR_CLIENT_ID` + `ANSVAR_CLIENT_SECRET`, or `ANSVAR_MCP_TOKEN`; restart the backend. |
+| Ansvar returns 401 | Expired token, wrong client, or missing scope | Verify the `mcp:tools` scope and token/client values; check `ANSVAR_TOKEN_URL`; rotate the secret. |
+| Ansvar tool error | Auto-selected tool needs different arguments | Pin `ANSVAR_TOOL_NAME` (for example `search`) and set `ANSVAR_TOOL_ARGS` with `{{query}}`/`{{limit}}`. |
+| Uploads return 413 | Request cap hit before processing | Raise `AI_UPLOAD_MAX_BYTES` and nginx `client_max_body_size`; the default is 25 MB. |
+| Scanned PDF returns 422 | Encrypted PDF or OCR page limit | Remove password protection; raise `OCR_PDF_MAX_PAGES` / OCR timeouts. |
+
+### Accounts, email and billing
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Login rejects an account as unverified | Dev console email was not opened | Read the `[DEV-EMAIL] ... Verify URL` line in backend logs, or set `verified_at` in SQL. |
+| Reset or verification email never arrives | Development uses the console transport | Check backend logs; production requires `EMAIL_TRANSPORT=smtp` plus SMTP settings. |
+| Checkout stays in mock mode | `STRIPE_SECRET_KEY=sk_test_mock` or unset | Configure a real test/live key and all three price IDs. |
+| Stripe webhook returns 400 | Missing or wrong `STRIPE_WEBHOOK_SECRET`, or a proxy parsed the body | Register the endpoint with `npm run stripe:webhook`; keep `/api/billing/webhook` on the raw-body path. |
+
+### Frontend, tests and deployment
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Dev SPA's `/api` calls 404 | Angular proxy targets the compose hostname | Run the stack through compose, or point `proxy.conf.json` at the local backend. |
+| Karma reports "No usable sandbox" | Chrome sandbox is unavailable in CI/containers | Use `npm test -- --browsers=ChromeHeadlessNoSandbox` (the CI setting). |
+| Stale UI after deploy | Service worker or cached shell | Reload once; nginx never caches `index.html`/`ngsw*`; purge the CDN cache if used. |
+| Canonical/OG links use `your-domain.gr` | `SITE_URL` placeholder was not replaced at build time | Rebuild with `SITE_URL=https://your-domain`; `npm run build` rewrites the shell and sitemap. |
 
 ---
 
