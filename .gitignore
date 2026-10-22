@@ -11,5 +11,9 @@ out-tsc/
 # The durable project preferences under .commandcode/taste/ ARE tracked.
 .commandcode/settings.json
 
+# Qoder session-local settings (machine-specific permissions/MCP credentials).
+# Shared project settings belong in .qoder/settings.json instead.
+.qoder/settings.local.json
+
 # Tesseract OCR language caches downloaded at runtime
 *.traineddata

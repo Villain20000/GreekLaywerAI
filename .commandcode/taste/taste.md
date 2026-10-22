@@ -1,1 +1,6 @@
 - Prefers parallel subagents for multi-area work: when a task spans several independent areas, dispatch multiple subagents concurrently (one per area) instead of working sequentially, and give each subagent a strict, non-overlapping file scope so their edits don't collide. Confidence: 0.9
+- Prefers committing and pushing directly to `main` — no feature-branch or pull-request workflow. Confidence: 0.8
+- Gives terse, imperative instructions ("continue with subagents", "commit and push to main") and expects autonomous end-to-end execution without clarifying questions. Confidence: 0.8
+- When committing, expects the entire outstanding working tree to land as one logical commit with a detailed, section-structured message (even when part of the diff predates the current session) — flagging the attribution caveat rather than splitting the diff into per-session chunks. Confidence: 0.6
+- Keeps durable AI-preference files (`.commandcode/taste/`) tracked in git while gitignoring session-local agent settings (`.commandcode/settings.json`) that embed machine-specific paths. Confidence: 0.6
+- Expects agent-reported completion to be independently re-verified against the real CI gates before it is reported as done. Confidence: 0.6
