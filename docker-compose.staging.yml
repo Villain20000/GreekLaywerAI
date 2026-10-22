@@ -140,6 +140,21 @@ services:
       - "WHISPER_URL=http://whisper:8000"
       - "WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}"
       - "WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}"
+      # Optional Ansvar MCP Greek-law retrieval; empty credentials keep the
+      # local pgvector corpus as the only source.
+      - "ANSVAR_MCP_ENABLED=${ANSVAR_MCP_ENABLED:-}"
+      - "ANSVAR_MCP_URL=${ANSVAR_MCP_URL:-https://gateway.ansvar.eu/mcp}"
+      - "ANSVAR_CLIENT_ID=${ANSVAR_CLIENT_ID:-}"
+      - "ANSVAR_CLIENT_SECRET=${ANSVAR_CLIENT_SECRET:-}"
+      - "ANSVAR_CLIENT_SECRET_FILE=${ANSVAR_CLIENT_SECRET_FILE:-}"
+      - "ANSVAR_MCP_TOKEN=${ANSVAR_MCP_TOKEN:-}"
+      - "ANSVAR_MCP_TOKEN_FILE=${ANSVAR_MCP_TOKEN_FILE:-}"
+      - "ANSVAR_SCOPE=${ANSVAR_SCOPE:-mcp:tools}"
+      - "ANSVAR_TOKEN_URL=${ANSVAR_TOKEN_URL:-https://auth.ansvar.eu/realms/ansvar/protocol/openid-connect/token}"
+      - "ANSVAR_TOOL_NAME=${ANSVAR_TOOL_NAME:-}"
+      - "ANSVAR_TOOL_ARGS=${ANSVAR_TOOL_ARGS:-}"
+      - "ANSVAR_TIMEOUT_MS=${ANSVAR_TIMEOUT_MS:-20000}"
+      - "ANSVAR_SESSION_TTL_MS=${ANSVAR_SESSION_TTL_MS:-300000}"
       # Use Stripe *test* keys in staging (sk_test_...), or sk_test_mock to
       # exercise the mock checkout without any Stripe account. Webhooks need
       # a public HTTPS URL; see docs/staging-deployment.md.

@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const ollamaService = require('./ollamaService');
 const cacheService = require('./cacheService');
+const ansvarMcpService = require('./ansvarMcpService');
 
 const RAG_CACHE_TTL_SECONDS = positiveInt(process.env.RAG_CACHE_TTL_SECONDS, 300);
 
@@ -17,8 +18,33 @@ function ragCacheKey(query, limit) {
   return `rag:context:${cacheService.hashKey(normalized)}:${limit}`;
 }
 
+function ansvarCacheKey(query, limit) {
+  const normalized = String(query || '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+  return `rag:context:ansvar:${cacheService.hashKey(normalized)}:${limit}`;
+}
+
 // Perform a similarity search in pgvector using the HNSW index
 async function retrieveContext(query, limit = 5) {
+  if (ansvarMcpService.isConfigured()) {
+    const ansvarKey = ansvarCacheKey(query, limit);
+    const cached = await cacheService.getJson(ansvarKey);
+    if (Array.isArray(cached) && cached.length > 0) {
+      return cached;
+    }
+
+    try {
+      const ansvarDocuments = await ansvarMcpService.retrieveLegislation(query, limit);
+      if (Array.isArray(ansvarDocuments) && ansvarDocuments.length > 0) {
+        await cacheService.setJson(ansvarKey, ansvarDocuments, RAG_CACHE_TTL_SECONDS);
+        return ansvarDocuments;
+      }
+    } catch (error) {
+      console.warn(
+        `[RAG] Ansvar MCP retrieval failed (${error.message}); falling back to the local pgvector corpus`
+      );
+    }
+  }
+
   const cacheKey = ragCacheKey(query, limit);
   const cached = await cacheService.getJson(cacheKey);
   if (Array.isArray(cached) && cached.length > 0) {

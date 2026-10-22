@@ -137,6 +137,22 @@ services:
       - "WHISPER_URL=${WHISPER_URL:-http://whisper:8000}"
       - "WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}"
       - "WHISPER_TIMEOUT_MS=${WHISPER_TIMEOUT_MS:-120000}"
+      # Optional Ansvar MCP Greek-law retrieval. Enabling it sends the chat
+      # query text to the gateway (never uploaded documents); failures fall
+      # back to the local pgvector corpus.
+      - "ANSVAR_MCP_ENABLED=${ANSVAR_MCP_ENABLED:-}"
+      - "ANSVAR_MCP_URL=${ANSVAR_MCP_URL:-https://gateway.ansvar.eu/mcp}"
+      - "ANSVAR_CLIENT_ID=${ANSVAR_CLIENT_ID:-}"
+      - "ANSVAR_CLIENT_SECRET=${ANSVAR_CLIENT_SECRET:-}"
+      - "ANSVAR_CLIENT_SECRET_FILE=${ANSVAR_CLIENT_SECRET_FILE:-}"
+      - "ANSVAR_MCP_TOKEN=${ANSVAR_MCP_TOKEN:-}"
+      - "ANSVAR_MCP_TOKEN_FILE=${ANSVAR_MCP_TOKEN_FILE:-}"
+      - "ANSVAR_SCOPE=${ANSVAR_SCOPE:-mcp:tools}"
+      - "ANSVAR_TOKEN_URL=${ANSVAR_TOKEN_URL:-https://auth.ansvar.eu/realms/ansvar/protocol/openid-connect/token}"
+      - "ANSVAR_TOOL_NAME=${ANSVAR_TOOL_NAME:-}"
+      - "ANSVAR_TOOL_ARGS=${ANSVAR_TOOL_ARGS:-}"
+      - "ANSVAR_TIMEOUT_MS=${ANSVAR_TIMEOUT_MS:-20000}"
+      - "ANSVAR_SESSION_TTL_MS=${ANSVAR_SESSION_TTL_MS:-300000}"
       - "STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY must be set in .env.production}"
       - "STRIPE_SECRET_KEY_FILE=${STRIPE_SECRET_KEY_FILE:-}"
       - "STRIPE_PRICE_ID_BASIC=${STRIPE_PRICE_ID_BASIC:-}"

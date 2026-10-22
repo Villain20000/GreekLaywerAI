@@ -43,6 +43,21 @@ services:
       - WHISPER_URL=http://whisper:8000
       - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-whisper-base}
       - WHISPER_TIMEOUT_MS=120000
+      # Optional external Greek-law retrieval over the Ansvar MCP gateway.
+      # Empty credentials keep retrieval fully local (pgvector).
+      - ANSVAR_MCP_ENABLED=${ANSVAR_MCP_ENABLED:-}
+      - ANSVAR_MCP_URL=${ANSVAR_MCP_URL:-https://gateway.ansvar.eu/mcp}
+      - ANSVAR_CLIENT_ID=${ANSVAR_CLIENT_ID:-}
+      - ANSVAR_CLIENT_SECRET=${ANSVAR_CLIENT_SECRET:-}
+      - ANSVAR_CLIENT_SECRET_FILE=${ANSVAR_CLIENT_SECRET_FILE:-}
+      - ANSVAR_MCP_TOKEN=${ANSVAR_MCP_TOKEN:-}
+      - ANSVAR_MCP_TOKEN_FILE=${ANSVAR_MCP_TOKEN_FILE:-}
+      - ANSVAR_SCOPE=${ANSVAR_SCOPE:-mcp:tools}
+      - ANSVAR_TOKEN_URL=${ANSVAR_TOKEN_URL:-https://auth.ansvar.eu/realms/ansvar/protocol/openid-connect/token}
+      - ANSVAR_TOOL_NAME=${ANSVAR_TOOL_NAME:-}
+      - ANSVAR_TOOL_ARGS=${ANSVAR_TOOL_ARGS:-}
+      - ANSVAR_TIMEOUT_MS=${ANSVAR_TIMEOUT_MS:-20000}
+      - ANSVAR_SESSION_TTL_MS=${ANSVAR_SESSION_TTL_MS:-300000}
       # Phase 1-8: canonical path for the scraper output consumed by
       # `node src/scripts/ingestLegislation.js`. Bind-mounted read-only below
       # so a re-scrape on the host is picked up without rebuilding the image.

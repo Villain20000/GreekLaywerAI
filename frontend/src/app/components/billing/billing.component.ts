@@ -70,6 +70,7 @@ import { BillingService, SubscriptionState, TierPlan } from '../../services/bill
   `,
   styles: [`
     .nl-tier-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    .nl-tier-grid .nl-landing-hero-subtitle { opacity: 1; font-size: 1.15rem; margin: 0.25rem 0 1rem; }
     .nl-billing-manage { margin-top: 1rem; }
     .nl-billing-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.75rem; }
   `]

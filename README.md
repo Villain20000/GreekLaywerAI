@@ -10,18 +10,19 @@
 ## Contents
 
 1. [Feature set](#feature-set)
-2. [Architecture](#architecture)
-3. [Technology stack](#technology-stack)
-4. [Quick start](#quick-start)
-5. [Environment variables](#environment-variables)
-6. [Database schema & migrations](#database-schema--migrations)
-7. [API reference](#api-reference)
-8. [Frontend](#frontend)
-9. [Services & middlewares](#services--middlewares)
-10. [Production operations](#production-operations)
-11. [Testing](#testing)
-12. [Project structure](#project-structure)
-13. [Roadmap](#roadmap)
+2. [Screenshots](#screenshots)
+3. [Architecture](#architecture)
+4. [Technology stack](#technology-stack)
+5. [Quick start](#quick-start)
+6. [Environment variables](#environment-variables)
+7. [Database schema & migrations](#database-schema--migrations)
+8. [API reference](#api-reference)
+9. [Frontend](#frontend)
+10. [Services & middlewares](#services--middlewares)
+11. [Production operations](#production-operations)
+12. [Testing](#testing)
+13. [Project structure](#project-structure)
+14. [Roadmap](#roadmap)
 
 ---
 
@@ -29,9 +30,13 @@
 
 - **Local-first AI** — chat and embeddings run on a local Ollama runtime
   (`gemma2b-mmap` chat, `bge-m3` embeddings, 1024 dimensions). No prompt or
-  document leaves the deployment.
-- **Grounded RAG** — pgvector HNSW cosine search over Greek legislation;
-  answers carry structured sources and a confidence score.
+  document leaves the deployment unless the optional Ansvar MCP retrieval is
+  enabled, which sends only the chat query text — never uploaded documents —
+  to the gateway.
+- **Grounded RAG** — legislation retrieval uses the optional Ansvar MCP
+  gateway (Streamable HTTP, OAuth client credentials or a bearer token, tool
+  discovery) with automatic fallback to the local pgvector HNSW corpus.
+  Answers carry structured sources and a confidence score.
 - **Real token streaming** — `POST /api/ai/query/live` + SSE
   `GET /api/ai/query/live/:jobId/events` stream model deltas through Redis
   pub/sub (with an in-process fallback when Redis is absent). The legacy
@@ -69,6 +74,27 @@
 
 ---
 
+## Screenshots
+
+Captured from the running development stack with the seeded Greek demo
+corpus and demo accounts. Greek is the default UI language; the last image
+shows the same workspace in English with the light theme.
+
+| | |
+|---|---|
+| [![NomosAI landing page](docs/screenshots/01-landing.png)](docs/screenshots/01-landing.png)<br>**Landing** — Three.js brand hero with the landing-hero A/B subtitle. | [![Sign-in page](docs/screenshots/02-login.png)](docs/screenshots/02-login.png)<br>**Sign in** — JWT authentication with recovery and registration links. |
+| [![Registration page](docs/screenshots/03-register.png)](docs/screenshots/03-register.png)<br>**Register** — Account creation feeding the email-verification flow. | [![Password recovery request page](docs/screenshots/04-password-recovery.png)](docs/screenshots/04-password-recovery.png)<br>**Password recovery** — Anti-enumeration reset-link request. |
+| [![Chat with grounded answer and citations](docs/screenshots/05-chat-grounded-answer.png)](docs/screenshots/05-chat-grounded-answer.png)<br>**Grounded chat** — RAG answer with four citations, 90% confidence and feedback. | [![Greek tax-law answer](docs/screenshots/06-chat-legal-answer.png)](docs/screenshots/06-chat-legal-answer.png)<br>**Legal Q&amp;A** — Markdown answer with source and confidence badge. |
+| [![Conversation history](docs/screenshots/07-conversations.png)](docs/screenshots/07-conversations.png)<br>**Conversations** — Searchable history with rename, delete and pagination. | [![Documents page](docs/screenshots/08-documents.png)](docs/screenshots/08-documents.png)<br>**Documents** — Upload dropzone, semantic search and per-user files. |
+| [![Document preview](docs/screenshots/09-document-preview.png)](docs/screenshots/09-document-preview.png)<br>**Document preview** — Extracted text from a stored court decision. | [![Plans and billing](docs/screenshots/10-plans-billing.png)](docs/screenshots/10-plans-billing.png)<br>**Plans** — Server-owned catalog with the current Pro plan highlighted. |
+| [![Subscriptions and invoices](docs/screenshots/11-subscriptions-invoices.png)](docs/screenshots/11-subscriptions-invoices.png)<br>**Subscription &amp; invoices** — Status history and paginated Stripe invoices. | [![Profile and GDPR controls](docs/screenshots/12-profile-gdpr.png)](docs/screenshots/12-profile-gdpr.png)<br>**Profile &amp; GDPR** — Email change, daily quotas, export and deletion. |
+| [![Change password page](docs/screenshots/13-change-password.png)](docs/screenshots/13-change-password.png)<br>**Change password** — Password rotation invalidates other sessions. | [![Admin console](docs/screenshots/14-admin-console.png)](docs/screenshots/14-admin-console.png)<br>**Admin console** — Roles and tiers, answer quality and the audit log. |
+| [![Admin document management](docs/screenshots/15-admin-documents.png)](docs/screenshots/15-admin-documents.png)<br>**Admin documents** — Cross-user search and administrative deletion. | [![Email verification error state](docs/screenshots/16-verify-email.png)](docs/screenshots/16-verify-email.png)<br>**Verify email** — Single-use token error state. |
+| [![Password reset form](docs/screenshots/17-reset-password.png)](docs/screenshots/17-reset-password.png)<br>**Reset password** — One-time token with password confirmation. | [![Admin magic link error state](docs/screenshots/18-admin-magic-link.png)](docs/screenshots/18-admin-magic-link.png)<br>**Admin magic link** — Admin-only redemption, invalid-token state. |
+| [![404 page](docs/screenshots/19-not-found.png)](docs/screenshots/19-not-found.png)<br>**Not found** — Localized 404 surface. | [![English interface with light theme](docs/screenshots/20-chat-english-light.png)](docs/screenshots/20-chat-english-light.png)<br>**English &amp; light theme** — The same workspace, localized and re-themed. |
+
+---
+
 ## Architecture
 
 ```
@@ -84,11 +110,17 @@ Traefik (prod/staging, TLS, edge rate limits) ──▶ frontend nginx :80
                                                                    ├─ PostgreSQL 16 + pgvector
                                                                    ├─ Redis 7 (queue, rate limits, cache, SSE)
                                                                    ├─ Ollama (gemma2b-mmap + bge-m3)
-                                                                   └─ whisper (faster-whisper)
+                                                                   ├─ whisper (faster-whisper)
+                                                                   └─ Ansvar MCP (optional; query text only)
 ```
 
 The compose stacks run on one host. `deploy/k8s/` moves the same frontend/
 backend pair onto Kubernetes with external PostgreSQL, Redis and Ollama.
+
+When Ansvar credentials are configured, legislation retrieval goes to the
+external MCP gateway first; any failure or empty result falls back to the
+local pgvector corpus. Uploaded documents are only ever embedded and searched
+locally.
 
 The SPA always calls `/api/*` on its own origin; the dev server proxies to the
 backend and nginx proxies in production, so no CORS or hostname is baked into
@@ -104,6 +136,7 @@ the bundle.
 | Backend | Node.js 20, Express, jsonwebtoken, bcryptjs, multer, helmet, express-rate-limit, pino |
 | Data | PostgreSQL + pgvector (HNSW cosine), Redis 7 |
 | AI | Ollama (`gemma2b-mmap`, `bge-m3`), Tesseract.js OCR, optional Ollama vision model, faster-whisper sidecar |
+| Legal retrieval | Optional Ansvar MCP gateway (Streamable HTTP) with local pgvector fallback |
 | Billing | Stripe SDK (Checkout, Billing Portal, webhooks) with a dev-only mock mode |
 | Infra | Docker Compose (dev/staging/prod), Traefik v3, NVIDIA Container Toolkit in prod |
 | Scraping | Python 3.10+ prototype (`prototype_scraper.py`) |
@@ -189,9 +222,33 @@ Every supported secret can be supplied as `<NAME>_FILE=/path` instead of the
 plain variable. The file is read as UTF-8, trailing CR/LF is stripped, and the
 file value takes precedence over the environment. A configured-but-unreadable
 file aborts startup. Supported names: `DB_PASSWORD`, `JWT_SECRET`,
-`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SMTP_USER`, `SMTP_PASS`.
+`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SMTP_USER`, `SMTP_PASS`,
+`ANSVAR_CLIENT_SECRET`, `ANSVAR_MCP_TOKEN`.
 Compose interpolation still requires the plain variables, so keep a
 non-sensitive placeholder when using files.
+
+### Ansvar MCP (optional Greek-law retrieval)
+
+RAG uses the local pgvector corpus by default. To query Greek legislation
+through the Ansvar gateway instead, register an OAuth client with the
+`mcp:tools` scope (or obtain a bearer token) and configure:
+
+```dotenv
+ANSVAR_CLIENT_ID=your-client-id
+ANSVAR_CLIENT_SECRET=your-client-secret
+# or: ANSVAR_MCP_TOKEN=<bearer-token>
+#ANSVAR_MCP_ENABLED=true
+#ANSVAR_TOOL_NAME=...
+#ANSVAR_TOOL_ARGS={"query":"{{query}}","limit":"{{limit}}","jurisdiction":"GR"}
+```
+
+The backend performs the MCP Streamable HTTP handshake, lists the gateway
+tools, and calls the best-matching search tool (or the pinned
+`ANSVAR_TOOL_NAME`). Results are normalized into the same citation shape as
+the local corpus, cached in Redis, and any error or empty result falls back
+to pgvector. Only the chat query text is sent; uploaded document contents
+never leave the deployment. `GET /health` reports the integration under
+`checks.ansvar`, and `GET /api/ai/health` exposes `retrievalProvider`.
 
 ### Backend
 
@@ -236,6 +293,15 @@ non-sensitive placeholder when using files.
 | `AI_STREAM_PUBLISH_TIMEOUT_MS` / `AI_STREAM_SUBSCRIBE_TIMEOUT_MS` | `2000` / `5000` | Redis pub/sub deadlines |
 | `AI_STREAM_REDIS_COOLDOWN_MS` | `30000` | Fallback-to-local period after a Redis failure |
 | `RAG_CACHE_TTL_SECONDS` | `300` | Legislation retrieval cache TTL |
+| `ANSVAR_MCP_ENABLED` | auto | Enable Ansvar when credentials are present; `false` forces local pgvector |
+| `ANSVAR_MCP_URL` | `https://gateway.ansvar.eu/mcp` | MCP Streamable HTTP endpoint |
+| `ANSVAR_CLIENT_ID` / `ANSVAR_CLIENT_SECRET` | — | OAuth client-credentials client (`ANSVAR_CLIENT_SECRET_FILE` supported) |
+| `ANSVAR_MCP_TOKEN` | — | Pre-issued bearer token; takes precedence over client credentials (`ANSVAR_MCP_TOKEN_FILE` supported) |
+| `ANSVAR_SCOPE` | `mcp:tools` | OAuth scope requested from the token endpoint |
+| `ANSVAR_TOKEN_URL` | Keycloak realm token endpoint | OAuth token endpoint |
+| `ANSVAR_TOOL_NAME` | auto | Pin the MCP search tool |
+| `ANSVAR_TOOL_ARGS` | auto | JSON argument template with `{{query}}` and `{{limit}}` |
+| `ANSVAR_TIMEOUT_MS` / `ANSVAR_SESSION_TTL_MS` | `20000` / `300000` | Retrieval deadline and MCP session reuse TTL |
 | `PLANS_CACHE_TTL_SECONDS` | `3600` | Billing plan catalog cache TTL |
 | `CACHE_PREFIX` | `nomos:cache` | Redis key namespace |
 | `FEATURE_FLAGS` | *(empty)* | `name` enables, `name:false` disables; known: `billing`, `documents`, `audio`, `adminDocuments` |
@@ -450,7 +516,12 @@ Routes: `/`, `/login`, `/register`, `/forgot-password`, `/reset-password`,
 - **`ollamaService.js`** — chat, token streaming, embeddings, warmup, shared
   abort timeout; canonical Greek legal system prompt.
 - **`ragService.js`** — real `bge-m3` embeddings, pgvector cosine search,
-  Redis-cached retrieval, context/source formatting.
+  Redis-cached retrieval, context/source formatting. Delegates legislation
+  retrieval to Ansvar when configured and falls back to pgvector on failure.
+- **`ansvarMcpService.js`** — optional Greek-law retrieval over MCP
+  Streamable HTTP: OAuth client credentials or a static bearer token, tool
+  discovery/pinning, argument inference, session/token reuse and result
+  normalization. Never sends uploaded documents.
 - **`ocrService.js` / `pdfRasterService.js` / `visionService.js`** — serialized
   Tesseract OCR, scanned-PDF page rasterization with typed errors, and optional
   Ollama vision (`OLLAMA_VISION_MODEL`), with vision→OCR fallback.
@@ -506,6 +577,10 @@ Routes: `/`, `/login`, `/register`, `/forgot-password`, `/reset-password`,
   `GET /api/config`; flags default to enabled.
 - **Caching** — RAG retrieval and the plan catalog are cached in Redis with
   configurable TTLs; every cache path fails open.
+- **Ansvar MCP (optional)** — opt-in external Greek-law retrieval over MCP
+  Streamable HTTP with OAuth client credentials or a bearer token. Only the
+  chat query text is sent; uploaded documents remain local. Failures fall back
+  to pgvector, and status is exposed under `checks.ansvar` on `/health`.
 
 ---
 
@@ -519,7 +594,8 @@ npm test -- --runInBand
 ```
 
 Jest + Supertest covers auth/verification/email-change, AI routes and live
-streaming, queue hardening, multimodal OCR/vision, RAG cache, billing/invoices,
+streaming, queue hardening, multimodal OCR/vision, RAG cache, Ansvar MCP
+handshake/normalization and pgvector fallback, billing/invoices,
 webhooks, document originals, admin search, quotas, rate limits, migrations,
 compose/monitoring configuration and backup/restore.
 
@@ -545,7 +621,7 @@ backend/
   src/
     config/{db,secrets}.js
     routes/{auth,ai,aiStream,billing,subscriptions,documents,admin,conversations,gdpr,webhook,config}.js
-    services/{ollamaService,ragService,inferenceQueue,streamHub,ocrService,visionService,
+    services/{ollamaService,ragService,ansvarMcpService,inferenceQueue,streamHub,ocrService,visionService,
               documentService,stripeService,emailService,cacheService,quotaService,auditLog}.js
     middlewares/{authMiddleware,rateLimiters,quotaMiddleware,privacyShield,security,metrics,requestLogger}.js
     scripts/{migrate-all,migrate-invoices,migrate-email-change,migrate-document-originals,
@@ -561,6 +637,7 @@ deploy/cloudflare/{README.md,real-ip.conf}
 deploy/k8s/{README.md,namespace,configmap,secret.example,backend,frontend,ingress}.yaml
 monitoring/{prometheus,alertmanager,grafana,loki,promtail}
 docs/{production-hardening,observability,backup-restore,staging-deployment}.md
+docs/screenshots/*.png
 docker-compose.yml, docker-compose.staging.yml, docker-compose.prod.yml
 ```
 
@@ -569,7 +646,8 @@ docker-compose.yml, docker-compose.staging.yml, docker-compose.prod.yml
 ## Roadmap
 
 Implemented already: local bge-m3 embeddings, legislation ETL, active
-inference queue, live SSE token streaming, live Stripe billing + invoices,
+inference queue, live SSE token streaming, optional Ansvar MCP Greek-law
+retrieval with pgvector fallback, live Stripe billing + invoices,
 email change, original document storage, OCR/vision images, scanned-PDF OCR,
 message pagination, scheduled account deletion, PWA/SEO with build-time
 `SITE_URL`, caching, feature flags, A/B experiments, optional Sentry,

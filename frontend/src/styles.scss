@@ -832,8 +832,11 @@ button.secondary .spinner,
 .nl-admin-table tbody tr.is-self { background: var(--nl-danger-bg); }
 
 .nl-admin-actions { display: flex; gap: var(--nl-space-3); align-items: center; padding: var(--nl-space-4) var(--nl-space-6); }
+.nl-admin-actions > button { width: auto; flex: 0 0 auto; }
 .nl-admin-actions select { background: var(--nl-bg-input); color: var(--nl-fg); border: 1px solid var(--nl-border); padding: var(--nl-space-2) var(--nl-space-3); border-radius: var(--nl-radius-sm); font-size: 0.85rem; cursor: pointer; }
 .nl-admin-actions select:disabled { opacity: 0.5; cursor: not-allowed; }
+.nl-admin-table select { background: var(--nl-bg-input); color: var(--nl-fg); border: 1px solid var(--nl-border); padding: 0.35rem 0.5rem; border-radius: var(--nl-radius-sm); font-size: 0.85rem; cursor: pointer; min-width: 7rem; }
+.nl-admin-table select:disabled { opacity: 0.6; cursor: not-allowed; }
 
 .nl-mono { font-family: var(--nl-font-mono); color: var(--nl-fg-subtle); }
 .nl-you-badge {
@@ -1171,6 +1174,7 @@ button.secondary .spinner,
 /* ── 16. Conversations UX (Phase 2-3) ─────────────────────────────── */
 .nl-conversation-search { display: flex; gap: var(--nl-space-2); margin-bottom: var(--nl-space-4); }
 .nl-conversation-search .nl-input { flex: 1; }
+.nl-conversation-search > button { width: auto; flex: 0 0 auto; }
 .nl-pagination {
   display: flex;
   align-items: center;

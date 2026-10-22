@@ -134,6 +134,7 @@ const INVOICE_PAGE_SIZE = 10;
   styles: [`
     .nl-invoice-links { display: flex; flex-wrap: wrap; gap: 0.75rem; }
     .nl-invoice-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin-top: 0.75rem; }
+    .nl-invoice-pagination .nl-btn-secondary { width: auto; flex: 0 0 auto; }
   `]
 })
 export class SubscriptionsComponent implements OnInit {

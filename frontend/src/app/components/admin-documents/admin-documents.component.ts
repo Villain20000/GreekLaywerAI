@@ -110,6 +110,7 @@ interface AdminDocument {
   `,
   styles: [`
     .nl-admin-filters { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; padding-bottom: var(--nl-space-4); }
+    .nl-admin-filters > button { width: auto; flex: 0 0 auto; }
     .nl-input-narrow { max-width: 7.5rem; }
     .nl-pager { display: flex; align-items: center; justify-content: flex-end; gap: 0.75rem; margin-top: var(--nl-space-4); }
     .nl-pager-label { font-size: 0.8rem; color: var(--nl-fg-subtle); }

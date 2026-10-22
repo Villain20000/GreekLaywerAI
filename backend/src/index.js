@@ -20,6 +20,7 @@ const { authMiddleware } = require('./middlewares/authMiddleware');
 const ollamaService = require('./services/ollamaService');
 const inferenceQueue = require('./services/inferenceQueue');
 const stripeService = require('./services/stripeService');
+const ansvarMcpService = require('./services/ansvarMcpService');
 const db = require('./config/db');
 const { initSentry, captureException } = require('./config/sentry');
 
@@ -132,7 +133,8 @@ app.get('/health', async (req, res) => {
     },
     stripe: {
       status: stripeService.isConfigured() ? 'configured' : 'missing'
-    }
+    },
+    ansvar: ansvarMcpService.getStatus()
   };
 
   const anyDown = database.status === 'down' || redis.status === 'down';
@@ -154,7 +156,8 @@ app.get('/api/ai/health', (req, res) => {
   // and docker-compose healthchecks.
   res.json({
     service: 'NomosAI',
-    ...ollamaService.getWarmupStatus()
+    ...ollamaService.getWarmupStatus(),
+    retrievalProvider: ansvarMcpService.isConfigured() ? 'ansvar-mcp' : 'local-pgvector'
   });
 });
 
@@ -232,6 +235,12 @@ let server = null;
 if (require.main === module) {
   server = app.listen(port, () => {
     console.log(`Backend listening on port ${port}`);
+    const ansvarStatus = ansvarMcpService.getStatus();
+    if (ansvarStatus.status === 'configured') {
+      console.log(
+        `[ANSVAR] Greek-law MCP retrieval enabled (auth=${ansvarStatus.auth}, tool=${ansvarStatus.tool})`
+      );
+    }
     // Phase 28: pre-warm gemma:2b (chat) and bge-m3 (embed) so the first
     // /api/ai/query doesn't pay the ~180 s cold-load penalty. Fire-and-forget.
     ollamaService.warmup().catch((err) => {
